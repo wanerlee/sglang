@@ -7,6 +7,7 @@ This validates bookkeeping and LFU only, NOT weight readiness or model outputs.
 """
 
 import importlib.util
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -59,13 +60,15 @@ class TestNPUCacheMetadata(unittest.TestCase):
 
         if not torch.npu.is_available():
             raise unittest.SkipTest("No Ascend device is available")
-        torch.npu.set_device(0)
+        index = int(os.environ.get("MOE_TEST_NPU_DEVICE", "0"))
+        torch.npu.set_device(index)
+        cls.device = f"npu:{index}"
 
     def test_capture_replay_matches_cpu_with_changing_inputs(self):
-        cpu, npu = make_cache("cpu"), make_cache("npu:0")
-        routes = torch.tensor([[1, 1, 1], [1, 1, -1]], device="npu:0")
+        cpu, npu = make_cache("cpu"), make_cache(self.device)
+        routes = torch.tensor([[1, 1, 1], [1, 1, -1]], device=self.device)
         valid = torch.ones_like(routes, dtype=torch.bool)
-        enabled = torch.tensor(False, device="npu:0")
+        enabled = torch.tensor(False, device=self.device)
         addresses = [
             npu.policy_state.usage.data_ptr(),
             npu.residency.step_access_count.data_ptr(),

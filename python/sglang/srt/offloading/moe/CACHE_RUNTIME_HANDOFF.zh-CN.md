@@ -183,6 +183,29 @@ MOE_TEST_NPU_DEVICE=1 PYTHONPATH=python python test/manual/test_moe_cache_runtim
 
 ## 7. 当前完成情况与 NPU 联调顺序
 
+### 一条命令运行现有验证
+
+在已安装匹配 PyTorch / torch_npu / CANN 的 Ascend 环境，用该环境的 Python 执行：
+
+```bash
+python test/manual/validate_moe_cache_npu.py --device 0
+```
+
+入口：[validate_moe_cache_npu.py](../../../../../test/manual/validate_moe_cache_npu.py)。无需下载模型；自动使用当前 checkout 的源码，以独立进程运行四组测试。轻量 package bootstrap 绕过 serving API 初始化，但不替换 cache 实现；CPU 测试内部仍使用其明确声明的硬件/通信替身。
+
+| 分组 | 当前用例数 | 验证范围 |
+| --- | --- | --- |
+| `cpu` | 133 | 全部 offloading CPU UT，包括模型 installer、CacheBackend、graph lease 的测试替身验证 |
+| `npu_runtime` | 3 | 真实小权重 H2D/D2D、event 等待、LFU 替换、映射发布、快照回填 |
+| `npu_metadata_graph` | 1 | 真实 NPU metadata/LFU capture/replay，变化路由与 CPU 对照 |
+| `npu_layout` | 2 | 生产 AscendDispatchLayout 在 NPU eager/graph 下的行整理、scale、空 wave、尾组、NaN padding 屏蔽与固定输出地址；F 为简单算术 |
+
+默认生成带时间戳的 `moe-cache-validation-*` 目录，包含 `report.json`、每组 JSON 结果和完整日志。可通过 `--output-dir /path/to/new-empty-dir` 指定空目录，`--timeout 900` 设置每组超时秒数。所有测试必须实际运行且无 skip/expected failure 才算通过：退出码 `0` 为上述范围内通过，`1` 为失败或超时，`2` 为缺失硬件或验证不完整。
+
+交给执行 AI 时要求：使用当前分支，保留原始断言和日志；先运行脚本，不把失败改成 skip，不用 CPU fallback 冒充 NPU。返回提交号、`report.json`、失败组日志和环境版本。若修复代码，单独说明修复，并使用新的输出目录重跑。
+
+本入口不验证真实 DeepEP/HCCL、多卡 EP、原生 MoE 量化/GMM kernel、同事生产 transfer/prefill pipeline 或完整模型 graph；这些范围写入每份报告。不能把四组通过解释为整模型已联调通过。
+
 ### 7.1 已完成到哪一层
 
 | 部分 | 当前状态 | 尚未证明的内容 |
@@ -209,7 +232,7 @@ PYTHONPATH=python python test/manual/test_moe_cache_runtime_npu.py -v
 PYTHONPATH=python python test/manual/test_moe_cache_metadata_npu.py -v
 ```
 
-runtime 脚本可通过第 6 节的 `MOE_TEST_NPU_DEVICE` 选择设备；metadata 脚本当前固定使用可见设备 0。两者都必须实际运行测试，不能将 skipped 计作通过。metadata 脚本的成功也不表示 H2D 或整个模型已经入图。
+两个独立 NPU 脚本都可通过 `MOE_TEST_NPU_DEVICE` 选择可见设备，默认 0；统一入口用 `--device` 设置。两者都必须实际运行测试，不能将 skipped 计作通过。metadata 脚本的成功也不表示 H2D 或整个模型已经入图。
 
 小权重流程的可检查结果：初始热池 `[0,2,4,7]`，测试给定的四次 forward 后为 `[1,2,5,7]`；实际计算与独立 CPU 参考一致；新映射只在复制完成后发布；借池覆盖后按原 slot 恢复，并能继续 decode。这一步不依赖同事优化流水，可以先排查当前 NPU 对所用 tensor 操作和 event 的支持。
 
