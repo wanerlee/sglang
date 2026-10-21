@@ -1,60 +1,83 @@
-# MoE 专家 Cache 基础功能设计
+# MoE Cache 与框架适配实现总结
 
-接口更新：已合并同事 `59cbb5d`；cache 执行统一接入公共 `ExpertWeightAccess` / `CacheUpdateCoordinator`。算法参数及层内配对不变，详见 [合并适配设计](MERGE_ADAPTATION_DESIGN.zh-CN.md)。
+本文总结本分支完成的 cache 算法与框架适配：实现了哪些功能、代码如何组织、prefill / decode 如何执行，以及如何验证这些改动。接口部分说明本次实现提供或调用的方法，验证部分区分已通过的测试与测试覆盖范围。
 
-适用分支：`codex/moe-offload-dev`
+代码核对版本：`codex/moe-offload-dev` 的 `a29b739`；改动比较基线：`59cbb5d`。本文是本次改动的完整说明，可独立阅读。
 
-状态：周期 LFU、元数据适配，以及 cache 调用方的初始化、实际需求计划、slot 替换、传输调用和就绪后发布已实现。本轮补齐 DeepSeek V4 模型安装、Ascend/DeepEP 适配、CacheBackend 组装和 NPU graph lease，详见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。结构精简后 134 项 CPU UT 通过；实际 NPU transport、prefill 流水和物理 bindings 仍需同事交付。用户回报精简前版本的 6 项 NPU 基础测试通过，精简后的版本需复验；完整模型实机验收尚未执行。
+## 1. 目标与已实现功能
 
-本设计实现离线热启动、在线计数、周期层内替换、换入量限制与热度衰减，以及搬运完成后发布映射。复用现有专家目录、缓存状态、执行 bank 和 owner 生命周期，以基本功能跑通为目标。
+目标是在 HBM 放不下全部 routed expert 权重时，使用有限热缓存减少 decode 的 H2D；prefill 复用热池空间执行流式加载，结束后恢复 decode 缓存。
 
-## 0. 原分支基线与变更边界
+当前接入 **DeepSeek V4 + Ascend + compact DeepEP**。支持普通 DECODE / IDLE、EXTEND / MIXED 的阶段编排。前三层、hash 层和 shared experts 保持原有常驻规则。verify / speculative、split prefill、TBO/SBO、MoE TP、弹性或重映射 EP 等原分支限制没有解除。没有新增生产后端默认注册或一键 serving CLI，沿用 ModelRunner 的 offloader 注入入口。
 
-核对基线为 `moe-offload-proto-v1` 的 `5b13541370f4b3f4746ea4b88054801b6a278c81`，框架代码提交为 `65e5c53ebbced0b06a8c3a1a253593a4caebe14f`。以下区分已有契约与本设计新增内容：
-
-| 项目 | 原分支事实 | 本设计处理 |
-| --- | --- | --- |
-| Decode 权重准备 | dispatch 后得到本 rank 实际需求，再调用 `resolve_execution(local_demand)`。 | 保持按需加载；不扩大为 wave 全专家加载。 |
-| 固定 waves | 固定 D/F/C 次数和顺序，`LocalExpertProgram` 接收 dispatch 结果。 | 保持；wave 范围不等于加载清单。 |
-| 热池容量 | `floor(cache_ratio * catalog.num_experts)`。 | 原样保留。 |
-| `target_keys` | 目标专家集合，不分配 slot。 | 原样保留；物理位置由 residency 决定。 |
-| 执行区 | 总容量显式预算，`fixed_waves()` 默认一个 bank。 | 不强制双 bank、正偶数或新增容量。 |
-| 默认 LFU | 跨层选 Top-K，默认不衰减，可选周期减半。 | 新增独立周期策略实现五点需求，不将其误写成已有行为。 |
-| Prefill | 层开始全量流式预取、借热池、恢复原 slot 和策略状态。 | 保持执行路径，只补充新策略状态的保存恢复。 |
-| Verify | 原适配器和 ModelRunner 明确拒绝投机解码。 | 只定义待接入语义，不声明当前已支持。 |
-| NPU 后端 | 动态传输、residency、真实专家执行仍为接口。 | 列出实现落点，不声称已跑通。 |
-
-依据：[原 README 执行时序](https://github.com/pachi-33/sglang/blob/5b13541370f4b3f4746ea4b88054801b6a278c81/python/sglang/srt/offloading/moe/README.zh-CN.md#3-uml从当前框架生长)、[config.py](config.py)、[interfaces.py](interfaces.py)、[programs.py](programs.py)、[owner.py](owner.py)、[policy.py](policy.py)。
-
-## 1. 五项需求与确定行为
-
-| 需求 | 基础版行为 |
+| 已实现功能 | 具体行为 |
 | --- | --- |
-| 离线初始化 | 每个 EP rank 将全部可卸载 `(layer, expert)` 按离线路由频次排序，选前 K 个装入 device 热池。 |
-| 在线计数 | 每个有效 token-expert 路由令 `usage[key] += 1`，命中和 miss 都计数。 |
-| 周期替换 | 每 4 个目标模型 decode/verify 完整 forward 检查一次；每层将最热非驻留专家与最冷驻留专家一一配对。 |
-| 门槛与限量 | 候选 `usage >= 2`，且 `usage >= victim_usage + 1.5`；所有层合格配对按热度差排序，每 rank 每轮最多交换 96 个专家。 |
-| 衰减与发布 | 每轮选择完成后，所有 usage 乘 0.7；新权重完整复制后才发布驻留映射。异步搬运沿用后端 stream/event；计算重叠只在真实数据依赖允许时安排，见第 8 节。 |
+| PeriodicLFU 与 batch 统计 | 离线 Top-K 初始化、有效 assignment 计数、层内冷热配对、周期替换与衰减 |
+| Decode 缓存执行 | 根据实际需求选择热池或 host 来源，生成执行计划，等待复制后发布映射，计算读完后允许复用 |
+| Prefill 阶段适配 | 保存 decode 元数据和 LFU 状态，调用借池与流水接口，切回 decode 时按原 slot 回填并恢复状态 |
+| 模型与算子适配 | 安装 DeepSeek V4 层首及 routed experts 入口，转换 DeepEP receive 布局，通过 bank 视图调用原生 Ascend F |
+| Runtime 与 graph 生命周期 | 组装逐层 Program，接入 eager / capture / replay，管理统计开关、完成事件及 graph lease |
+| 自动化验证 | CPU UT、小权重 NPU 复制与恢复测试、metadata / 布局 graph 测试，以及统一验证报告脚本 |
 
-“高 1.5”定义为热度差至少 **1.5**，不是倍数。两个阈值都包含等号。这与核对到的 [Strata adaptive 判断](https://github.com/Niko1221/Strata/blob/main/src/program/generate.cpp#L9952-L9978) 一致；原分支默认 TensorLFU 本身没有该门槛。
+实现复用已有 `ResidencyOps` / `WholeMoEProgram`、公共权重访问层和传输接口。本次新增的是 cache 决策、状态管理及实际框架接线；底层传输、存储和流水通过注入的 backend 对象调用，不将这些依赖本身计为本次实现。
 
-初始化跨层竞争 K 个位置；后续按用户需求只做层内一换一，因此各层驻留数量保持初始化形成的分配。这里有意改变原 TensorLFU 每轮跨层竞争的策略，不改变热池的物理容量和公共接口。某层初始化没有驻留专家时，该层仍能通过 miss 路径计算，但本策略不会为它新增热 slot。
+基础版只保证正常执行所需的事件、读者和生命周期约束，不增加预测器、跨 rank 热度协调、自动容量调整、失败重试或额外权重备份池。
 
-## 2. 范围与基本约束
+## 2. 数据与内存模型
 
-- 只缓存可卸载 routed experts；前三层、hash 层及 shared experts 沿用现有常驻规则。
-- 每个 EP rank 只管理自己负责的专家。热度、周期和 96 个换入上限均按 rank 独立计算，不同步全局排行榜。
-- CPU pinned DRAM 保存完整、只读的权重 bundle；淘汰不做 D2H 写回。bundle 包含权重、scales 和格式要求的其他分量。
-- forward 内热集合不变；miss 使用临时执行区，不能立即挤入热池。
-- 两个 forward 不重叠使用资源。cache 替换放在 forward 尾部，下一次 forward 等待完成。
-- prefill 借用热池，不更新热度、不推进替换周期；退出时恢复 decode 的精确布局和策略状态。
-- 基础版不增加预测器、跨 rank 热度协调、在线容量调整、复制失败重试、回滚事务或额外权重备份池。正常读写依赖仍必须满足。
+### 2.1 专家身份、rank 与 slot
 
-当前分支拒绝投机解码。本设计定义 verify 的 cache 行为，但实际启用 verify 需要同步实现模型/runtime 接入；不能只删除限制就认为支持。先完成 decode 路径，再用同一套接口接通 verify。
+一个专家由 `(layer_id, expert_id)` 标识；不同层的 E0 是不同权重。每个 EP rank 只保存、统计和缓存自己负责的专家，token 的激活通过 EP dispatch 送到专家所属 rank。
 
-## 3. 配置与容量
+本 rank 的 `ExpertCatalog` 将可卸载专家展开成连续 canonical key：
 
-建议新增 `PeriodicLFUConfig`，由策略对象持有，不改变现有 offload 参数的含义：
+```text
+rank 内有 L3、L4 两层，每层 4 个本地专家：
+L3/E0..E3 -> key 0..3
+L4/E0..E3 -> key 4..7
+```
+
+离线文件使用全局 expert ID；dispatch 后统计使用本 rank、本层的 local expert ID；搬运计划的 HOST 来源使用 canonical key；HOT_SLOT 来源使用物理热 slot。四者不能混用。
+
+### 2.2 三类存储
+
+| 存储 | 用途与寿命 |
+| --- | --- |
+| CPU pinned / 注册后的 host store | 完整只读专家 bundle；包含权重、scale 等原生格式组件，淘汰无需 D2H 写回 |
+| HBM hot pool | 跨 decode forward 保留热专家；prefill 可借用 |
+| HBM execution pool | 当前 wave 的连续权重输入；计算完成后可覆盖 |
+
+```text
+N = 当前 rank 所有可卸载专家数
+K = floor(cache_ratio * N)
+热池总 slot 数 = K
+所有 execution bank 的 slot 总数 = execution_slots
+```
+
+`bank_slots` 是单个执行 bank 的容量，所有 bank 都计入 `execution_slots`；借用视图不重复计入物理分配。当前 CacheBackend 要求各卸载层的本地专家数量一致，并使用兼容的原生组件布局。
+
+**命中仍需 D2D 到 execution bank**，miss 则 H2D 到该 bank。当前实现不直接把任意离散热 slot 交给原生 F。缓存减少的是 host→device 搬运，不是消除全部复制。
+
+### 2.3 元数据
+
+| 状态 | 含义 |
+| --- | --- |
+| `key_to_slot[N]` | 专家到热 slot；未驻留为 -1 |
+| `slot_to_key[K]`、`slot_valid[K]` | slot 当前专家及完整 bundle 是否可读 |
+| `slot_generation[K]` | slot 内容更新版本 |
+| `execution_key[S]`、`execution_valid[S]` | 临时执行池内容 |
+| `step_access_count[N]`、`update_enabled` | 当前完整 forward 的路由计数与统计开关 |
+| `usage[N]` | 在线热度，float32 |
+| `step_mod`、`update_due` | 4 步周期及本步是否调整 |
+| `target_keys[K]` | 策略选中的目标集合；数组位置不是 slot |
+
+热 slot 本身不绑定层。LFU 的层内替换保证各层驻留数量不变；residency 保留幸存者原位置，将新增 key 分配到空出的物理 slot，不要求物理 slot 也按同层配对。
+
+## 3. LFU：五项需求及准确语义
+
+### 3.1 参数
+
+对应 [periodic_lfu.py](periodic_lfu.py)：
 
 ```python
 @dataclass(frozen=True)
@@ -67,451 +90,429 @@ class PeriodicLFUConfig:
     usage_decay: float = 0.7
 ```
 
-设当前 rank 在可卸载层 `l` 有 `N_l` 个专家，缓存比例为现有 `cache_ratio`：
+| 需求 | 当前实现 |
+| --- | --- |
+| 离线初始化 | 在本 rank 全部可卸载专家中选离线频次 Top-K，装入热池 |
+| 在线计数 | 每个有效 token→expert assignment 加 1，命中与 miss 均计数 |
+| 周期替换 | 每 4 个有效完整 decode forward，在每层内部冷热一一配对 |
+| 换入上限与衰减 | 候选 usage ≥ 2，候选减被替换者 ≥ 1.5；所有层合格配对按差值排序，每 rank 最多 96 对；随后全部 usage × 0.7 |
+| 搬运与发布分开 | 等完整 bundle 搬完后发布；异步提交和实际计算重叠分别看待 |
 
-```text
-N = sum(N_l)
-K = floor(cache_ratio * N)
-```
+1.5 是**差值**，不是 1.5 倍，等号满足门槛。每轮即使没有交换也衰减；非周期轮不衰减。
 
-沿用 `MoEOffloadConfig.hot_slots()` 的结果。初始化全局 Top-K 后，令 `K_l` 为其中属于层 l 的专家数量；不是预先按比例计算 `K_l`。运行期一换一保持该数量，`K_l=0` 的层只走临时执行，`K_l=N_l` 的层没有换入候选。
+初始化跨层 Top-K，运行期层内一换一，因此各层热专家数量由初始化确定。某层初始化为 0 个热专家时，它一直通过 miss 路径执行，本策略不会从其他层给它调入缓存配额。这是当前策略的明确取舍。
 
-例如 N=8、K=4，离线排序前四名为 L3/E4、L3/E5、L3/E6、L4/E5，则 L3 有 3 个热专家、L4 有 1 个。保持原 K 的计算，不修改 config 和 owner 的容量公式。
+原五点需求提到 verify，但当前 serving 接入仍拒绝投机解码。本文不将 verify 列为已实现功能。
 
-临时执行区沿用原分支总预算：
+### 3.2 离线统计与初始化
 
-```text
-所有物理执行 bank 的 slot 总数 = execution_slots
-```
-
-基础 decode 可用一个 bank。若后端采用双缓冲，两个 bank 都必须计入该总数；本策略不要求正偶数配置，也不额外申请权重池。prefill 可按原设计借用热池视图，视图不新增物理分配。仍沿用原分支同构 bundle 的字节预算。
-
-## 4. 离线统计与热启动
-
-离线文件以层号和全局专家编号保存频次。例如：
+示例：
 
 ```json
 {
   "model_id": "checkpoint-used-for-profiling",
   "layers": {
-    "3": {"4": 1200, "5": 900, "6": 500, "7": 100},
-    "4": {"4": 300, "5": 1800, "6": 600, "7": 200}
+    "3": {"0": 1200, "1": 900, "2": 500, "3": 100},
+    "4": {"0": 300, "1": 1800, "2": 600, "3": 200}
   }
 }
 ```
 
-`model_id` 标识对应 checkpoint；部署时提供与模型匹配的文件。各 rank 从中筛选自身专家，缺少的专家频次按 0 处理。只需初始化时读取一次；文件无法读取则报配置错误，不增加备用初始化流程。
-
-初始化顺序：
-
-1. 建立 `ExpertCatalog`，确定可卸载层及本 rank 专家。
-2. 使用原 `hot_slots(catalog)` 计算 K。
-3. 在本 rank 所有可卸载专家间，按离线频次降序、专家 key 升序排序，选择前 K 个。
-4. 从 CPU 加载这些专家到固定热 slot，等待完整 bundle 就绪。
-5. 写入双向映射和有效位；初始化完成后才允许模型 forward。
-6. 在线 `usage` 全部置 0，`step_mod` 置 0。
-
-离线频次只用于初始装入，不直接加到在线 usage，避免离线大样本计数长期压制在线变化。频次相同或全为零时，按专家 key 决定顺序，初始化填满总计 K 个 slot。各层 slot 不要求连续；通过 `slot_to_key` 和专家层号即可确定归属。
-
-## 5. 最小数据结构
-
-复用 [state.py](state.py) 的 `ResidencyState`：
-
-| 字段 | 含义 |
-| --- | --- |
-| `key_to_slot[N]` | 专家 key 到热 slot，未驻留为 -1。 |
-| `slot_to_key[K]` | 热 slot 当前存放的专家。 |
-| `slot_valid[K]` | 完整权重是否可读。 |
-| `slot_generation[K]` | slot 复用版本，沿用现有框架。 |
-| `execution_key[S]`、`execution_valid[S]` | 执行 bank 的内容标识。 |
-| `step_access_count[N]` | 本次完整 forward 的有效访问次数。 |
-| `update_enabled` | warmup/capture 时禁止更新，真实执行时允许更新。 |
-
-策略新增状态：
-
-```python
-@dataclass
-class PeriodicLFUState:
-    usage: object       # device float32[N]，支持乘 0.7
-    step_mod: object    # device int64 标量，值为 0..update_interval-1
-    update_due: object  # device bool 标量：本次是否执行周期替换/衰减
-```
-
-初始化固定 `layer_key_ranges` 或等价的 `key_to_layer`，供策略和 residency 判断专家层号。无需新增连续的层 slot 配额表。
-
-预分配 `target_keys[K]`，语义仍是目标专家集合；数组下标不表示物理 slot。非更新轮输出当前驻留集合，runtime 差分得到零交换。策略内部排序或输出顺序不能移动幸存专家。
-
-没有单独的“待准入专家缓存”。临时执行区可以被后续波次覆盖，因此尾部晋升热专家时允许再次 H2D。
-
-## 6. 在线计数与 miss 执行
-
-### 6.1 计数规则
-
-一次 step 是目标模型一个 batch 的一次完整 decode/verify forward。
-
-在 EP dispatch 后，根据有效本地 token-expert 分配统计：
-
-```python
-# 说明语义的伪代码；实际实现为设备算子。
-for assignment in valid_local_assignments:
-    step_access_count[assignment.expert_key] += 1
-```
-
-- 多个 token 选择同一个专家，分别加一。
-- top-k 中每个有效专家分配分别计数，不按 router 权重加权。
-- 不按搬运次数计数；一个专家加载一次、处理 5 个 token，计 5 次。
-- 每个分配只在它所属波次记录一次，padding 和无效项不计数。
-- prefill、warmup、capture 不计数，也不推进周期；没有有效 token 的全局 IDLE 不推进。
-- 周期按 batch 的 forward 推进；某个 rank 没有本地路由时计数为零，但仍随同一有效 batch 推进一步。不能用本 rank 的计数和是否为零判断全局 IDLE。
-
-verify 统计目标模型实际执行的有效路由，拒绝的候选 token 不回滚计数，因为计算已经发生。draft 模型不计入本状态。一个 verify batch 只推进一步，不按候选 token 数推进。
-
-### 6.2 本次计算的权重来源
+`model_id` 必须与初始化传入值一致。频次必须有限且非负；缺失专家按 0 处理。各 rank 只选自身拥有、允许卸载的专家。频次相同按 canonical key 升序打破平局。
 
 ```text
-命中：热 slot → D2D → 执行 bank → 专家计算
-miss：CPU pinned DRAM → H2D → 执行 bank → 专家计算
+建立 catalog → 计算 K → 离线 Top-K
+→ prepare_refill(exact_slot_keys) → H2D → 等待 → 发布
+→ usage 全零、周期为零 → 允许 forward
 ```
 
-基础版采用连续 bank，兼容现有算子输入；直接读取任意热 slot 暂不实现。同一波内同一专家只准备一份权重，供它的多个 token 共用。
+离线频次不注入在线 usage，避免历史样本量压制当前请求。
 
-本地专家数大于 bank 容量时，沿用固定 waves 和 `ComposedDFCProgram`；所有 rank 保持相同 D/F/C 波次顺序，包括空波。完整顺序保持：
+### 3.3 Batch 计数和周期
 
-```text
-mask 当前 wave 路由 → dispatch → 本 rank 有效需求
-→ resolve_execution(local_demand) → 按需准备权重 → F → combine
-```
+计数点在 **EP dispatch 之后**，输入是本 rank 实际接收的有效分配。多个 token 选同一专家分别计数；top-k 中每个有效分配分别计数，不按 gate 权重加权。加载时才对专家需求去重。
 
-例如 wave 范围为 E4/E5，但实际只收到发往 E5 的 token，则只准备 E5；E4 的计划项无效，不触发搬运或读取未就绪权重。空波保留通信顺序，不加载无关专家。按需加载是基础行为，不是后续优化。
+- 不把 padding、无效 ID、其他 wave 的分配计入当前 wave。
+- 一个完整 batch forward 只推进一次周期，不按 token、层或 wave 推进。
+- prefill、warmup、capture 不累计热度、不推进周期；真实 graph replay 按开关计数。
+- 全局空步不推进；全局有工作但本 rank 无本地分配时仍推进，计数为零。
+- 全局 prefill 时，本地 IDLE / DECODE rank 也按 prefill 阶段处理，避免各 rank 借池时机不一致。
 
-## 7. 周期层内替换算法
+### 3.4 替换算法
 
-### 7.1 每个完整 forward 的尾部
+以下是语义伪代码；生产实现使用设备 Tensor，不在 decode 在线路径回读路由和热度到 CPU。
 
 ```python
-# 算法参考伪代码，不是 graph 内的 Python 执行实现。
-# update_statistics：每次都刷新 due，禁止沿用上一步的触发标志。
-update_due = False
-if update_enabled:  # 已包含真实有效 decode/已接通 verify 的 forward 条件
-    usage += step_access_count
-    step_mod = (step_mod + 1) % update_interval
-    update_due = (step_mod == 0)
-
-# select_hot_set：只决定目标集合，不写任何物理 slot。
-target = set(current_resident_keys)
-if not update_due:
-    target_keys[:] = sorted(target)
+usage += this_forward_counts
+step_mod = (step_mod + 1) % 4
+if step_mod != 0:
     return
 
-eligible_pairs = []
-
+pairs = []
 for layer in offloaded_layers:
-    # 只看这个 rank、这个层的专家。
-    hot = resident_experts(layer)
-    cold = nonresident_experts(layer)
+    candidates = nonresident_sorted_by_usage_desc(layer)
+    victims = resident_sorted_by_usage_asc(layer)
+    for candidate, victim in zip(candidates, victims):
+        gain = usage[candidate] - usage[victim]
+        if usage[candidate] >= 2 and gain >= 1.5:
+            pairs.append((gain, candidate, victim))
 
-    # 同分时按 expert key 升序，保证确定性。
-    hot.sort(key=lambda e: (usage[e], e))
-    cold.sort(key=lambda e: (-usage[e], e))
-
-    # 一一配对，不重复使用候选或被替换专家。
-    for candidate, victim in zip(cold, hot):
-        if (usage[candidate] >= min_usage
-                and usage[candidate] >= usage[victim] + replacement_min_gain):
-            eligible_pairs.append((
-                usage[candidate] - usage[victim],
-                layer.id,
-                candidate,
-                victim,
-            ))
-
-# 本 rank 所有层合并后排序，最多选择 max_swaps 对。
-eligible_pairs.sort(key=lambda p: (-p[0], p[1], p[2], p[3]))
-for gap, layer_id, candidate, victim in eligible_pairs[:max_swaps]:
-    target.remove(victim)
-    target.add(candidate)
-
-target_keys[:] = sorted(target)
-
-# runtime 在本次选取之后调用新策略的 finish_step()，每步一次。
-# 非周期轮和禁用更新时不衰减。
-if update_due:
-    usage *= usage_decay  # 所有专家，无交换也执行。
-update_due = False
+# 所有层竞争本 rank 的最多 96 次交换；候选/被替换者仍来自同一层。
+selected = largest_gains(pairs, limit=96)
+target_keys = replace_in_current_set(selected)
+usage *= 0.7
+# 实际选取、finish_step 和 apply_update 由 coordinator 按顺序衔接。
 ```
 
-配对和排序始终基于同一次热度快照；本轮不会“换入后再拿新成员参与下一次配对”。热池在初始化时已填满，正常运行通过一换一保持各层驻留数量，不需要额外补洞算法。上面的非周期 `return` 仅表示提前结束选取；runtime 仍调用 `finish_step()`，此时它是无操作。
+同热度按 key 稳定排序；同差值按层及专家的确定顺序处理。一次选择基于同一份热度，不把刚换入的专家再次参与本轮配对。
 
-### 7.2 具体例子
+### 3.5 一个 batch 的完整例子
 
-第 4 个 forward 计数完成后：
+L3 热池内是 E0、E1，第四次 forward 前 usage 为 `[1, 0, 2, 1]`。这次 batch 在该层的有效本地分配是 `[E1, E2, E2, E2, E3]`：
 
-| 层 | 当前驻留专家及 usage | 非驻留专家及 usage |
-| --- | --- | --- |
-| L3 | E4=2、E6=5 | E5=8、E7=3 |
-| L4 | E4=1、E7=4 | E5=7、E6=2 |
+| 专家 | 本步计数 | 选择前 usage | 当前计算权重来源 |
+| --- | ---: | ---: | --- |
+| E0 | 0 | 1 | 本次不需要 |
+| E1 | 1 | 1 | 热池 D2D |
+| E2 | 3 | 5 | host H2D，只准备一份权重 |
+| E3 | 1 | 2 | host H2D |
 
-配对结果：
+当前计算先正常完成。到**整个模型 forward 尾部**，E2(5) 与 E0(1) 配对，差 4，通过；E3(2) 与 E1(1) 差 1，不通过。若 E2 这对进入 rank 内前 96，则热池换成 E2、E1，随后 usage 为 `[0.7, 0.7, 3.5, 1.4]`。
+
+E2 的临时 execution 权重和尾部晋升热池是两次不同用途的加载，基础版允许再次 H2D，不增加暂存池。E3 虽然本次被使用，仍不自动驻留。
+
+## 4. 执行流程
+
+### 4.1 初始化与模型安装
+
+```mermaid
+flowchart TD
+    A[注册 DeepSeek V4 卸载层] --> B[调用 prepare_weights 建立 host 加载目标]
+    B --> C[权重加载与原生格式处理完成]
+    C --> D[bind_weights 返回物理 CacheBackendBinding]
+    D --> E[CacheBackend 组装状态 runtime 和逐层 Program]
+    E --> F[离线 Top-K 加载并发布]
+    F --> G[创建 owner 并安装模型及 capture hooks]
+    G --> H[ModelRunner forward]
+```
+
+`DeepSeekV4ProgramBinding` 安装 decoder pre-hook，同时包装 NPU 模型直接调用的 `forward_hc_pre_from_prev`。该直接方法不触发 Module hook，所以两种入口都需覆盖。routed experts 的 forward 被接到 Program；Attention、Router、shared experts 和模型缩放保留原路径，输出裁剪及必要 reduction 保留。close 时恢复原方法。
+
+### 4.2 Decode：一次 D、分组 F、一次 C
+
+当前 CacheBackend 选择的是 `DispatchOnceProgram`，不是每个 wave 重复一次通信。
+
+```mermaid
+flowchart TD
+    A[完整 forward 开始 清空本步计数] --> B[某层 Router]
+    B --> C[一次 DeepEP dispatch]
+    C --> D[按固定 wave 整理 receive 行和有效路由]
+    D --> E[统计 assignment 并生成实际专家需求]
+    E --> F{该专家命中热池?}
+    F -->|是| G[热池 D2D 到 execution bank]
+    F -->|否| H[host H2D 到 execution bank]
+    G --> I[等待复制完成 发布 execution 映射]
+    H --> I
+    I --> J[原生 Ascend F 返回 read_done]
+    J --> K[释放 lease 并写回原 receive 行顺序]
+    K --> L{还有 wave?}
+    L -->|有| D
+    L -->|无| M[一次 combine 返回模型]
+    M --> N{还有模型层?}
+    N -->|有| B
+    N -->|无| O[完整 forward 尾部累计 LFU]
+    O --> P[到期则选择 换入并发布热集合]
+    P --> Q[登记完成 下一 forward 等待依赖]
+```
+
+固定 wave 只限定执行范围，不等于必须搬完范围内全部专家。没有真实需求的 lane 不搬运。空 wave 仍沿用固定本地执行结构，整层仍只有一次 dispatch / combine。
+
+当前 decode 串行复用计划和执行 bank；异步 copy 接口加事件保证正确性，**不代表已实现下一 wave 的搬运与当前 F 重叠**。跨 wave 优化流水不是基础 cache 算法的一部分。
+
+### 4.3 Prefill：借池、流水、恢复
+
+```mermaid
+flowchart TD
+    A[decode 切换 prefill 等前序工作完成] --> B[快照热映射 generation usage 周期]
+    B --> C[借出 hot arena]
+    C --> D[卸载层开始 pipeline.start]
+    D --> E[Attention Router 一次 dispatch]
+    E --> F[真实 dispatch completion 交给 pipeline.seal]
+    F --> G[按流水给出的 wave acquire lease]
+    G --> H[等待权重 原生 F read_done 归还]
+    H --> I{还有 wave?}
+    I -->|有| G
+    I -->|无| J[一次 combine pipeline.finish]
+    J --> K{还有卸载层?}
+    K -->|有| D
+    K -->|无| L[返回 prefill 输出 保持 prefill 阶段]
+    L --> M[切回 decode 时排空流水和读者]
+    M --> N[按快照原 slot 从 host 回填]
+    N --> O[回填完成 恢复映射及 LFU 执行区失效]
+    O --> P[继续 decode]
+```
+
+本次适配在层首调用 `pipeline.start`，在 dispatch 后传入真实完成依赖，并按 `seal` 返回的分组执行 acquire / wait / F / release。层首通知为流水在 Attention / Router / 通信期间预取提供入口；具体调度沿用注入的 pipeline。prefill 不调用 decode 的热度更新，也不使用其按需 DeviceCopyPlan provider。
+
+快照只保存元数据和策略状态，不备份一份专家权重。恢复依赖 host store 已有的完整只读权重。`prepare_refill(slot_keys)` 精确恢复位置，不能用普通 `apply_update(target_keys)` 替代：目标集合相同不保证 slot 顺序相同。
+
+### 4.4 热替换与完成语义
 
 ```text
-L3：E5(8) 替换 E4(2)，满足门槛，差值 6。
-L3：E7(3) 对 E6(5)，不满足差值至少 1.5，不换。
-L4：E5(7) 替换 E4(1)，满足门槛，差值 6。
-L4：E6(2) 对 E7(4)，不满足差值至少 1.5，不换。
+等待旧 bank / 热权重读者
+→ 准备目标 slot 和 copy plan，victim 有效位置 false
+→ copy stream 等待计划就绪并复制完整 bundle
+→ compute stream 等待 weights_ready
+→ commit_update 发布双向映射、有效位及 generation
+→ 记录 residency_ready / resources_idle
+→ 后续 forward 才使用新映射
 ```
 
-默认上限 96，本轮两对都执行，各层 slot 数量不变。如果测试把上限设为 1，差值相同时按层号选 L3。随后所有 usage 乘 0.7，例如 L3/E5 从 8 变成 5.6。
+复制完成与发布完成是两个不同事件。transport 不直接写 cache 映射。覆盖 slot / bank 之前还必须等待旧读者；只等本次 H2D 完成不够。
 
-## 8. 异步搬运与映射发布
+`output_ready` 表示输出，`residency_ready` 表示驻留元数据，`resources_idle` 要覆盖全部计算、复制、通信和 prefill worker。只有这些工作已汇入同一流时，该流的最终 event 才能代表整体结束。
 
-### 8.1 按需执行与异步重叠的边界
+## 5. 实现接口与调用关系
 
-Decode 采用原分支的顺序式 D/F/C，最小执行路径为：
+接口以 [interfaces.py](interfaces.py)、[execution.py](execution.py)、[prefill.py](prefill.py)、[transfer.py](../transfer.py) 为准。`CacheBackend` 负责组装，`CacheRuntime` 负责生命周期，`TensorResidencyOps` 实现缓存计划与发布；权重访问和流水执行复用已有公共接口。
 
-```text
-dispatch 得到实际需求
-copy stream：等待旧 bank 读完 → 搬运本波所需权重 → weights_ready
-compute stream：等待 weights_ready → 本波 F → read_done
-combine 完成本波，再进入下一波
-```
-
-原 `ComposedDFCProgram` 不会在 F0 前先完成 D1，因此不能保证“计算 wave0 时已知 wave1 的完整实际需求”。本 cache 策略不修改这个顺序，不传 `local_demand=None`，也不为获得重叠而搬运 wave 全部专家。
-
-第五点中的异步搬运与计算重叠按下面边界落实：
-
-- 搬运使用异步接口和事件依赖；异步提交本身不代表 GPU/NPU 上有计算重叠。
-- Prefill 沿用原分支 layer-start 全专家流式预取及有预算的 bank 流水；这条路径有提前已知的加载清单，可与独立计算重叠，具体后端仍待实现。
-- Decode 首先按需打通。后端若要在一次本地 F 内将已知需求进一步分组、流水搬运与计算，可在 `LocalExpertProgram` 实现，但必须计入执行区预算，并保持外层 D/F/C 配对。该优化不是本 cache 策略已实现的能力。
-- 尾部缓存换入等待旧读者并在下一 forward 前完成，不为保证它与计算重叠另建 staging 热池。
-
-因此基础版先验收按需加载、异步正确性和发布顺序；如果交付要求 decode 搬运必须实际隐藏在计算后面，需要单列本地执行流水任务并用设备时间线验收，不能把该项当成现有框架自动满足。
-
-### 8.2 热集合更新
-
-缓存替换只在当前 forward 尾部进行：
-
-```text
-准备交换计划
-    ↓
-copy stream 等待 victim slot 的旧读者结束
-    ↓
-将 candidate 完整 bundle 写入同层待替换 slot
-    ↓
-记录 weights_ready
-    ↓
-发布流等待 weights_ready，提交映射
-    ↓
-下一次 forward 等待更新及其他资源使用结束
-```
-
-`prepare_update()` 对当前集合和目标集合做差：幸存专家保留原 slot；每层新增专家与该层被移除专家的 slot 配对，生成实际搬运及发布计划。策略已确定淘汰哪些专家，不要求策略数组位置决定物理配对。相同层 bundle 格式一致，按 key/slot 固定顺序配对即可。
-
-发布时，使用该计划中的 candidate、victim、slot：
+### 5.1 CacheBackend 组装入口
 
 ```python
-key_to_slot[victim] = -1
-key_to_slot[candidate] = slot
-slot_to_key[slot] = candidate
-slot_valid[slot] = True
-slot_generation[slot] += 1
+backend = CacheBackend(
+    model_id=model_id,
+    prepare_weights=prepare_weights,  # (decoder, spec)
+    bind_weights=bind_weights,        # (layers, catalog, config) -> CacheBackendBinding
+    close_weights=close_weights,      # drain / graph 销毁后释放物理注册资源
+)
+offloader = MoEOffloaderV2(
+    config,
+    backend,
+    periodic_lfu_config=PeriodicLFUConfig(offline_stats_path),
+)
+# 使用现有 ModelRunner(..., moe_offloader=offloader) 注入入口。
 ```
 
-这些写入作为同一个受依赖保护的发布阶段完成；期间没有新 forward 读取映射。不要求提供跨 forward 并发读写能力。旧映射在复制时保留，但旧读者已排空，不能再次据此执行。
+这是 `CacheBackend` 的组装示意。它通过三个注入回调访问权重存储：注册层时调用 `prepare_weights`，finalize 时调用 `bind_weights`，资源排空后调用 `close_weights`。收到 binding 后，创建状态、runtime、逐层 Program、模型 installer 和初始化热池均由本次新增代码完成。示例省略具体后端实例，不是独立的模型启动脚本。
 
-`residency_ready` 表示发布结束，`resources_idle` 汇合全部 copy、compute、communication 和 prefetch。warmup/capture 的禁用开关同时覆盖 residency commit，不能只关闭 usage 更新。基础模式没有跨 forward 并发读取，不需要另加事务回滚设计。
+[CacheBackendBinding](cache_backend.py) 的全部字段：
 
-## 9. 与现有接口的对应
-
-策略新增 `PeriodicLFUPolicy(CachePolicy)`，保留现有四个公共方法的含义：
-
-```python
-allocate_state(num_experts, device) -> PeriodicLFUState
-# 分配 usage、step_mod、update_due；专家层号由构造参数固定。
-
-update_statistics(state, step_counts, update_enabled)
-# 允许更新时累加 usage 并推进 step_mod；写 update_due，不在此处衰减。
-# 禁用时保持 usage/step_mod 不变，并清空 update_due。
-
-select_hot_set(state, key_to_slot, target_keys)
-# 图路径每次 forward 调用一次；eager 只在周期到期时调用。
-# 普通轮输出当前驻留集合；周期轮执行配对、限量，输出新目标集合。
-# 不改变 usage、不分配 slot、不搬运、不发布。
-
-copy_state(source, destination)
-# 复制完整策略状态，供 prefill 快照与恢复使用。
-```
-
-新策略额外提供一个具体方法，不改动 `CachePolicy` 抽象基类：
-
-```python
-finish_step(state)
-# update_due 为真时对所有 usage 乘 usage_decay；然后清空 update_due。
-# runtime 在 select_hot_set 之后调用一次，无交换也衰减。
-```
-
-这是本策略新增的明确接入点，现有 runtime 没有此调用。它避免把衰减副作用藏进 `select_hot_set()`，也不需要让策略绑定整个 `ResidencyState`。runtime 组装该策略时采用：
-
-```text
-update_statistics → select_hot_set → finish_step
-→ prepare_update → materialize_into → commit_update
-```
-
-这些设备操作按依赖顺序录入图。每次真实 forward 执行一次；关闭更新时目标保持当前集合、计划为空且 commit 禁用，初始 `step_mod=0` 不会误触发替换。
-
-复用 `ResidencyOps`：
-
-```python
-resolve_execution(local_demand, context) -> DeviceCopyPlan
-# dispatch 后调用，只对本波有效本地需求生成加载计划。
-# 没有需求的专家不搬运；不新增 None 预取调用约定。
-
-prepare_update(target_keys, context) -> update_plan
-# 对比当前驻留集合和 target_keys；幸存专家原位保留。
-# 本策略下把每层新增专家放到本层被淘汰专家腾出的 slot。
-
-commit_update(update_plan, weights_ready, context)
-# 等完整 bundle 就绪后更新映射。
-```
-
-`DeviceTransferOps.materialize_into()` 执行计划，不决定热门专家，也不修改 LFU。`LocalExpertProgram` 负责 bank 绑定、计算和读者结束事件。`BoundMoERuntime.emit_step_end()` 负责组合统计、选择、搬运、提交。
-
-`resolve_execution()` 和 `target_keys` 的公共语义不变。新的 residency 后端需要知道专家所属层，才能把同层更换落实到物理 slot；不能复用任意其他层的 victim slot。
-
-算法伪代码中的动态列表和 Python 分支只用于说明语义。当前框架要求完整 decode graph，因此实际计数、配对、Top-K 选取、计划生成和发布使用固定地址设备 tensor/算子；不能 `.item()`/`.tolist()` 后由 CPU 决策，也不能每轮重新捕图。离线初始化和模式切换可在 host 执行。
-
-## 10. Prefill 借池与恢复
-
-沿用现有 owner 的切换顺序：
-
-1. 进入 prefill 前排空前序工作，保存映射、有效位、generation 及完整策略状态（usage、step_mod、update_due；已结束 step 的 due 为假）。
-2. 借用热池做流式执行；连续 prefill 不重复保存，不计数、不衰减。
-3. 切回 decode 时从 CPU 将原专家加载回原 slot，再恢复全部元数据和策略状态。
-4. 等待恢复完成，继续已有 decode graph；例如进入前 `step_mod=2`，恢复后仍为 2。
-
-快照只保存元数据和策略状态，不复制一份热权重。基础版不额外维护 prefill 热度。
-
-## 11. 代码修改清单
-
-| 位置 | 基础版修改 |
+| 字段 | 类型 / 要求 |
 | --- | --- |
-| `config.py` / `owner.py` | 保留热池容量公式、执行区总预算和现有生命周期，不因策略要求修改。 |
-| 新增 `periodic_lfu.py` | `PeriodicLFUConfig`、状态、周期配对与限量衰减算法；现有 `TensorLFUPolicy` 可保留用于比较。 |
-| `offloader.py` / 具体 backend | 显式注入新策略；读取离线统计，在 finalize 阶段加载初始热集合。 |
-| `state.py` | 复用已有状态，不把 usage 放进公共 ResidencyState。 |
-| 具体 `ResidencyOps` | 按真实需求生成 miss 计划；目标集合差分、同层分配 victim slot、完成后发布。 |
-| 具体 `DeviceTransferOps` / `LocalExpertProgram` | 固定 bank 的按需 H2D/D2D、就绪与读完事件；prefill 预取沿用原执行程序。 |
-| 具体 `BoundMoERuntime` | 有效路由计数、step-end 接入新策略 `finish_step`、完整更新开关、策略快照/恢复。 |
-| 模型和执行入口 | 接通 decode；接通目标模型 verify 的计数和模式识别后，再调整现有投机解码限制。 |
-| 测试 | 策略参考测试及 NPU 搬运/执行联调。 |
+| `device_module`、`device` | 设备 API；torch.device 或 str |
+| `compute_stream`、`copy_stream` | 计算流和复制流 |
+| `transfer` | `WeightTransferBackend` |
+| `hot_bindings`、`execution_bindings` | `ExpertBankBindings`，原生权重 / scale Tensor 和 bank 起点 |
+| `prefill_pipeline` | 具体 `PrefillWeightPipeline`，包含自己的 HOST_ONLY access |
+| `borrow_hot_arena` | 无参数借池回调 |
+| `resources` | `tuple[Allocation, ...]`，物理存储和流水分配只计一次 |
+| `expert_nbytes` | 完整专家 bundle 字节数 |
+| `bank_slots` | decode 单个 bank 的 slot 数 |
+| `max_dispatch_rows` | receive / 分组缓冲区最大行数 |
+| `hidden_size`、`output_dtype` | 原生专家输出宽度和类型 |
+| `capabilities` | 经后端确认的 `RuntimeCapabilities` |
 
-本设计不实现新的 CPU offload 框架或新的内存池管理器；继续使用 `HostExpertStore`、`AllocationLedger`、`MoEOffloadOwner`。新增具体后端来填补接口。
+`ExpertBankBindings.components` 使用 `AscendQuantInfo` 字段名，至少包含 `w13_weight`、`w2_weight`，并提供模型需要的 scales / offsets / biases。不同模型属性名在物理 binding 时映射，不在 cache 中重新量化或改写 Parameter。
 
-## 12. 最小验收用例
+decode `execution_bindings.bank_offsets` 必须为 `0, bank_slots, 2*bank_slots, ...`；物理目标 slot 为 `wave.bank * bank_slots + lane`。prefill 可提供借池后的不同视图，但不得重复分配或漏报实际占用。
 
-| 用例 | 预期结果 |
+### 5.2 路由、residency 和公共 access
+
+| 接口 | 责任 |
 | --- | --- |
-| 离线初始化 | 每 rank 跨层 Top-K 正确装入，K 保持原公式；允许某层零热 slot，在线 usage=0。 |
-| Batch 计数 | 3 个有效 token 使用同一专家，计 3；miss 同样计数，padding 不计数。 |
-| 周期 | 前 3 个有效 forward 不换；第 4 个尾部更新；prefill/warmup/IDLE 不推进。 |
-| 门槛 | candidate=3.5、victim=2 可换；candidate=3、victim=2 不换；candidate=12、victim=10 可换；candidate<2 不换。 |
-| 层内配对和全层限量 | 每层 slot 数量不变；构造超过 96 对，只选择本 rank 差值最大的 96 对。 |
-| 衰减 | 使用衰减前热度选取；周期轮所有 usage 乘 0.7，无交换也衰减。 |
-| 按需执行 | wave 覆盖 E4/E5、实际只需 E5 时只加载 E5；空波无多余权重搬运，保持 D/F/C 顺序。 |
-| Miss 执行 | 临时加载后能正确计算，但周期准入前仍显示非驻留。 |
-| 集合与物理位置 | 改变 target_keys 的排列不移动幸存专家；层内配对决定集合及各层驻留数量；物理 slot 由 residency 分配，不绑定层。 |
-| 发布顺序 | 复制完成前没有新映射可被下一轮使用；执行 bank 不覆盖未读完的权重。 |
-| Graph | 同一 graph 多次 replay 改变路由，hit/miss、替换和 usage 随之改变；warmup/capture 不改变 usage、周期或热布局。 |
-| 模式切换 | decode → prefill → prefill → decode 后，恢复原 slot、usage 和周期位置。 |
-| Verify | 实际目标模型路由计数；拒绝 token 不回滚；draft 不计数；每个 verify forward 只推进一步。 |
-| EP 周期 | 一个有效 batch 在某 rank 没有本地路由时，该 rank usage 不增加，但周期仍推进。 |
-| 异步及预取 | 就绪/读完依赖正确；prefill 后端的真实重叠单独用时间线验收，不用 decode 全 wave 搬运凑出重叠。 |
+| `LocalRoutes(expert_ids, valid)` | IDs 为本 rank、本层 local ID，int32/int64；valid 为同形状 bool；保留重复 assignments |
+| `runtime.make_execution_request(layer_id, routes, wave, context)` | 统计并产生 `ExecutionRequest`；`local_demand` 是 execution 池长度的 key 向量，不需要的 lane 为 -1 |
+| `resolve_execution(request, context)` | 返回 `ExecutionReservation`：copy plan、bindings、依赖和保活对象 |
+| `publish_execution(reservation, weights_ready, context)` | 等权重后发布 execution 元数据，返回发布票据 |
+| `finish_execution(reservation, read_done, context)` | 登记最终读者，保护下一次计划 / bank 复用 |
+| `prepare_update(target_keys, context)` | 保留幸存 slot，为新增专家生成公共 `UpdatePlan` |
+| `commit_update(plan, weights_ready, context)` | 等待后发布热映射，返回发布票据 |
+| `prepare_refill(slot_keys, context)` | cache 生命周期专用，精确位置初始化 / 回填，不执行 LFU |
 
-实现顺序：离线装入与固定缓存 → decode miss 和计数 → 周期替换与衰减 → prefill 恢复 → verify 接入。动态搬运和分波计算的同图可行性应在最小单层路径先验证；无需先完成整模型才能发现该限制。
+公共调用链：
 
-## 13. 本次基线 Review 修正记录
-
-| 原文问题 | 修正结果 | 原分支依据或需求来源 |
-| --- | --- | --- |
-| Decode 为重叠而准备整个 wave 的权重，并允许 local_demand=None。 | 删除；恢复 dispatch 后按实际需求加载。 | `interfaces.py` 的 `emit_after_router`、`resolve_execution`，`programs.py` 调用顺序。 |
-| target_keys 的下标被解释成物理 slot。 | 恢复目标集合语义，由 residency 保留幸存 slot、分配同层 victim slot。 | `CachePolicy.select_hot_set` 明确不分配 slot。 |
-| 每层提前按比例取整，改变热池总容量。 | 恢复原 K 公式，跨层离线排序，层占比由初始化结果形成。 | `config.py::hot_slots` 和用户离线频次排序需求。 |
-| 强制双 bank 和正偶数 execution_slots。 | 删除新增限制，沿用总预算，按实际执行后端选择 bank。 | `config.py` 只要求正数，`fixed_waves` 默认单 bank。 |
-| 门槛写成 1.5 倍。 | 改为热度差至少 1.5，并增加区别两种公式的例子。 | 用户“高 1.5”及核对到的 Strata 加法判断。 |
-| 声称靠异步 copy 就能在现有 decode 顺序下实现跨波重叠。 | 明确真实依赖和实现缺口，不声称框架已提供重叠。 | 原顺序 D0/F0/C0 → D1/F1/C1。 |
-| 在 select_hot_set 中隐式衰减，并额外绑定公共状态。 | 新策略显式 finish_step；保持选集和 slot 职责分离。 | 新周期衰减需求的最小 runtime 接入扩展。 |
-| 未区分策略新增、原框架既有及未实现后端。 | 第 0 节列清边界，verify 和 NPU 路径标明待接入。 | 原 README 实现状态及 ModelRunner/适配器限制。 |
-
-## 14. 无需 H2D 联调即可使用的元数据组件
-
-[cache_metadata.py](cache_metadata.py) 提供 `CacheMetadataAdapter`，接收已有 catalog、residency 和 `PeriodicLFUPolicy`。它不实现物理 slot 分配、`DeviceCopyPlan`、权重复制、映射发布或事件编排，不预先约束传输流水接口。
-
-### 14.1 已实现的调用序列
-
-```python
-cache = CacheMetadataAdapter(catalog, residency, policy)  # 捕图前分配
-
-# 以下调用作为一次完整 forward 内的设备操作。
-# enabled 是固定地址的 device bool 输入，replay 前由 runtime 更新其内容。
-cache.begin_step(enabled)
-
-# 在 EP dispatch 后提供有效 token-expert 分配：
-# local_ids 是该层、本 rank 内的专家编号，valid 标记真实行而非 padding。
-cache.record_local_routes(layer_id, local_ids, valid)
-
-# 所有层、所有 wave 结束后，由预先绑定的公共 coordinator 收尾一次。
-cache_updates.emit_step_end(context)
-# 统计 -> 选择 -> policy.finish_step -> access.apply_update。
-# metadata 不执行 H2D 或映射发布；这两者经公共 access/residency 完成。
+```text
+DecodeLocalExpertProgram
+→ ExpertWeightAccess.stage(request, context)
+→ residency.resolve_execution
+→ transfer.materialize_into
+→ residency.publish_execution
+→ access.wait_ready(lease, compute_stream)
+→ native F → LocalExecution(output, read_done)
+→ access.release_after(lease, read_done, context)
 ```
 
-实际入口 `record_local_routes()` 接收 dispatch 后本 rank 的 local ID；无生产调用方的 `record_global_routes()` 已删除。负编号、越界项及 padding 不计数。若调用方持有的是每专家聚合 token 数，需要先另接计数适配，不能把一个专家编号当成只有一次访问。
+周期更新由 `CacheUpdateCoordinator.emit_step_end(context, adjust=...)` 统一调用策略统计、选择、`finish_step` 和 `access.apply_update`。metadata 层不再重复编排收尾。
 
-两种分波计数接法二选一：
+### 5.3 生成的搬运计划与传输调用
 
-- 每波只传该波 dispatch 后的有效分配，每条分配只提交一次。
-- 同一份完整路由张量用于多个 wave 时，传入互不重叠的 `local_start/local_end` 区间。区间由未来实际执行程序提供；组件不预设 bank 数或 wave 大小。
+```python
+materialize_into(device_plan, bindings, stream) -> TransferTicket
+materialize_host_into(host_plan, bindings, stream) -> TransferTicket
+```
 
-`record_local_routes` 返回当前 wave 的每专家需求次数，runtime 直接复用以构造装载计划，不重复做直方图。返回需求不受 LFU 开关影响，保证 warmup/capture 仍能准备计算所需权重；usage 和命中统计受开关控制。
-
-`stats.accesses/hits/misses` 是本次有效 token-expert 分配数。命中检查 key 到 slot、有效位及反向映射；不把“一个专家只搬一次”误计成一次访问。统计保留在设备 tensor 中，不在 replay 内读回 host。它不提供搬运字节数或流水时间等依赖后端的指标。
-
-### 14.2 模式开关与目标集合
-
-更新开关只由 `CacheRuntime.forward_scope` 根据全局 phase 和原始 token 数决定，并写入固定地址的设备 bool。prefill、全局空步和捕图/warmup 不更新 LFU；真实 decode replay 使用运行时写入的开关。未接入推理的独立辅助 gate 已删除，不预留 verify 开关；投机解码仍由现有框架明确拒绝。
-
-metadata 只维护 `target_keys`。层内一换一由 LFU 保证，residency 直接根据目标集合与现有映射生成物理更新计划，不另存一份集合差分。
-
-阶段判断不依赖 TBO 才提供的 `global_forward_mode`：结合 `is_extend_in_batch` 与全局 token 数推导。在全局 prefill 中，本地 IDLE 或 DECODE rank 都进入 prefill；在有效全局 decode 中，本地 IDLE rank 仍统计 dispatch 后的访问并推进周期。优先使用 `original_global_num_tokens_cpu`，避免把图 padding 当成有效 token；全局空闲时保持当前阶段，不触发无谓回填。
-
-Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache_updates.emit_step_end(context, adjust=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `adjust=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
-
-### 14.3 快照及资源归属
-
-- `save_decode_metadata()`：在前序工作已排空时保存热池双向映射、有效位、generation 和完整 LFU 状态。保存空间已预分配。
-- 后续权重恢复实现可读取 `cache.snapshot.slot_to_key/slot_valid`，确定原专家及原位置；本组件不生成 H2D 计划。
-- `restore_decode_metadata_after_refill()`：**仅在原权重已恢复到原 slot 后**还原元数据和 LFU 状态。方法本身不等待搬运，也不证明权重就绪。
-- 临时执行区内容不随快照保存，恢复时将 `execution_key/execution_valid` 失效，避免宣称旧权重仍在 bank 中。
-- `cache.allocations()` 报告组件持有的状态、快照和统计 tensor。`residency.allocations()` 单独报告。排序等算子临时 workspace 仍由 backend 计入预算。
-
-### 14.4 框架接入位置与尚待对齐部分
-
-| 已有位置 | 当前接法 |
+| DeviceCopyPlan 字段 | 含义 |
 | --- | --- |
-| `MoEBackend.finalize()` | 可构造 `CacheRuntime` 并调用 `initialize(model_id)`；真实 backend 注入权重 bindings、程序和 transport。 |
-| `BoundMoERuntime.emit_step_begin()` | `CacheRuntime` 调用 `cache.begin_step(enabled)`。 |
-| EP dispatch 后的实际分配 | `DecodeLocalExpertProgram` 调用 make_request 适配路由并计数，经 `ExpertWeightAccess` 准备 bank，再调用原生 F。具体 dispatcher 的 adapter 仍需提供。 |
-| `BoundMoERuntime.emit_step_end()` | 已接 `CacheUpdateCoordinator -> update_statistics/select_hot_set/finish_step -> ExpertWeightAccess.apply_update`。 |
-| `ModelRunner.forward_scope()` | `CacheRuntime.forward_scope` 处理全局模式、owner 生命周期及本次提交的新完成事件。 |
-| `ModelRunner` eager 分支 | 新 `eager_step_scope` 包围实际 eager 调用，graph 分支绕过此入口。 |
-| `capture_head_hooks/capture_tail_hooks` | `CacheRuntime.install_model_hooks` 注册一次；图 replay 不重新执行 Python 计数。真实 NPU capture 验证仍待完成。 |
-| owner 的 prefill/decode 切换 | 已接快照、借池 callback、原位置回填调用、完成依赖、元数据恢复。实际借池程序及 bindings 由后端提供。 |
+| `source_kind: int64[C]` | NONE=0、HOST=1、HOT_SLOT=2 |
+| `source_index: int64[C]` | HOST 使用 canonical expert key；HOT_SLOT 使用热 slot |
+| `destination_slot: int64[C]` | bindings 对应目标池的实际 slot，不是压紧后的条目序号 |
+| `valid: bool[C]` | 每条是否有效，允许空洞 |
+| `count: int64 scalar` | valid.sum()，0 是正常空操作 |
+| `expected_generation: int64[C]` | HOT_SLOT 来源版本；HOST / NONE 为 0 |
+| `capacity: int` | 静态容量，计划 Tensor 地址固定 |
 
-没有安装假硬件 backend 或默认 serving 开关。调用方已接线，测试实现验证流程；真实物理布局、NPU 动态复制与原生模型程序仍通过后端注入。调用方已经采用的计划格式及待确认项单独列于 [H2D 交接表](CACHE_RUNTIME_HANDOFF.zh-CN.md)。
+例如 `valid=[False, True, False, True]`、目标 `[0,1,2,3]`、count=2，必须写 slot 1、3，不能压紧到 0、1。
 
-### 14.5 验证
+一个条目代表完整专家 bundle。cache 通过公共 access 提交计划，等待返回 ticket 后才发布映射；因此该 ticket 的语义是完整 bundle 复制完成。当前 `TensorResidencyOps` 生成 decode/cache 的 DeviceCopyPlan；prefill 路径使用 pipeline 自身的 access 和 HOST_ONLY reservation。本次没有另写底层搬运实现。
 
-- CPU：`test/registered/unit/offloading/test_cache_metadata.py` 覆盖 batch/EP 计数、padding、互斥 wave、模式开关、目标集合、快照、资源核算和动态 tensor 回放。
-- NPU：`test/manual/test_moe_cache_metadata_npu.py` 可单独验证 LFU、计数和目标集合的 `NPUGraph` 捕获及变化输入回放，不依赖专家权重 H2D。在 Ascend 环境执行 `python test/manual/test_moe_cache_metadata_npu.py`。
-- NPU 小规模完整流程：`test/manual/test_moe_cache_runtime_npu.py` 新增 3 组测试，使用真实 H2D/D2D、事件等待、两块矩阵组成的专家权重，验证 LFU 替换、发布和回填恢复。它通过主机读取计划进行 eager 测试，不支持动态搬运入图；运行方式及验收标准见 [交接表第 6 节](CACHE_RUNTIME_HANDOFF.zh-CN.md#6-npu-小规模完整流程测试)。
-- 本地没有 `torch_npu`，不能宣称 NPU 算子/捕图已验证。CPU trace 只检查固定形状下的数据流；其静态形状判断警告不表示支持动态 shape 或真实设备图。
-- 当前本地回归：调用链测试 22 项、NPU 脚本参考计算的 CPU 检查 2 项，与元数据、LFU 和原框架测试合并时 117 项；本轮 review 删除 1 项无调用方测试、增加 3 项回归，119 项 CPU 测试通过。本机没有 `torch_npu`，新增 NPU 完整流程脚本尚未实机验证。Ruff 检查及格式、isort 和空白检查通过。
+### 5.4 已接入的 Prefill 流水调用
+
+| 接口 | 调用时机 |
+| --- | --- |
+| `start(layer_id, context)` | 卸载层开始，提前启动加载 |
+| `validate_session(layer, context)` | 本层 Program 执行前检查 session |
+| `seal(layer, dispatch_ready, context)` | 一次 dispatch 后，接真实 Completion，返回本层 waves |
+| `acquire(layer, wave, context)` | 返回对应分组的 WeightLease |
+| `finish(layer, context) -> TransferTicket` | 本层执行结束，汇合流水工作 |
+| `abort(context) -> TransferTicket` | 失败 / prefill 清理时停止提交、汇合工作 |
+
+F 返回的 `read_done` 必须覆盖所有读权重的计算流，再通过 `release_after` 归还 lease；后台 worker 不能提前覆盖该区域。
+
+## 6. 框架、Ascend 和 graph 适配
+
+### 6.1 Forward 与捕图
+
+- `forward_scope` 包住一次实际 eager 或 graph replay，处理全局阶段、前序等待和完成登记。
+- eager 执行调用 `eager_step_scope`；replay 不重复调用 Python step hooks。
+- capture head/tail 捕获 step begin/end 的设备操作；统计开关使用固定地址 Tensor，capture/warmup 关闭，真实 replay 开启。
+- eager 维护一个 host 周期镜像，跟随有效完整 forward 推进，用于跳过非调整轮的排序和热池计划；无需读回设备周期。replay 后同样推进镜像，切回 eager 保持一致。
+- 图内保留固定操作序列，由设备门控交换；没有声称已消除图内非周期排序开销。
+- NPU graph backend 在 warmup 前取得 owner lease，捕获成功才允许 replay。失败图也由 cleanup 排空并销毁后释放 lease，防止权重资源早于图释放。
+
+`RuntimeCapabilities.require_decode()` 门槛保留。metadata 能捕图、单次 H2D 能执行，都不足以声明完整生产 decode graph 可用。
+
+### 6.2 Ascend 原生计算
+
+`AscendDeepEPDispatcher` 保留原 dispatcher 的调用约定及通信 hooks，兼容关闭 TBO 后单个 inner 的 `MaybeTboDeepEPDispatcher`。
+
+`AscendDispatchLayout` 处理本分支 NPU 的二维 compact receive：有效行按专家组织；LL counts 留在设备端，NORMAL counts 仅用于 eager prefill。每 wave 整理激活和 scale，F 后恢复原 receive 顺序，再调用一次 combine，不重复施加 top-k 权重。
+
+当前为基础固定容量整理。剩余零 padding 计入最后一个 F lane 的算子行数，F 后屏蔽；padding 不计入 LFU 或加载需求。它有额外计算开销，尚未实现专门的高性能打包 kernel。
+
+`AscendExpertRunner` 从 bank 构造原生 `AscendQuantInfo` 视图并调用 `AscendRunnerCore.run`；不新增量化格式或 GMM 算子。
+
+## 7. 修改文件与职责
+
+以下按相对 `59cbb5d` 的最终净差异列出本次修改，涵盖新增模块、已有框架调用点和测试。新增模块依赖这些公共接口及 ModelRunner 修改才能形成完整调用链。
+
+### 7.1 新增七个生产文件
+
+| 文件 | 单一职责 |
+| --- | --- |
+| [periodic_lfu.py](periodic_lfu.py) | 离线热启动与周期 LFU |
+| [cache_metadata.py](cache_metadata.py) | 路由统计、策略状态与快照 |
+| [cache_residency.py](cache_residency.py) | 设备计划、slot 分配、发布及读者保护 |
+| [cache_runtime.py](cache_runtime.py) | cache 生命周期、forward / capture 和阶段切换 |
+| [cache_backend.py](cache_backend.py) | 物理 binding 到真实 runtime / Program 的组装 |
+| [model_binding.py](model_binding.py) | DeepSeek V4 模型方法安装与恢复 |
+| [ascend_adapter.py](ascend_adapter.py) | DeepEP 布局与原生 Ascend F 适配 |
+
+### 7.2 已有文件的功能修改
+
+以下路径相对 `python/sglang/srt/`：
+
+| 文件 | 修改内容 |
+| --- | --- |
+| `offloading/moe/__init__.py` | 导出新功能 |
+| `offloading/moe/interfaces.py` | LocalRoutes 和策略收尾等公共契约 |
+| `offloading/moe/execution.py` | coordinator 接入周期收尾与 eager adjust |
+| `offloading/moe/offloader.py` | 创建 PeriodicLFU 并接通 runtime |
+| `offloading/base.py` | eager step scope 入口 |
+| `model_executor/model_runner.py` | eager / replay 分流与 scope 调用 |
+| `hardware_backend/npu/graph_runner/npu_cudagraph_backend.py` | MoE owner graph lease 与清理 |
+
+`offloading/transfer.py` 相对该基线仅有格式调整，无功能变更。`programs.py`、`prefill.py`、`owner.py` 等基础设施直接复用，不计为本次新增实现。
+
+### 7.3 测试与文档
+
+`test/registered/unit/offloading/` 中新增七个文件并修改一个文件：
+
+- `test_periodic_lfu.py`
+- `test_cache_metadata.py`
+- `test_cache_runtime.py`
+- `test_cache_integration.py`
+- `test_cache_model_binding.py`
+- `test_cache_npu_test_support.py`
+- `test_npu_moe_graph_lifetime.py`
+- `test_moe_framework.py`（修改）
+
+以及 `test/manual/` 的三个文件：
+
+- `test_moe_cache_runtime_npu.py`
+- `test_moe_cache_metadata_npu.py`
+- `validate_moe_cache_npu.py`
+
+本文 `CACHE_DESIGN.zh-CN.md` 汇总上述实现和验证，不依赖其他专项或历史文档。
+
+### 7.4 已完成的代码精简
+
+- `CacheRuntime` 显式持有 `model_binding`、`prefill_pipeline` 和关闭回调，删除空安装回调、外部私有字段赋值及动态挂载 pipeline 的做法。
+- 模型安装统一为 `model_binding.install(runtime)`，去掉未使用的安装参数；关闭时恢复方法和 hooks，测试覆盖部分安装失败后的清理与重新安装。
+- `LocalRoutes` 统一放在公共 `interfaces.py`，Ascend adapter 不再为该数据结构依赖 runtime 模块。
+- 删除没有生产调用方的 `record_global_routes()`，计数入口统一使用 dispatch 后的 local expert ID。
+- 复用 metadata 的 `layer_layout`，去掉 runtime 中重复的层信息；由公共 coordinator 统一完成 LFU 收尾。
+- 保留独立的精确回填路径，因为它需要恢复原 slot，语义不同于周期热集合替换。
+
+## 8. 验证方法和已知结果
+
+### 8.1 一条命令验证基础流程
+
+在具备匹配 PyTorch、torch_npu、CANN 的 Ascend 环境，从包含上述代码和测试的完整仓库根目录执行：
+
+```bash
+python test/manual/validate_moe_cache_npu.py --device 0
+# 可选指定一个新的空目录：
+python test/manual/validate_moe_cache_npu.py --device 0 --output-dir ./moe-cache-check-current
+```
+
+无需下载大模型。脚本为每组创建独立进程，使用当前 checkout 的子模块，绕过与这些测试无关的 serving 顶层导入。它不安装依赖、不修改测试、不以 CPU 代替 NPU 通过硬件分组。
+
+| stage | 内容 | 测试数（a29b739） |
+| --- | --- | ---: |
+| cpu | offloading UT：算法、元数据、执行计划、框架接线、模型安装、生命周期 | 134 |
+| npu_runtime | 小权重真实 H2D / D2D、等待、LFU 替换、映射发布、原 slot 回填 | 3 |
+| npu_metadata_graph | metadata / LFU 捕图及多组输入 replay，与 CPU 参考比较 | 1 |
+| npu_layout | compact receive 行、scale、padding 和输出顺序的 eager / graph 测试 | 2 |
+
+输出 `report.json`、各 stage 的 JSON 和日志。报告记录 commit、已跟踪文件状态、环境和覆盖限制。全部分组无 skip 地通过才返回 0 / `passed_within_scope`；失败返回 1，环境缺失或验证不完整返回 2。
+
+### 8.2 NPU 测试具体证明什么
+
+`npu_runtime` 使用两个逻辑层、每层四个专家，四个热 slot、两个执行 slot，每专家两块 8×8 FP32 矩阵：
+
+- pinned host→HBM 的 H2D、热池→执行 bank 的 D2D 及真实 event wait。
+- 重复 assignment 计数，第四次 forward 后 LFU 更新，下一步命中与参考计算一致。
+- 复制已完成但未 commit 时新映射仍不可见；commit 后才发布。
+- 模拟 prefill 覆盖热池后，按原 slot 回填并恢复映射、generation、usage、周期，执行区失效。
+
+该测试的搬运器先把设备计划读到 host，再提交真实 NPU copy，不能用于 decode graph 或性能验收。dispatch 是脚本数据，prefill 覆盖是模拟写入，F 是小矩阵计算。
+
+`npu_metadata_graph` 验证算法状态的设备执行和固定地址 replay，不包含完整权重搬运图。`npu_layout` 使用生产布局适配器，覆盖空输入、动态 counts、部分尾 wave、scale 和 padding；测试 F 为简单运算，不是原生量化 GMM。
+
+因此这六项测试不覆盖：真实多卡 DeepEP/HCCL、原生 Ascend MoE GMM / 量化结果、生产 transfer/prefill、完整 DeepSeek 推理、性能与实际拷贝重叠。
+
+### 8.3 已有验证记录
+
+- `a29b739` 代码精简后，本地 **134 项 CPU UT 通过**，格式与差异检查通过。
+- 用户回报精简前版本：133 项 CPU UT、3 项 NPU runtime、1 项 metadata graph、2 项 layout 全部通过；无改断言、skip 或 CPU fallback。
+- 用户报告环境：B072 镜像、torch_npu 2.10.0.post6。完整 report.json / 日志尚未归档到本工作区；该结果按用户回报记录，不外推为 `a29b739` 的实机复验。
+- 精简后的版本需要重新执行上述统一脚本。本文整理只改文档，不将既有结果伪称为此次重新运行。
+
+### 8.4 如何检查本次改动的验证结果
+
+1. 使用完整 checkout 运行第 8.1 节命令，保存报告中的 commit 和工作区状态，确保结果对应待验证代码。
+2. 检查四个 stage 均为 `passed`，测试数量与第 8.1 节一致，且没有 skip；进程退出码应为 0。
+3. 在 `cpu.log` 查看算法边界、batch 计数、模型安装、公共调用链及 graph 生命周期测试；这些测试验证框架适配逻辑，硬件依赖使用测试实现。
+4. 在 `npu_runtime.log` 查看真实复制、完成等待、复制与发布分离、第四步 LFU 替换及精确回填的三项测试。
+5. 在 `npu_metadata_graph.log` 和 `npu_layout.log` 查看状态 replay、动态有效行、padding、scale 及行顺序恢复结果。
+6. 保留 `report.json` 和四份日志，将结论限定在第 8.2 节的覆盖范围。单个分组失败时，先依据对应日志定位该层功能，不把部分通过记为整体通过。
