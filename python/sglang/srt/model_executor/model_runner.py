@@ -2060,9 +2060,14 @@ class ModelRunner:
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
+                with (
+                    self.offloader.eager_step_scope(forward_batch)
+                    if not self.is_draft_worker
+                    else contextlib.nullcontext()
+                ):
+                    ret = self.eager_runner.execute(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

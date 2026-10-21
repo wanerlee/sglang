@@ -23,6 +23,10 @@ class BaseOffloader(ABC):
         """Host lifecycle around eager execution or graph replay."""
         return nullcontext()
 
+    def eager_step_scope(self, forward_batch):
+        """Device step hooks around an actual eager invocation, never replay."""
+        return nullcontext()
+
     @property
     def forbid_copy_engine_usage(self):
         return False

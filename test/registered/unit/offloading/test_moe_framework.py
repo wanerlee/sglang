@@ -25,6 +25,7 @@ from sglang.srt.offloading.moe.interfaces import (
 )
 from sglang.srt.offloading.moe.offloader import DeepSeekV4Adapter, MoEOffloaderV2
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner, OwnerState
+from sglang.srt.offloading.moe.periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy
 from sglang.srt.offloading.moe.policy import TensorLFUPolicy
 from sglang.srt.offloading.moe.programs import ComposedDFCProgram
 from sglang.srt.offloading.moe.resources import (
@@ -466,6 +467,44 @@ class TestLFU(unittest.TestCase):
 
 
 class TestIntegration(unittest.TestCase):
+    def test_periodic_policy_binds_after_catalog_registration(self):
+        backend = FakeBackend()
+        original_finalize = backend.finalize
+
+        def finalize(layers, cat, cfg, policy):
+            self.assertIsInstance(policy, PeriodicLFUPolicy)
+            self.assertEqual(policy.catalog, cat)
+            state = policy.allocate_state(cat.num_experts, "cpu")
+            target = torch.empty(cfg.hot_slots(cat), dtype=torch.int64)
+            slots = torch.tensor([0, -1, 1, -1, 2, -1, -1, 3])
+            # A bound runtime must use this sequence at each valid step tail.
+            for _ in range(4):
+                policy.update_statistics(
+                    state, torch.tensor([0, 3, 0, 0, 0, 2, 0, 0]), torch.tensor(True)
+                )
+                policy.select_hot_set(state, slots, target)
+                policy.finish_step(state)
+            self.assertEqual(target.tolist(), [1, 2, 5, 7])
+            return original_finalize(layers, cat, cfg, policy)
+
+        backend.finalize = finalize
+        facade = MoEOffloaderV2(
+            config(),
+            backend,
+            adapter=IdentityAdapter(),
+            periodic_lfu_config=PeriodicLFUConfig("unused.json"),
+        )
+        facade.wrap_modules(catalog().layers)
+        facade.post_init()
+        facade.close()
+        with self.assertRaises(ValueError):
+            MoEOffloaderV2(
+                config(),
+                FakeBackend(),
+                policy=TensorLFUPolicy(),
+                periodic_lfu_config=PeriodicLFUConfig("unused.json"),
+            )
+
     def test_legacy_base_is_noop(self):
         offloader = BaseOffloader()
         self.assertEqual(offloader.wrap_modules(iter([1, 2])), [1, 2])
