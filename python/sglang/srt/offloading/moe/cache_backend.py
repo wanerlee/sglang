@@ -5,8 +5,12 @@ It supplies weight pools, transfer and prefill pipeline only; this module owns
 the model/runtime integration. No alternate transport or eager serving fallback.
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
+
+from ..transfer import WeightTransferBackend
 from .ascend_adapter import (
     AscendDeepEPDispatcher,
     AscendDispatchLayout,
@@ -17,6 +21,7 @@ from .cache_runtime import CacheExecutionContext, CacheRuntime
 from .config import fixed_waves
 from .interfaces import MoEBackend, RuntimeCapabilities
 from .model_binding import DeepSeekV4ProgramBinding, LayerPrograms
+from .prefill import PrefillWeightPipeline
 from .programs import (
     DecodeLocalExpertProgram,
     DispatchOnceProgram,
@@ -24,6 +29,11 @@ from .programs import (
     PrefillLocalExpertProgram,
 )
 from .state import ResidencyState
+
+if TYPE_CHECKING:
+    import torch
+
+    from .resources import Allocation
 
 
 @dataclass
@@ -38,25 +48,25 @@ class CacheBackendBinding:
     """
 
     device_module: object
-    device: object
+    device: torch.device | str
     compute_stream: object
     copy_stream: object
-    transfer: object
+    transfer: WeightTransferBackend
     hot_bindings: ExpertBankBindings
     execution_bindings: ExpertBankBindings
-    prefill_pipeline: object
-    borrow_hot_arena: object
-    resources: tuple
+    prefill_pipeline: PrefillWeightPipeline
+    borrow_hot_arena: Callable[[], None]
+    resources: tuple[Allocation, ...]
     expert_nbytes: int
     bank_slots: int
     max_dispatch_rows: int
     hidden_size: int
-    output_dtype: object
+    output_dtype: torch.dtype
     capabilities: RuntimeCapabilities
 
 
 class CacheBackend(MoEBackend):
-    """Injected into the existing MoEOffloaderV2 / ModelRunner entry point.
+    """DeepSeek V4 + Ascend/DeepEP binding for MoEOffloaderV2 / ModelRunner.
 
     prepare_weights(decoder, spec): establish host checkpoint targets.
     bind_weights(layers, catalog, config): return CacheBackendBinding.
@@ -124,14 +134,12 @@ class CacheBackend(MoEBackend):
             capabilities=binding.capabilities,
             expert_nbytes=binding.expert_nbytes,
             resources=tuple(binding.resources) + layout.allocations(),
-            prefill_program=None,
-            install_programs=None,
             borrow_hot_arena=binding.borrow_hot_arena,
+            model_binding=DeepSeekV4ProgramBinding(layers),
+            prefill_pipeline=binding.prefill_pipeline,
+            close_weights=self.close_weights,
         )
         self.runtime = runtime  # Preserve partially assembled work for cleanup.
-        runtime.model_binding = DeepSeekV4ProgramBinding(layers, runtime)
-        runtime._install_programs = runtime.model_binding.install
-        runtime.close_weights = self.close_weights
         decode, prefill = {}, {}
         for decoder, spec in layers:
             experts = decoder.mlp.experts
@@ -164,9 +172,6 @@ class CacheBackend(MoEBackend):
             )
         runtime.decode_program = LayerPrograms(decode)
         runtime.prefill_program = LayerPrograms(prefill)
-        # One physical pipeline serves layers serially; cleanup must reach its
-        # background submitter even though programs are selected by layer ID.
-        runtime.prefill_program.pipeline = binding.prefill_pipeline
         runtime.initialize(self.model_id)
         return runtime
 

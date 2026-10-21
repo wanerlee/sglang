@@ -623,6 +623,34 @@ class TestCacheModelBinding(unittest.TestCase):
             adapter.write_wave(layout, wave, result.output, self.runtime.context)
         self.assertEqual(layout.output.shape, (0, 2))
 
+    def test_partial_model_install_can_be_closed_and_reinstalled(self):
+        from unittest.mock import patch
+
+        from sglang.srt.offloading.moe.model_binding import DeepSeekV4ProgramBinding
+
+        decoder = Decoder(3)
+        spec = self.runtime.cache.catalog.offloaded_layers[0]
+        binding = DeepSeekV4ProgramBinding(((decoder, spec),))
+        self.addCleanup(binding.close)
+        hidden = torch.ones(3, 2)
+        original = decoder(hidden, self.routing())
+        with patch.object(
+            decoder,
+            "register_forward_pre_hook",
+            side_effect=RuntimeError("hook failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "hook failed"):
+                binding.install(self.runtime)
+        binding.close()
+        torch.testing.assert_close(decoder(hidden, self.routing()), original)
+        binding.install(self.runtime)
+        with self.assertRaisesRegex(RuntimeError, "already installed"):
+            binding.install(self.runtime)
+        binding.close()
+        torch.testing.assert_close(
+            decoder.forward_hc_pre_from_prev(hidden, self.routing()), original
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

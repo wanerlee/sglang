@@ -84,11 +84,10 @@ class CacheMetadataAdapter:
         self.catalog = catalog
         self.residency = residency
         self.policy = policy
-        self._layers = {
+        self.layer_layout = {
             layer.layer_id: (
                 catalog.key(layer.layer_id, 0),
                 layer.local_experts,
-                layer.global_start,
             )
             for layer in catalog.offloaded_layers
         }
@@ -122,7 +121,7 @@ class CacheMetadataAdapter:
         """
         import torch
 
-        offset, size, _ = self._layers[layer_id]
+        offset, size = self.layer_layout[layer_id]
         end = size if local_end is None else local_end
         if not 0 <= local_start <= end <= size:
             raise ValueError("Route range is outside the layer's local experts")
@@ -167,13 +166,6 @@ class CacheMetadataAdapter:
         self.stats.hits.add_(hits)
         self.stats.misses.add_(accesses - hits)
         return counts
-
-    def record_global_routes(self, layer_id, global_expert_ids, valid, **kwargs):
-        """Normalize contiguous EP ownership; foreign experts are not counted."""
-        _, _, global_start = self._layers[layer_id]
-        return self.record_local_routes(
-            layer_id, global_expert_ids - global_start, valid, **kwargs
-        )
 
     def save_decode_metadata(self):
         """Host phase transition, after prior streams have drained; no weights."""

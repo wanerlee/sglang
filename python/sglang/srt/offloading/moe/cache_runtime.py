@@ -60,14 +60,6 @@ class CacheExecutionContext(ExecutionContext):
         return ForwardCompletion(output, output, idle)
 
 
-@dataclass(frozen=True)
-class LocalRoutes:
-    """Normalized post-dispatch assignments; IDs are local to this rank/layer."""
-
-    expert_ids: object
-    valid: object
-
-
 class CacheRuntime(BoundMoERuntime):
     """Concrete cache lifecycle; hardware capabilities must be supplied honestly.
 
@@ -92,10 +84,10 @@ class CacheRuntime(BoundMoERuntime):
         capabilities,
         expert_nbytes,
         resources,
-        prefill_program,
-        install_programs,
         borrow_hot_arena,
-        residency_ops=None,
+        model_binding=None,
+        prefill_pipeline=None,
+        close_weights=None,
     ):
         import torch
 
@@ -105,7 +97,7 @@ class CacheRuntime(BoundMoERuntime):
         self.expert_nbytes = expert_nbytes
         self.residency = residency
         self.cache = CacheMetadataAdapter(catalog, residency, policy)
-        self.residency_ops = residency_ops or TensorResidencyOps(
+        self.residency_ops = TensorResidencyOps(
             residency, hot_bindings, execution_bindings
         )
         self.transfer = transfer
@@ -119,16 +111,14 @@ class CacheRuntime(BoundMoERuntime):
         )
         self.context = context
         self.bank_slots = bank_slots
-        self.prefill_program = prefill_program
-        self.decode_program = None  # Bound before install_model_hooks.
-        self._install_programs = install_programs
+        # Programs depend on this runtime's access and are assembled by backend
+        # before initialize/install. Model installation has one explicit owner.
+        self.prefill_program = None
+        self.decode_program = None
+        self.prefill_pipeline = prefill_pipeline
         self._borrow_hot_arena = borrow_hot_arena
         self._enabled = torch.zeros_like(residency.update_enabled)
         self._demand = torch.full_like(residency.execution_key, -1)
-        self._layers = {
-            layer.layer_id: (catalog.key(layer.layer_id, 0), layer.local_experts)
-            for layer in catalog.offloaded_layers
-        }
         extra = []
         for name, tensor in (("enabled", self._enabled), ("demand", self._demand)):
             extra.append(
@@ -148,8 +138,8 @@ class CacheRuntime(BoundMoERuntime):
             + tuple(extra)
         )
         self._runner = None
-        self.model_binding = None
-        self.close_weights = None
+        self.model_binding = model_binding
+        self.close_weights = close_weights
         self._initialized = False
         self._capture_contexts = []
         self._serving_context = context
@@ -197,6 +187,8 @@ class CacheRuntime(BoundMoERuntime):
             self._runner is not None
             or not self._initialized
             or self.decode_program is None
+            or self.prefill_program is None
+            or self.model_binding is None
         ):
             raise RuntimeError("Initialize weights and programs before installing once")
         if (
@@ -204,7 +196,7 @@ class CacheRuntime(BoundMoERuntime):
             and not self.transfer.supports_device_plans
         ):
             raise ValueError("Full decode graph requires device-plan transfer support")
-        self._install_programs(model_runner, self.prefill_program, self.decode_program)
+        self.model_binding.install(self)
         model_runner.capture_head_hooks.append(self._capture_head)
         model_runner.capture_tail_hooks.append(self._capture_tail)
         self._runner = model_runner
@@ -308,7 +300,7 @@ class CacheRuntime(BoundMoERuntime):
     def make_execution_request(self, layer_id, routes, wave, context):
         import torch
 
-        offset, size = self._layers[layer_id]
+        offset, size = self.cache.layer_layout[layer_id]
         width = wave.local_end - wave.local_start
         start = wave.bank * self.bank_slots
         if not (
@@ -360,7 +352,7 @@ class CacheRuntime(BoundMoERuntime):
 
     def synchronize(self):
         # abort stops/join prefill submitters before draining their device work.
-        pipeline = getattr(self.prefill_program, "pipeline", None)
+        pipeline = self.prefill_pipeline
         if pipeline is not None and self.context.phase is Phase.PREFILL:
             self.context.retain(pipeline.abort(self.context))
         self.context.device_module.synchronize()

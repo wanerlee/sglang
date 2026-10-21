@@ -4,7 +4,7 @@
 
 适用分支：`codex/moe-offload-dev`
 
-状态：周期 LFU、元数据适配，以及 cache 调用方的初始化、实际需求计划、slot 替换、传输调用和就绪后发布已实现。本轮补齐 DeepSeek V4 模型安装、Ascend/DeepEP 适配、CacheBackend 组装和 NPU graph lease，详见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。133 项 CPU UT 通过；实际 NPU transport、prefill 流水和物理 bindings 仍需同事交付。NPU 实机验收尚未执行。
+状态：周期 LFU、元数据适配，以及 cache 调用方的初始化、实际需求计划、slot 替换、传输调用和就绪后发布已实现。本轮补齐 DeepSeek V4 模型安装、Ascend/DeepEP 适配、CacheBackend 组装和 NPU graph lease，详见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。结构精简后 134 项 CPU UT 通过；实际 NPU transport、prefill 流水和物理 bindings 仍需同事交付。用户回报精简前版本的 6 项 NPU 基础测试通过，精简后的版本需复验；完整模型实机验收尚未执行。
 
 本设计实现离线热启动、在线计数、周期层内替换、换入量限制与热度衰减，以及搬运完成后发布映射。复用现有专家目录、缓存状态、执行 bank 和 owner 生命周期，以基本功能跑通为目标。
 
@@ -464,7 +464,7 @@ cache_updates.emit_step_end(context)
 # metadata 不执行 H2D 或映射发布；这两者经公共 access/residency 完成。
 ```
 
-`record_global_routes()` 可将连续 EP 分片下的全局专家编号转换为 local ID；其他 rank 的专家、负编号、越界项及 padding 不计数。若调用方持有的是每专家聚合 token 数，需要先另接计数适配，不能把一个专家编号当成只有一次访问。
+实际入口 `record_local_routes()` 接收 dispatch 后本 rank 的 local ID；无生产调用方的 `record_global_routes()` 已删除。负编号、越界项及 padding 不计数。若调用方持有的是每专家聚合 token 数，需要先另接计数适配，不能把一个专家编号当成只有一次访问。
 
 两种分波计数接法二选一：
 

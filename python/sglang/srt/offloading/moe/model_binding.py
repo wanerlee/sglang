@@ -27,15 +27,16 @@ class DeepSeekV4ProgramBinding:
     changing logical expert counts. All handles are removed on runtime close.
     """
 
-    def __init__(self, layers, runtime):
+    def __init__(self, layers):
         self.layers = tuple(layers)
-        self.runtime = runtime
+        self.runtime = None
         self._handles = []
         self._forwards = []
 
-    def install(self, model_runner, prefill_program, decode_program):
-        if self._forwards:
+    def install(self, runtime):
+        if self.runtime is not None:
             raise RuntimeError("Model programs are already installed")
+        self.runtime = runtime
         for decoder, spec in self.layers:
             experts = decoder.mlp.experts
             self._forwards.append((experts, "forward", experts.__dict__.get("forward")))
@@ -101,3 +102,4 @@ class DeepSeekV4ProgramBinding:
                 setattr(module, name, previous)
         self._handles.clear()
         self._forwards.clear()
+        self.runtime = None

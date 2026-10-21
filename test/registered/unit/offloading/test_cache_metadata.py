@@ -85,13 +85,13 @@ class TestRouteAccounting(unittest.TestCase):
             (5, 2, 3),
         )
 
-    def test_global_ids_foreign_rank_and_layer_identity(self):
+    def test_local_ids_are_counted_separately_per_layer(self):
         cache = adapter()
         cache.begin_step(torch.tensor(True))
-        ids = torch.tensor([0, 3, 4, 5, 7, 8, -1])
+        ids = torch.tensor([-4, -1, 0, 1, 3, 4, -5])
         valid = torch.ones_like(ids, dtype=torch.bool)
-        cache.record_global_routes(3, ids, valid)
-        cache.record_global_routes(4, ids, valid)
+        cache.record_local_routes(3, ids, valid)
+        cache.record_local_routes(4, ids, valid)
         self.assertEqual(
             cache.residency.step_access_count.tolist(), [1, 1, 0, 1, 1, 1, 0, 1]
         )

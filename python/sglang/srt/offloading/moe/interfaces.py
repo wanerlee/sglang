@@ -10,10 +10,22 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 from ..transfer import Completion, TransferTicket
 from .config import Phase
 from .state import ResidencyState
+
+
+@dataclass(frozen=True)
+class LocalRoutes:
+    """Post-dispatch assignments; expert IDs are local to this rank/layer."""
+
+    expert_ids: torch.Tensor
+    valid: torch.Tensor
 
 
 @dataclass(frozen=True)

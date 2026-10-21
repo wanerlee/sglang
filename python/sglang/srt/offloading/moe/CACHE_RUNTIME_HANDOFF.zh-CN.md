@@ -4,13 +4,13 @@
 
 适用分支：`codex/moe-offload-dev`。
 
-核对基线：`9da07a0`（2026-10-21）；本轮在此之上补齐真实框架适配，见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。下面区分代码实现与硬件验收；目前没有 NPU 实机通过记录。
+核对基线：`9da07a0`（2026-10-21）；本轮在此之上补齐真实框架适配，见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。下面区分代码实现与硬件验收；用户回报精简前版本 6 项 NPU 基础测试全部通过；结构精简后版本仍需复验，详见修改总结第 10 节。
 
 本轮全部修改概览见 [修改总结](CHANGE_SUMMARY.zh-CN.md)。
 
 当前已实现 cache 调用方：初始化、step 生命周期、dispatch 后计数、按实际需求准备 execution bank、LFU 更新、slot 计划、复制完成后发布、prefill 借池前快照及回填后恢复。decode 通过公共 access 调用 `materialize_into`，prefill pipeline 调用 `materialize_host_into`。
 
-CPU 测试使用延迟执行的测试搬运器和两分量专家权重，验证实际权重复制与计算结果。NPU 小权重脚本见第 6 节，本机没有 NPU，尚未实机验证。测试实现只位于测试目录，不作为 serving fallback。本轮已提供 DeepSeek V4 模型 installer、Ascend/DeepEP 适配和 CacheBackend 组装，复用已有原生专家算子与 EP dispatcher；实际 NPU transport、prefill pipeline 和物理 bindings 仍由同事交付。
+CPU 测试使用延迟执行的测试搬运器和两分量专家权重，验证实际权重复制与计算结果。NPU 小权重脚本见第 6 节，本机没有 NPU；用户回报精简前版本已通过相应实机测试，精简后需复验。测试实现只位于测试目录，不作为 serving fallback。本轮已提供 DeepSeek V4 模型 installer、Ascend/DeepEP 适配和 CacheBackend 组装，复用已有原生专家算子与 EP dispatcher；实际 NPU transport、prefill pipeline 和物理 bindings 仍由同事交付。
 
 ## 1. 代码落点与调用路径
 
@@ -111,7 +111,7 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 | 完成事件与内存复用 | transfer 返回复制完成票据；cache 发布映射；F 返回 `LocalExecution(output, read_done)` | 同事保证票据覆盖整个 bundle、所有内部复制流，并继承传入 stream 的前序依赖。你保证 F 的 read_done 覆盖全部权重读取；双方用真实 event 验证“读完才覆盖、复制完才发布”。 |
 | Prefill 流水与借池 | `start / validate_session / seal / acquire / finish / abort`；`borrow_hot_arena`，快照与原位置回填 | 同事交付具体 pipeline 和 bank 布局，明确热池可借字节范围、A/B 等区域是否别名、何时不再有后台写入。你接 owner 阶段切换和快照恢复。`finish/abort` 必须覆盖后台提交及设备工作，才能归还池。 |
 | Dispatch 与原生 F | `dispatch_completion`、`DispatchLayoutAdapter`、`LocalRoutes`、`run_experts(layer, dispatch_output, bindings, context)` | 主要由你实现目标模型/EP 适配；同事确认 pipeline 使用真实通信完成依赖。固定 wave 划分、local expert ID、padding mask、行顺序恢复与路由权重施加位置必须一致。Python dispatch 返回不等于通信完成。 |
-| Backend 组装与 graph | `MoEBackend.finalize()`、`install_programs(...)`，固定地址的计划/池/状态 | 你组装实际 backend、原生程序和模型 hooks；同事提供可捕图的 device transfer。共同验证后再声明能力，不能降低 serving capability gate 来绕过未完成的 graph 接入。 |
+| Backend 组装与 graph | `MoEBackend.finalize()`、`model_binding.install(runtime)`，固定地址的计划/池/状态 | 你组装实际 backend、原生程序和模型 hooks；同事提供可捕图的 device transfer。共同验证后再声明能力，不能降低 serving capability gate 来绕过未完成的 graph 接入。 |
 
 驻留表由 cache/runtime 统一发布；transport 不直接修改 `key_to_slot`、`slot_to_key`、`slot_valid` 或 generation。
 
@@ -179,7 +179,7 @@ MOE_TEST_NPU_DEVICE=1 PYTHONPATH=python python test/manual/test_moe_cache_runtim
 
 该测试驱动直接调用 `CacheRuntime` 的初始化、step、D/F/C、快照及恢复接口。它不创建需要完整 graph 能力的 serving owner，也不修改生产 capability gate：`full_decode_graph=False`、`supports_device_plans=False`。主机读计划会增加同步，因此不能用于性能测试或替代同事的动态图流水。dispatch 为单卡脚本路由，借池覆盖为模拟 prefill 写入，非真实模型 / HCCL / prefill 流水验证。
 
-成功应显示三个测试 `ok`、`Ran 3 tests` 和 `OK`。缺少 torch_npu 或设备时，脚本明确打印 `NPU flow was NOT validated`，直接执行返回码为 **2**；断言或执行失败返回 **1**，全部通过返回 **0**。不将 `skipped` 视为 NPU 验证通过。当前只在无 NPU 的本机验证了缺失环境分支、语法、格式及 CPU 参考计算，尚无实机通过记录。
+成功应显示三个测试 `ok`、`Ran 3 tests` 和 `OK`。缺少 torch_npu 或设备时，脚本明确打印 `NPU flow was NOT validated`，直接执行返回码为 **2**；断言或执行失败返回 **1**，全部通过返回 **0**。不将 `skipped` 视为 NPU 验证通过。当前只在无 NPU 的本机验证了缺失环境分支、语法、格式及 CPU 参考计算，精简前版本已有用户回报的通过结果，精简后需复验。
 
 ## 7. 当前完成情况与 NPU 联调顺序
 
@@ -195,7 +195,7 @@ python test/manual/validate_moe_cache_npu.py --device 0
 
 | 分组 | 当前用例数 | 验证范围 |
 | --- | --- | --- |
-| `cpu` | 133 | 全部 offloading CPU UT，包括模型 installer、CacheBackend、graph lease 的测试替身验证 |
+| `cpu` | 134 | 全部 offloading CPU UT，包括模型 installer、CacheBackend、graph lease 的测试替身验证 |
 | `npu_runtime` | 3 | 真实小权重 H2D/D2D、event 等待、LFU 替换、映射发布、快照回填 |
 | `npu_metadata_graph` | 1 | 真实 NPU metadata/LFU capture/replay，变化路由与 CPU 对照 |
 | `npu_layout` | 2 | 生产 AscendDispatchLayout 在 NPU eager/graph 下的行整理、scale、空 wave、尾组、NaN padding 屏蔽与固定输出地址；F 为简单算术 |

@@ -243,10 +243,6 @@ class Backend(MoEBackend):
             )
         )
 
-        def install(runner, prefill, decode):
-            runner.model.prefill = prefill
-            runner.model.decode = decode
-
         self.runtime = CacheRuntime(
             catalog=catalog,
             residency=state,
@@ -259,10 +255,12 @@ class Backend(MoEBackend):
             capabilities=RuntimeCapabilities(True, True, True),
             expert_nbytes=8,
             resources=resources,
-            prefill_program=object(),
-            install_programs=install,
+            model_binding=SimpleNamespace(
+                install=lambda runtime: None, close=lambda: None
+            ),
             borrow_hot_arena=lambda: self.hot.fill_(-999),
         )
+        self.runtime.prefill_program = object()
 
         def native(layer, routes, bindings, context):
             # Compute from execution weights, never from the host oracle.
@@ -357,6 +355,9 @@ class TestCacheRuntime(unittest.TestCase):
             model=SimpleNamespace(), capture_head_hooks=[], capture_tail_hooks=[]
         )
         self.offloader.bind_model_runner(self.runner)
+        # This fixture drives Programs directly; production model installation
+        # is exercised separately in test_cache_model_binding.py.
+        self.runner.model.decode = self.runtime.decode_program
         self.addCleanup(self.offloader.close)
 
     def batch(self, name="DECODE", global_mode=None, counts=None, extend=False):

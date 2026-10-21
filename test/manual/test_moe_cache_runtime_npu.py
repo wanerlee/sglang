@@ -310,8 +310,6 @@ class TestNPUCacheRuntime(unittest.TestCase):
                 ),
                 expert_nbytes=2 * DIM * DIM * self.host.element_size(),
                 resources=resources,
-                prefill_program=None,
-                install_programs=lambda *args: None,
                 borrow_hot_arena=self.borrow_hot,
             )
             self.addCleanup(self.close_runtime)

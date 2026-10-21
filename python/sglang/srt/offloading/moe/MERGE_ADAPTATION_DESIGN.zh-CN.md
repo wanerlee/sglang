@@ -388,3 +388,6 @@ CPU 测试仍以测试通信/搬运/硬件算子替身代替 HCCL、ACL 和 NPU 
 接下来双方对接的是物理交付，不再把“写我方模型 adapter”列为同事任务。NPU 上需用真实 physical binding 运行同一调用链；既有小权重脚本仍只覆盖其原有范围，不自动变成新 adapter 的实机验收。
 
 本轮本地验证：**133 项 offloading CPU UT 全部通过**（原 119 项 + 10 项模型适配 + 4 项 NPU graph 生命周期/无 offload 兼容测试）。未执行真实 NPU kernel 或 HCCL 测试。
+
+
+后续结构精简：模型安装改为 `model_binding.install(runtime)`，pipeline 由 runtime 显式持有；移除无调用方扩展并统一层元信息，详见 [修改总结第 10 节](CHANGE_SUMMARY.zh-CN.md#10-基础功能范围内的结构精简)。精简后 134 项 CPU UT 通过，6 项 NPU 基础测试需在新提交上复验。

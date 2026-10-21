@@ -3,11 +3,7 @@
 from .cache_backend import CacheBackend, CacheBackendBinding
 from .cache_metadata import CacheMetadataAdapter
 from .cache_residency import CopySource, TensorResidencyOps
-from .cache_runtime import (
-    CacheExecutionContext,
-    CacheRuntime,
-    LocalRoutes,
-)
+from .cache_runtime import CacheExecutionContext, CacheRuntime
 from .config import ExpertCatalog, ExpertLayerSpec, MoEOffloadConfig, Phase
 from .execution import (
     CacheUpdateCoordinator,
@@ -19,7 +15,7 @@ from .execution import (
     UpdatePlan,
     WeightLease,
 )
-from .interfaces import ExecutionContext
+from .interfaces import ExecutionContext, LocalRoutes
 from .offloader import MoEOffloaderV2
 from .owner import MoEOffloadOwner
 from .periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy, PeriodicLFUState

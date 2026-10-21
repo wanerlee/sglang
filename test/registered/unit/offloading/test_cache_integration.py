@@ -316,6 +316,7 @@ class TestMergedCacheIntegration(unittest.TestCase):
         transport = HostTransport(self.backend.device.log)
         ops = BorrowedHostResidency(self.backend, self.runtime.cache.catalog)
         pipeline = SequentialPipeline(ExpertWeightAccess(ops, transport))
+        self.runtime.prefill_pipeline = pipeline
         dispatcher = OneDispatch()
 
         def native(layer, routes, bindings, ctx):

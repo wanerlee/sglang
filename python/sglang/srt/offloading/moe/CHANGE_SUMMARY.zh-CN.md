@@ -6,7 +6,7 @@
 
 本次合并同事 `59cbb5d` 的 dispatch-once、H2D 公共接口和资源重命名；详细边界见 [合并适配设计](MERGE_ADAPTATION_DESIGN.zh-CN.md)。累计工作实现了周期 LFU、cache 元数据管理、权重加载与替换计划，以及通过现有搬运接口串联的 cache 调用方流程。同时补充了 CPU 调用链测试和独立 NPU 测试脚本。
 
-当前结论：**cache 侧算法与调用方已经实现，119 项 CPU 测试通过；生产 NPU 后端和真实模型绑定尚未完成，NPU 脚本尚未实机验证。** 同事的公共 Program/transfer 接口沿用其提交；我方负责本文列出的 cache 功能和接口适配。
+当前结论：**cache 算法、调用链和模型适配已实现；结构精简后 134 项 CPU UT 通过。** 用户回报精简前版本的 6 项 NPU 测试全部通过；精简后版本仍需用同一入口复验。真实生产 transfer/prefill 流水及完整模型联调不在该通过范围内。下文旧测试数量为阶段记录，最新结构见第 10 节。
 
 ## 1. 周期 LFU 算法
 
@@ -30,7 +30,7 @@
 新增 [cache_metadata.py](cache_metadata.py)。
 
 - `CacheMetadataAdapter`：负责 `begin_step → record_local_routes`、状态与快照；策略收尾由公共 `CacheUpdateCoordinator` 统一调用。
-- 路由适配：支持层内、rank 内专家编号；连续 EP 分片的 global ID 可转换为 local ID。过滤 padding、无效编号和不属于当前 wave 的分配。
+- 路由适配：接收 dispatch 后的 rank-local 专家编号，过滤 padding、无效编号和不属于当前 wave 的分配。已删除无生产调用方的 global-ID 转换入口。
 - Batch 统计：同一专家被多个 token 选中时累计多次；多 wave 不重复统计同一分配。
 - `CacheRouteStats`：记录本步 accesses、hits、misses；这些是路由分配次数，不是搬运次数。
 - `target_keys`：LFU 选出的目标集合；与当前映射的差分仅由 residency 计算，不维护重复的 keep/admit/evict 数组。
@@ -145,7 +145,7 @@ MOE_TEST_NPU_DEVICE=1 PYTHONPATH=python python test/manual/test_moe_cache_runtim
 
 不下载模型，不依赖同事的优化流水。该测试不注册成 serving backend，不宣称动态搬运入图、分布式 EP 或真实模型 prefill 支持。
 
-本机没有 `torch_npu`，**两个 NPU 脚本尚未实机验证**。已检查完整流程脚本的缺失环境分支：直接执行时缺少硬件返回码为 2，失败为 1，全部通过为 0，不将 skipped 当作验证通过。
+本机没有 `torch_npu`。最初交付时未执行实机测试；后续用户回报验证入口的 6 项 NPU 测试全部通过，范围及精简后复验要求以本文开头为准。完整流程脚本缺少硬件返回码为 2，失败为 1，全部通过为 0，不将 skipped 当作验证通过。
 
 ## 6. 文档交付
 
@@ -204,3 +204,13 @@ LFU 的层内配对、周期 4、门槛 2/差值 1.5、最多 96 次交换、衰
 物理交付仍需同事提供 host 加载/注册、权重池、真实 transfer、prefill pipeline 及其物理 host-plan/bank 视图；我方的模型 hook、dispatch adapter、F adapter、runtime 组装不再列为对方任务。具体字段及注入示例见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。LFU 参数和层内配对规则未改。
 
 本轮提交前 review 修正了图捕获失败路径：在 warmup 前获取 lease，重复 shape 在执行模型前拒绝；创建后立即由 backend 持有图，只有成功生成输出才允许 replay。失败后仍由 cleanup 排空设备、销毁未完成图，再释放 lease，不添加自动重试或 fallback。补充回归覆盖捕获失败、重复捕获、未加载 bank lane 含 NaN、零接收行的输出形状/类型，以及关闭后恢复 NPU 直接入口。
+
+## 10. 基础功能范围内的结构精简
+
+- 保留七个模块的职责；不修改 LFU 参数、复制计划语义和等待/发布顺序。
+- Runtime 构造时显式接收 `model_binding`、`prefill_pipeline` 和物理释放回调。删除 `_install_programs` 重复回调、外部私有字段赋值、动态追加的 `program.pipeline` 及清理时的属性探测。
+- `DeepSeekV4ProgramBinding.install(runtime)` 统一安装依赖，`close()` 恢复方法并断开 runtime 引用。Program 仍在 backend 中组装，因为它们依赖 runtime 的 access；这不新增组装框架。
+- 删除无调用方的可选 `residency_ops` 注入和 `record_global_routes()`。实际调用链只处理 dispatch 后的 local ID。
+- 层偏移/专家数量统一由 metadata 的 `layer_layout` 保存；runtime 复用。`LocalRoutes` 移入已有 `interfaces.py`，保持包级导出，Ascend adapter 不再反向导入 runtime。
+- 明确 CacheBackend 仅服务 DeepSeek V4 + Ascend/DeepEP，保留既有交接名称；补充原生 Tensor、wave、bank 组件和 physical binding 的具体类型，不增加新的协议层。
+- 既有 global-ID 辅助入口测试改为实际 local-ID 层隔离测试，新增部分安装失败后恢复、重新安装及重复安装拒绝的回归。**134 项 CPU UT 通过**；NPU 验证入口命令不变，6 项 NPU 测试需在精简后的提交上复验。

@@ -5,14 +5,23 @@ The existing NPU DeepEP dispatcher joins receive/combine work to the calling
 stream; AscendRunnerCore consumes the same weights/scales as the resident path.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
-from .cache_runtime import LocalRoutes
+from .config import ExpertWave, Phase
 from .execution import LocalExecution
-from .interfaces import DispatchLayoutAdapter, MoEDispatcher
+from .interfaces import DispatchLayoutAdapter, LocalRoutes, MoEDispatcher
 from .resources import Allocation, ResourceKind
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
+    )
 
 
 @dataclass(frozen=True)
@@ -25,10 +34,10 @@ class ExpertBankBindings:
     Prefill reservations can return different bank views with their own offsets.
     """
 
-    components: dict
-    bank_offsets: tuple
+    components: dict[str, torch.Tensor]
+    bank_offsets: tuple[int, ...]
 
-    def wave_components(self, wave):
+    def wave_components(self, wave: ExpertWave) -> dict[str, torch.Tensor]:
         start = self.bank_offsets[wave.bank]
         end = start + wave.local_end - wave.local_start
         if any(end > tensor.shape[0] for tensor in self.components.values()):
@@ -74,22 +83,22 @@ class AscendDeepEPDispatcher(MoEDispatcher):
 
 @dataclass
 class AscendWaveInput:
-    hidden_states: object
-    hidden_states_scale: object
-    expert_tokens: object
+    hidden_states: torch.Tensor
+    hidden_states_scale: torch.Tensor | None
+    expert_tokens: torch.Tensor
     routes: LocalRoutes
-    wave: object
-    row_order: object
-    valid: object
+    wave: ExpertWave
+    row_order: torch.Tensor
+    valid: torch.Tensor
 
 
 @dataclass
 class _Layout:
-    dispatched: object
-    counts: object
+    dispatched: DeepEPLLDispatchOutput | DeepEPNormalDispatchOutput
+    counts: torch.Tensor
     routes: LocalRoutes
-    output: object
-    current: object = None
+    output: torch.Tensor
+    current: AscendWaveInput | None = None
 
 
 class AscendDispatchLayout(DispatchLayoutAdapter):
@@ -118,8 +127,6 @@ class AscendDispatchLayout(DispatchLayoutAdapter):
         )
 
     def bind(self, dispatched, context):
-        from .config import Phase
-
         x = dispatched.hidden_states
         if x.ndim != 2 or x.shape[0] > self.output.shape[0]:
             raise ValueError("Expected bounded compact Ascend receive rows")
