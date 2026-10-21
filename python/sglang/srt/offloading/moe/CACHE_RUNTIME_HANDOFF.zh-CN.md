@@ -4,16 +4,21 @@
 
 适用分支：`codex/moe-offload-dev`。
 
+核对基线：`9da07a0`（2026-10-21）；本轮在此之上补齐真实框架适配，见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。下面区分代码实现与硬件验收；目前没有 NPU 实机通过记录。
+
 本轮全部修改概览见 [修改总结](CHANGE_SUMMARY.zh-CN.md)。
 
 当前已实现 cache 调用方：初始化、step 生命周期、dispatch 后计数、按实际需求准备 execution bank、LFU 更新、slot 计划、复制完成后发布、prefill 借池前快照及回填后恢复。decode 通过公共 access 调用 `materialize_into`，prefill pipeline 调用 `materialize_host_into`。
 
-CPU 测试使用延迟执行的测试搬运器和两分量专家权重，验证实际权重复制与计算结果。另新增 NPU 完整流程脚本，使用真实 stream/event 和小矩阵权重，见第 6 节；本机没有 NPU，尚未实机验证。测试实现只位于测试目录，不作为 serving fallback。尚未提供生产 NPU transport、原生专家算子或 EP dispatcher；也未验证完整 NPU graph 或重叠性能。
+CPU 测试使用延迟执行的测试搬运器和两分量专家权重，验证实际权重复制与计算结果。NPU 小权重脚本见第 6 节，本机没有 NPU，尚未实机验证。测试实现只位于测试目录，不作为 serving fallback。本轮已提供 DeepSeek V4 模型 installer、Ascend/DeepEP 适配和 CacheBackend 组装，复用已有原生专家算子与 EP dispatcher；实际 NPU transport、prefill pipeline 和物理 bindings 仍由同事交付。
 
 ## 1. 代码落点与调用路径
 
 | 文件 | 本次实现 |
 | --- | --- |
+| [cache_backend.py](cache_backend.py) | 将物理 binding 组装为 CacheRuntime、每层 decode/prefill Program 和真实模型 installer。 |
+| [model_binding.py](model_binding.py) | 安装 decoder 层首 hook 和 routed experts forward，关闭时恢复原方法。 |
+| [ascend_adapter.py](ascend_adapter.py) | 原生 DeepEP 通信接入、compact receive 行分组/恢复、原生 Ascend F 读取 bank 视图。 |
 | [cache_runtime.py](cache_runtime.py) | `CacheRuntime` 实现 `BoundMoERuntime` 的 cache 生命周期和捕图 hook；`make_execution_request` 接 D 后统计，公共 `DecodeLocalExpertProgram` / `ExpertWeightAccess` 串联 bank 准备和原生 F。 |
 | [cache_residency.py](cache_residency.py) | `TensorResidencyOps` 实现实际需求计划、保留幸存 slot、分配替换位置、失效旧读者映射及就绪后发布。 |
 | [cache_metadata.py](cache_metadata.py) | 保持原职责：计数、策略状态和元数据快照；LFU 收尾由公共 coordinator 统一调用。 |
@@ -96,28 +101,35 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 
 ## 3. 需要与 H2D 同事确认的事项
 
-| 对接项 | Cache 侧已提供 | 同事需提供 / 双方待确认 |
+公共方法签名已确定，不需要重做 LFU 或再加一套封装。下一步要确认的是实际 backend 能否按这些语义交付。下表中的“你”指 cache / 框架适配负责人，“同事”指 H2D / prefill 流水负责人。
+
+| 对接项 | 已定接口 / 语义 | 双方需要落定的内容与责任 |
 | --- | --- | --- |
-| 权重地址与格式 | canonical key、来源类别、目标 slot | `hot_bindings` / `execution_bindings` 的具体对象；host 权重、量化参数、stride、注册句柄和池地址的绑定方式。 |
-| 计划格式 | 上述 DeviceCopyPlan 编码、dtype、mask、固定容量 | 是否直接支持；如不同，由哪边做转换。空 mask / count=0 必须可执行。 |
-| H2D / D2D 职责 | HOST->bank、HOT_SLOT->bank、HOST->hot 三种调用 | 同事是否同时实现 HOT_SLOT 的 D2D；否则另指定实现者，不能把 cache hit 当作无需准备 bank。 |
-| 完成凭据 | 使用 TransferTicket；compute 流 wait 后再读权重或发布 | 返回的 completion 覆盖整个 bundle 和所有内部流；wait_on 仅建立设备依赖，不阻塞主机。 |
-| 内存覆盖保护 | 复制前 compute fence；copy 流等待；更新前失效受影响 slot | 同事内部流必须继承传入流的前序依赖；不能绕过等待提前覆盖。 |
-| Prefill 复用 | owner 排空前序工作，保存 snapshot；回填读取原 slot_to_key | `borrow_hot_arena` 实际可借范围、prefill 程序、内部流完成依赖；归还时按原 slot 回填完整 bundle。 |
-| Graph 动态复制 | 计划地址固定、内容设备侧变化；不在 caller 用 .item() 等读取路由 | NPU `DeviceTransferOps` 是否支持捕图后随输入变化的计划；普通 host copy loop 不能替代。 |
-| 权重存储生命周期 | 调用方持有 bindings；ticket 的 keepalive 随提交保活 | host pin/register 由谁管理，backend 关闭时谁释放。 |
+| 权重布局与 bindings | canonical key 定位完整专家 bundle；`hot_bindings` / `execution_bindings` 指定物理池 | 双方定一份具体布局：各权重与 scale 的 shape、dtype、stride、每 slot 字节数、kernel 视图。同事负责可供传输读取的 host 地址/注册，你负责 F 使用对应视图。host pin/register 的创建、保活与释放归属一并明确。 |
+| Decode 搬运 | `materialize_into(DeviceCopyPlan, bindings, stream) -> TransferTicket`；HOST→bank、HOT_SLOT→bank、HOST→hot | 同事提供三类复制及设备侧计划转换，明确 D2D 也包含在交付范围。支持任意 valid 空洞、零条目、实际 destination_slot；计划内容变化不能在 replay 时依赖 Python 读回。 |
+| Prefill 搬运 | `materialize_host_into(HostCopyPlan, bindings, stream) -> TransferTicket` | 同事提供 host 区间计划到实际复制的实现；双方明确字节偏移和组件布局与 decode 使用同一份权重存储。默认 `TensorResidencyOps` 只产生 decode 设备计划，prefill 的 HOST_ONLY reservation/provider 仍需后端提供。 |
+| 完成事件与内存复用 | transfer 返回复制完成票据；cache 发布映射；F 返回 `LocalExecution(output, read_done)` | 同事保证票据覆盖整个 bundle、所有内部复制流，并继承传入 stream 的前序依赖。你保证 F 的 read_done 覆盖全部权重读取；双方用真实 event 验证“读完才覆盖、复制完才发布”。 |
+| Prefill 流水与借池 | `start / validate_session / seal / acquire / finish / abort`；`borrow_hot_arena`，快照与原位置回填 | 同事交付具体 pipeline 和 bank 布局，明确热池可借字节范围、A/B 等区域是否别名、何时不再有后台写入。你接 owner 阶段切换和快照恢复。`finish/abort` 必须覆盖后台提交及设备工作，才能归还池。 |
+| Dispatch 与原生 F | `dispatch_completion`、`DispatchLayoutAdapter`、`LocalRoutes`、`run_experts(layer, dispatch_output, bindings, context)` | 主要由你实现目标模型/EP 适配；同事确认 pipeline 使用真实通信完成依赖。固定 wave 划分、local expert ID、padding mask、行顺序恢复与路由权重施加位置必须一致。Python dispatch 返回不等于通信完成。 |
+| Backend 组装与 graph | `MoEBackend.finalize()`、`install_programs(...)`，固定地址的计划/池/状态 | 你组装实际 backend、原生程序和模型 hooks；同事提供可捕图的 device transfer。共同验证后再声明能力，不能降低 serving capability gate 来绕过未完成的 graph 接入。 |
 
 驻留表由 cache/runtime 统一发布；transport 不直接修改 `key_to_slot`、`slot_to_key`、`slot_valid` 或 generation。
 
-## 4. 框架 / 原生后端仍需提供的绑定
+一个必须提前对齐的例子：`valid=[False, True, False, True]`、`destination_slot=[0,1,2,3]`、`count=2` 表示写 slot 1 和 3，不是写 slot 0 和 1。同事 H2D 文档所引用的本地 `group_pack_copy` 有选中项压紧语义，device adapter 必须保留公共计划的目标位置；不能直接把压紧序号当 slot。这里描述的是该文档指定实现，不能据此假定所有 MemFabric 版本相同。
 
-这些不是等 H2D 联调才能写的 cache 算法，也不能全部归给 H2D 同事：
+另一个需要实机确认的点：pinned host Tensor 不自动证明其地址可供设备 kernel 直接访问。按照同事的方案，需要确认同一份 host 权重既能用于 ACL 异步复制，也能合法注册/映射给 decode 的设备搬运实现，不能直接把 CPU `data_ptr()` 当设备可访问地址。
 
-1. 在真实 `MoEBackend.finalize()` 中构造并返回 `CacheRuntime`，提供真实权重 allocations、streams、bindings 和通过验证的 capabilities。
-2. 提供 `install_programs(model_runner, prefill_program, decode_program)`，将程序绑定到目标模型实际 routed-expert 路径。
-3. 将所用 EP dispatcher 输出转换成上述 `LocalRoutes`，实现 native F 对 execution bank 的绑定。当前测试 adapter 不适用于直接读取任意 DeepEP/NPU 输出。
-4. 提供原 prefill 流式程序，并把其后台工作接回 compute 的完成依赖。当前 runtime 对 decode 的每次复制都等待 ticket；不能替外部 prefill 程序推断未报告的流。
-5. 真实 graph backend 仍负责 graph bucket/owner lease 生命周期、固定地址与 workspace 预算、capture/replay 验证。正常图构建在 serving scope 外进行，统计开关默认为 0；不要在 serving scope 内临时 warmup/capture。
+## 4. 我方框架接线已补齐，剩余物理交付
+
+此前下列框架功能确实没有实现，不能仅称为“待联调”。本轮已补齐：
+
+1. `CacheBackend.finalize()` 创建 cache 状态、runtime 和逐层 Program，调用初始化；不再让同事实现该组装。
+2. `DeepSeekV4ProgramBinding` 将程序安装到真实 routed experts 路径，并保留原模型 shared/scaling 行为。
+3. `AscendDispatchLayout` 将本分支 NPU compact DeepEP receive counts 转为有效本地路由，`AscendExpertRunner` 复用原生 F；并非任意厂商 dispatcher 的通用适配。
+4. 使用公共 `PrefillDispatchOnceProgram` 接同事的 pipeline，经过 acquire/wait/F/read_done/finish；正常完成与失败清理都能到达流水。
+5. NPU graph backend 已接 owner lease，在 graph 销毁后释放。正常图构建在 serving scope 外，统计开关默认为 0。
+
+同事现在提供 `prepare_weights`、`bind_weights -> CacheBackendBinding`、`close_weights` 三个物理入口：host 加载/原生格式、权重池与注册、真实 transfer、prefill pipeline 及其 host-plan/bank 绑定。字段与示例见设计第 14 节。这些函数名是新明确的交接约定，不是声称同事已经实现同名函数；缺失的物理交付不再包含模型 hook、dispatch adapter 或 native F adapter。
 
 当前支持普通 DECODE / IDLE、EXTEND / MIXED 的阶段编排；verify、split prefill 和其他原分支未支持模式仍拒绝，不通过新 runtime 绕过原限制。全局模式和原始 token 数在 host scope 读取；全局有工作而本 rank 无路由时仍推进周期。
 
@@ -134,7 +146,7 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 
 这证明调用方流程及 CPU 语义，不证明真实 NPU H2D、完整 graph、分布式正确性或性能收益。
 
-当前本地运行：合并适配后原有 117 项，经本轮 review 删除 1 项无调用方辅助函数测试、增加 3 项回归，合计 119 项 CPU 测试通过；Ruff 检查 / 格式及 isort 通过。测试环境有 PyTorch CPU，没有 torch_npu。
+此前 review 基线为 119 项 CPU 测试通过。本轮新增真实模块安装/组装与 graph lease 测试，最终结果见修改总结；测试环境有 PyTorch CPU，没有 torch_npu。
 
 在具备项目依赖的环境中，可单独运行：
 
@@ -168,3 +180,61 @@ MOE_TEST_NPU_DEVICE=1 PYTHONPATH=python python test/manual/test_moe_cache_runtim
 该测试驱动直接调用 `CacheRuntime` 的初始化、step、D/F/C、快照及恢复接口。它不创建需要完整 graph 能力的 serving owner，也不修改生产 capability gate：`full_decode_graph=False`、`supports_device_plans=False`。主机读计划会增加同步，因此不能用于性能测试或替代同事的动态图流水。dispatch 为单卡脚本路由，借池覆盖为模拟 prefill 写入，非真实模型 / HCCL / prefill 流水验证。
 
 成功应显示三个测试 `ok`、`Ran 3 tests` 和 `OK`。缺少 torch_npu 或设备时，脚本明确打印 `NPU flow was NOT validated`，直接执行返回码为 **2**；断言或执行失败返回 **1**，全部通过返回 **0**。不将 `skipped` 视为 NPU 验证通过。当前只在无 NPU 的本机验证了缺失环境分支、语法、格式及 CPU 参考计算，尚无实机通过记录。
+
+## 7. 当前完成情况与 NPU 联调顺序
+
+### 7.1 已完成到哪一层
+
+| 部分 | 当前状态 | 尚未证明的内容 |
+| --- | --- | --- |
+| LFU 算法 | 已实现离线初始化、逐路由计数、每 4 个有效 decode forward 层内冷热配对、全 rank 最多 96 次交换、每轮 ×0.7 衰减；候选 usage≥2，热度差≥1.5 | 真实模型的命中率和性能收益；当前 verify 模式仍未开放，不能把算法支持 batch 计数等同于 verify 已接入 |
+| Cache 元数据与驻留管理 | 已实现实际需求计划、临时 execution 加载、幸存 slot 保留、复制后发布、读者完成保护、精确位置恢复 | NPU 算子支持和真实传输下的完整时序 |
+| 公共调用链与生命周期 | 公共 hooks、阶段切换、实际模型安装、Ascend/DeepEP 适配、native F bank 绑定、CacheBackend 组装及 NPU graph lease 均已实现 | 同事物理 binding 接入后的真实模型结果与多卡时序 |
+| 测试 | 119 项原有 CPU UT，加本轮模块调用与 graph 生命周期测试；两个既有 NPU 手工脚本已准备 | 真实 transport、完整 decode graph、真实 prefill pipeline 和多卡 EP 尚未实机验收 |
+
+LFU 的 1.5 是热度的差值，不是 1.5 倍。当前仍为层内配对，再跨层按热度差排序选出本轮交换；不是全局任意冷热配对。
+
+### 7.2 第一步：现在即可跑的 NPU 基线
+
+双方使用同一代码基线，记录提交号、NPU 型号、CANN、PyTorch、torch_npu 版本；接入同事 backend 时再记录其扩展和 MemFabric 构建版本。以下命令均从仓库根目录执行，环境需已安装对应依赖：
+
+```bash
+# CPU 语义与框架适配基线。
+PYTHONPATH=python python -m unittest discover -s test/registered/unit/offloading -p 'test_*.py' -v
+
+# 真实小矩阵 H2D/D2D、event 等待、发布和恢复：3 项。
+PYTHONPATH=python python test/manual/test_moe_cache_runtime_npu.py -v
+
+# 仅 metadata/LFU 的 NPU graph capture/replay：1 项。
+PYTHONPATH=python python test/manual/test_moe_cache_metadata_npu.py -v
+```
+
+runtime 脚本可通过第 6 节的 `MOE_TEST_NPU_DEVICE` 选择设备；metadata 脚本当前固定使用可见设备 0。两者都必须实际运行测试，不能将 skipped 计作通过。metadata 脚本的成功也不表示 H2D 或整个模型已经入图。
+
+小权重流程的可检查结果：初始热池 `[0,2,4,7]`，测试给定的四次 forward 后为 `[1,2,5,7]`；实际计算与独立 CPU 参考一致；新映射只在复制完成后发布；借池覆盖后按原 slot 恢复，并能继续 decode。这一步不依赖同事优化流水，可以先排查当前 NPU 对所用 tensor 操作和 event 的支持。
+
+### 7.3 第二步：替换测试搬运器，验证同事真实 backend
+
+保留 `test_moe_cache_runtime_npu.py` 的小权重、路由序列、CPU 参考与发布顺序断言，将测试 fixture 中的 `EagerNPUTransfer` 和 bindings 接到双方确定的真实 transfer。当前脚本没有选择生产 backend 的命令行参数，需要修改或参数化 fixture，不能只换一个启动参数。
+
+最小验收包括：HOST→bank、HOT→bank、HOST→hot，完整多组件 bundle，valid 有空洞和 count=0，原位置回填，以及等待前后映射状态。先验证结果与依赖，不要求这一步已经获得流水重叠收益。transfer 仍只复制，映射发布仍走现有 ResidencyOps。
+
+### 7.4 第三步：接单层真实 D/F/C 和 prefill 流水
+
+使用本轮已完成的 native F / dispatch adapter，接同事的真实物理 binding。使用相同权重、输入和路由，对比常驻权重执行与 offload 执行的结果。检查每个 batch 的有效 token-expert 分配只计一次、padding 不计数、路由权重不重复施加。
+
+随后与同事接真实 `PrefillWeightPipeline`：层开始启动，D 完成后 seal，逐 wave acquire/F，finish 归还资源。在同一进程中运行“若干 decode → prefill → decode”，验证一次 D/一次 C、后台工作结束后才回填、原热专家与 LFU 周期恢复、实际输出一致。现有模拟覆盖热池的测试不能替代这一步。
+
+### 7.5 第四步：验证完整单层 decode graph
+
+使用同事的 device-plan 实现，将真实权重准备、F、LFU 更新和映射发布一起 capture/replay。保持 tensor/池地址固定，改变路由、valid 和命中情况，至少跨过一个四步更新周期；与 eager 参考比较输出、usage 和最终驻留映射。检查空 wave、无交换轮次，以及替换后下一步命中。
+
+backend 注册、首次 kernel 加载等初始化放在 capture 前。不能用测试搬运器的 host 读计划替代动态图执行，也不能用只覆盖 metadata 的 graph 测试作为整层通过证据。功能正确后，再检查复制与计算的实际重叠。
+
+### 7.6 第五步：真实模型与两卡 EP
+
+在通过上述验证后，使用本轮已实现的 `CacheBackend` 和模型 installer，在符合现有能力门槛的配置下运行真实推理。先验证单卡/单层，再启用两卡 EP，检查全局 expert ID 到各 rank local ID 的映射、dispatch/combine 输出以及每 rank 独立 cache。本轮 native adapter 需要 DeepEP，单卡阶段若所用 DeepEP 构建不支持单 rank，就使用小权重单层测试后直接进入两卡。
+
+最小多卡用例包含：路由落到远端 rank、本地无输入但收到远端专家任务、某 rank 无有效路由但全局 decode 有工作、全局 prefill 下本地 IDLE。核对统计按 dispatch 后有效分配计数，周期按全局有效 forward 推进，阶段切换一致。现有小权重脚本虽然构造了 EP catalog，但没有真实跨卡通信，不能代替该验收。
+
+本轮联调先以结果正确、生命周期完整为完成标准。确认这些之后再测延迟、带宽和重叠收益；不为基本功能增加备用传输栈或新的抽象层。

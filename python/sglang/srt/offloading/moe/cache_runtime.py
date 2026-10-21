@@ -1,7 +1,7 @@
 """Cache-side runtime wiring with injected accelerator programs and transport.
 
-This is not an NPU backend. Native expert kernels, dispatch decoding, physical
-bindings, streams and device-plan copies are supplied at backend.finalize().
+CacheBackend assembles the model/dispatch/native-F adapters at finalize().
+Physical bindings, streams and device-plan copies come from the weight backend.
 The same orchestration is exercised by a delayed CPU transport in unit tests.
 """
 
@@ -73,7 +73,7 @@ class CacheRuntime(BoundMoERuntime):
 
     backend.finalize creates this, builds decode_program with
     DecodeLocalExpertProgram, initializes hot weights, then returns the runtime.
-    install_programs binds those programs to the model (native backend concern).
+    DeepSeekV4ProgramBinding installs those programs on the actual model.
     The baseline serializes copies against readers; pipelined overlap can replace
     the scheduling after the transport contract is validated.
     """
@@ -148,6 +148,8 @@ class CacheRuntime(BoundMoERuntime):
             + tuple(extra)
         )
         self._runner = None
+        self.model_binding = None
+        self.close_weights = None
         self._initialized = False
         self._capture_contexts = []
         self._serving_context = context
@@ -369,9 +371,15 @@ class CacheRuntime(BoundMoERuntime):
 
     def close(self):
         # Owner synchronizes and releases graph leases before calling close.
+        if self.model_binding is not None:
+            self.model_binding.close()
+            self.model_binding = None
         if self._runner is not None:
             self._runner.capture_head_hooks.remove(self._capture_head)
             self._runner.capture_tail_hooks.remove(self._capture_tail)
             self._runner = None
         self.context.clear()
         self._capture_contexts.clear()
+        if self.close_weights is not None:
+            close, self.close_weights = self.close_weights, None
+            close()

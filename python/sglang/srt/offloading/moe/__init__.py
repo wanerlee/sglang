@@ -1,5 +1,6 @@
 """Opt-in MoE offloading framework; accelerator execution is backend supplied."""
 
+from .cache_backend import CacheBackend, CacheBackendBinding
 from .cache_metadata import CacheMetadataAdapter
 from .cache_residency import CopySource, TensorResidencyOps
 from .cache_runtime import (
@@ -33,6 +34,8 @@ from .programs import (
 )
 
 __all__ = [
+    "CacheBackend",
+    "CacheBackendBinding",
     "CacheExecutionContext",
     "CacheMetadataAdapter",
     "CacheRuntime",

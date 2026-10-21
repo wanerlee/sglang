@@ -4,7 +4,7 @@
 
 适用分支：`codex/moe-offload-dev`
 
-状态：周期 LFU、元数据适配，以及 cache 调用方的初始化、实际需求计划、slot 替换、传输调用和就绪后发布已实现。见 [LFU 独立设计](LFU_DESIGN.zh-CN.md)、第 14 节及 [调用链与 H2D 交接表](CACHE_RUNTIME_HANDOFF.zh-CN.md)。CPU 测试搬运器验证调用链；真实 NPU transport、模型原生绑定和完整 graph 联调尚未完成。
+状态：周期 LFU、元数据适配，以及 cache 调用方的初始化、实际需求计划、slot 替换、传输调用和就绪后发布已实现。本轮补齐 DeepSeek V4 模型安装、Ascend/DeepEP 适配、CacheBackend 组装和 NPU graph lease，详见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。133 项 CPU UT 通过；实际 NPU transport、prefill 流水和物理 bindings 仍需同事交付。NPU 实机验收尚未执行。
 
 本设计实现离线热启动、在线计数、周期层内替换、换入量限制与热度衰减，以及搬运完成后发布映射。复用现有专家目录、缓存状态、执行 bank 和 owner 生命周期，以基本功能跑通为目标。
 

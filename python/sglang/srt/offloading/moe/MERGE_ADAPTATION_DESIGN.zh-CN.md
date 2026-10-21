@@ -2,7 +2,7 @@
 
 日期：2026-10-21
 目标分支：`wanerlee/sglang:codex/moe-offload-dev`
-状态：**已完成本地代码合并与 cache/框架调用方适配，review 精简后 119 项 CPU UT 通过。真实 NPU 后端与模型绑定仍待联调。**
+状态：**此前仅完成公共调用链，不能称为真实框架适配完成。本轮补齐 DeepSeek V4 模块安装、Ascend/DeepEP 数据适配、CacheBackend 组装和 NPU graph lease，详见第 14 节。实际传输和 prefill 流水继续由同事交付，不将我方模型接线交给同事。**
 
 ## 1. 基线与目标
 
@@ -60,7 +60,7 @@ flowchart TD
 | --- | --- | --- |
 | `PeriodicLFU`、`CacheMetadataAdapter` | usage、计数、周期、目标集合、快照 | 不参与缓存决策 |
 | `TensorResidencyOps` | 生成计划、保护读者、维护热池和执行区映射、返回发布完成票据 | 真实权重布局、bank 视图和地址绑定 |
-| `CacheRuntime`、模型/ModelRunner hook | phase 切换、上下文、Program 安装、forward 完成、图生命周期 | 真实设备能力及原生模型 backend 的绑定实现 |
+| `CacheRuntime`、模型/ModelRunner hook | phase 切换、上下文、真实模型 Program 安装、forward 完成、图生命周期及 CacheBackend 组装 | 物理权重存储、传输绑定与真实设备能力；不负责替我方完成模型接线 |
 | `ExpertWeightAccess` | 采用同事现有实现，统一调用入口 | 保持公共执行契约；不在 transfer 层实现 LFU |
 | `WholeMoEProgram` | 安装公共 Program，接真实 dispatch 布局和 native F | prefill pipeline 实现、动态分组和提交线程 |
 | transferOps | 依约提交计划、等待票据，不调用底层驱动 API | ACL/MemFabric 等后端、H2D/D2D、事件与地址转换 |
@@ -327,3 +327,64 @@ NPU 手工测试继续用小规模专家 bundle，核验真实 H2D、D2D、等�
 - 真实模型 dispatch/native F、ACL/MemFabric 后端和 NPU graph 验证仍依赖后端交付，未降低 capability gate。
 
 后续 review：删除未使用的独立统计 gate 和重复 runtime 字段，复用路由直方图，修正 decode 清理调用 prefill abort。119 项 CPU UT 通过，详见 [修改总结第 8 节](CHANGE_SUMMARY.zh-CN.md#8-合并后的代码-review-与精简)。
+
+## 14. 本轮补齐我方真实框架适配
+
+### 14.1 边界修正
+
+此前把“公共方法已接通 + 测试 backend 通过”作为框架适配完成，是完成标准过窄。`install_programs` 还由测试回调代替、没有具体 CacheBackend，不能只归类为待联调。
+
+本轮不新增一套执行框架，以现有 `ResidencyOps` / `WholeMoEProgram` 为边界：
+
+| 我方负责并实现 | 同事的物理/流水交付 |
+| --- | --- |
+| cache 算法、decode slot 计划、等待与发布、快照回填 | `WeightTransferBackend` 的 HostCopyPlan / DeviceCopyPlan 真实执行 |
+| DeepSeek V4 decoder 层首接线、routed experts 执行替换 | 专家权重的原生物理布局、host 注册地址与权重池 |
+| DeepEP receive 布局 → wave → LFU 本地需求，原顺序 combine | Prefill pipeline 的首组预取、分组提交和后台线程 |
+| AscendRunnerCore 读取 bank 的权重/scale 视图，返回 read_done | Prefill 物理区间、HOST_ONLY host-plan provider 和组合 lease 的真实 bank 视图（属于流水与地址布局） |
+| backend/runtime/Program 组装，以及 NPU graph 生命周期接线 | 复制完成依赖与真实 graph 能力声明 |
+
+框架适配不需要用户提供权重文件或先指定量化格式。复用原生 Ascend runner 和它的量化信息字段；具体物理绑定必须与模型原本使用的格式相同。
+
+### 14.2 计划与落地代码
+
+1. **模型安装**：[model_binding.py](model_binding.py) 的 `DeepSeekV4ProgramBinding` 在已登记的卸载 decoder 安装层首 pre-hook，并包装 NPU 模型实际直接调用的 `forward_hc_pre_from_prev`；直接调用方法不会触发 Module hook，不能漏掉此入口。routed 计算替换 `mlp.experts.forward`，Router、shared experts、MLP 缩放留在原路径；保留 FusedMoE 输出裁剪和必要的 reduction。`LayerPrograms` 按 layer ID 选择已绑定的 Program。关闭时移除 hook、恢复所有被替换的方法。
+2. **Dispatch/F 适配**：[ascend_adapter.py](ascend_adapter.py) 复用原生 `DeepEPDispatcher`，兼容实际外层 `MaybeTboDeepEPDispatcher` 的关键字调用约定，仅接受关闭 TBO 后的单个 DeepEP inner。以 NPU 的二维、按专家连续排列的 receive 行和每专家有效数量为输入，NORMAL 仅用于 eager prefill，LL 的数量保持在设备上。分 wave 时固定容量整理行与 activation scale，F 后恢复原 receive 顺序，只调用一次 combine；不重复施加 top-k 权重。
+3. **原生 bank 读取**：`ExpertBankBindings` 只表示原生组件 Tensor 与 bank 起始 slot。`AscendExpertRunner` 构造 `AscendQuantInfo` 的视图，调用原生 `AscendRunnerCore.run`，不重绑模型 Parameter，不新写量化核、不扩展权重精度。decode physical slot 必须与 `bank * bank_slots + lane` 一致。
+4. **组装**：[cache_backend.py](cache_backend.py) 的 `CacheBackend.finalize` 创建 ResidencyState、CacheRuntime、每层一次 D/C 的 decode/prefill Program、实际模型 installer，并初始化热权重。`CacheBackendBinding` 是物理交接数据，不是第二套 backend 抽象。公共 forward/capture hooks 继续走已有 ModelRunner 入口。
+5. **Graph 生命周期**：NPU graph backend 在 warmup 前为每个 shape 获取 owner lease，立即持有创建的 graph，仅捕获成功后发布输出并允许 replay。失败的未完成图同样由 cleanup 排空设备并销毁后释放 lease；重复捕获在 warmup 前拒绝。graph 仍存在时，owner 不能提前关闭权重存储。
+
+分组 F 采用基础固定容量整理：有效行按专家顺序排到前部，剩余零 padding 仅计入最后一个 F lane 的算子行数，F 后屏蔽。LFU 和加载需求使用真实 receive 数量，不将这些计算 padding 计为访问。这会带来额外 padding 计算，不声称是性能最优的打包 kernel。
+
+### 14.3 给同事的具体交付入口
+
+```python
+backend = CacheBackend(
+    model_id=model_id,
+    prepare_weights=prepare_weights,  # (decoder, spec)，建立 host 加载目标
+    bind_weights=bind_weights,        # (layers, catalog, config) -> CacheBackendBinding
+    close_weights=close_weights,      # 完成 drain / graph 销毁后的注册资源释放
+)
+offloader = MoEOffloaderV2(
+    config,
+    backend,
+    periodic_lfu_config=PeriodicLFUConfig(offline_stats_path),
+)
+# 交给已经存在的 ModelRunner(..., moe_offloader=offloader) 注入入口。
+```
+
+上述三个物理回调是对接入口，不是假称同事分支已经有同名函数。`bind_weights` 返回的字段以 `CacheBackendBinding` 定义为准，包括 streams、transfer、hot/execution bindings、prefill pipeline、借池回调、物理 allocations、容量、输出类型和 capabilities。它**不再负责**实现模型 hook、dispatch adapter、native F adapter 或组装 CacheRuntime。
+
+`components` 的 key 使用 `AscendQuantInfo` 名称；例如模型属性叫 `w13_weight_scale_inv` 时，由物理绑定映射到 `w13_weight_scale`。host 注册句柄可保留在 bindings 的扩展字段及 transfer ticket 中。不能把 CPU data_ptr 自动当成设备可访问地址。
+
+同事返回的 prefill pipeline 沿用原有 `access`：其 HOST_ONLY reservation 的 bindings 也要提供上述原生视图。它可以把 A/a 等别名映射为不同 bank 起点，但不能重复计入物理 allocations。pipeline 自己调度 H2D；我方程序负责等待、F 和 read_done 归还。
+
+### 14.4 验收与范围
+
+新增测试从实际 `torch.nn.Module` 调用进入我方生产 installer/backend/Program，不再用空的 install 回调。覆盖常驻层不替换、一次 D/C、重复 assignment、四步 LFU、bank 地址、padding/空 wave、设备计数不读回 host、原生 F 两次投影的参数传递、read_done 顺序、decode→prefill→decode 及恢复原 forward；另执行 NPU graph backend 的 capture/cleanup 方法验证 lease 生命周期。
+
+CPU 测试仍以测试通信/搬运/硬件算子替身代替 HCCL、ACL 和 NPU kernel。Ascend F 测试执行原 `AscendRunnerCore.run` 的方法体，仅替换硬件原语。当前支持范围明确为本分支 Ascend 的 compact DeepEP 格式，不扩展 CUDA 的三维 padded DeepEP、其他 dispatcher、verify 或新的量化格式。
+
+接下来双方对接的是物理交付，不再把“写我方模型 adapter”列为同事任务。NPU 上需用真实 physical binding 运行同一调用链；既有小权重脚本仍只覆盖其原有范围，不自动变成新 adapter 的实机验收。
+
+本轮本地验证：**133 项 offloading CPU UT 全部通过**（原 119 项 + 10 项模型适配 + 4 项 NPU graph 生命周期/无 offload 兼容测试）。未执行真实 NPU kernel 或 HCCL 测试。

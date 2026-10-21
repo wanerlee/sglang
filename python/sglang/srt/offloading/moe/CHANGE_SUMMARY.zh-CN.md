@@ -158,6 +158,8 @@ MOE_TEST_NPU_DEVICE=1 PYTHONPATH=python python test/manual/test_moe_cache_runtim
 
 ## 7. 尚待完成与对接边界
 
+本节为此前交付时的缺口记录；模型/dispatcher 绑定已在第 9 节补齐，当前边界以第 9 节及合并适配设计第 14 节为准。
+
 | 待完成项 | 说明 |
 | --- | --- |
 | 生产 NPU transport | 真实权重布局、host 注册、目标池 bindings、H2D/D2D 实现，以及覆盖所有相关流的完成凭据。测试搬运器不能替代它。 |
@@ -184,3 +186,21 @@ Review 范围：相对同事 `59cbb5d` 的 cache/LFU、框架接入、公共接�
 LFU 的层内配对、周期 4、门槛 2/差值 1.5、最多 96 次交换、衰减 0.7 均未变化。发布完成票据、F 最后读者依赖和异步资源保活仍是正确性所需，予以保留。
 
 验证：原 117 项测试删除 1 项无调用方辅助 gate 测试，增加 3 项针对性回归，**119 项 CPU UT 全部通过**。真实 NPU H2D/D2D、生产模型绑定及完整 graph 尚未在本机验证。
+
+## 9. 补齐我方模型与框架适配
+
+纠正之前“框架适配已完成”的表述：此前完成的是公共调用链，真实模型 installer 和原生 dispatch/F 接线仍缺失。本轮补齐这些我方任务，实际驱动搬运及 prefill 流水继续由同事负责。
+
+| 代码 | 本轮实现 |
+| --- | --- |
+| [cache_backend.py](cache_backend.py) | CacheBackend 接物理权重 binding，构造 cache 状态、runtime、每层 decode/prefill Program、installer，初始化热缓存；不要求同事组装模型执行链。 |
+| [model_binding.py](model_binding.py) | 接 DeepSeek V4 routed experts；覆盖 NPU 直接调用的 `forward_hc_pre_from_prev` 层首入口，保留 shared/scaling 与常驻层；关闭时恢复原方法。 |
+| [ascend_adapter.py](ascend_adapter.py) | 兼容原生 DeepEP 的外层关键字 wrapper；compact receive 行分 wave、scale 同步整理、padding 排除、原顺序 combine；复用 AscendRunnerCore 与原生 bank 权重/scale 视图。 |
+| [cache_runtime.py](cache_runtime.py) | 安装器和物理权重释放的关闭路径，先结束 graph/设备使用，再恢复模型方法和释放物理绑定。 |
+| [NPU graph backend](../../hardware_backend/npu/graph_runner/npu_cudagraph_backend.py) | shape 级 owner lease 与 graph cleanup 接线；保留不启用 MoE offload 时的原构造行为。 |
+
+新增 10 项模型调用测试及 4 项 graph 生命周期/兼容测试，**133 项 CPU UT 全部通过**。测试执行实际生产 backend/adapter/installer，并抽取原生 Ascend F 与 dispatcher wrapper 的方法体；HCCL、NPU kernel 和搬运由 CPU 测试替身提供。覆盖 decode→prefill→decode、LFU、读取依赖、恢复方法、动态 receive counts 和 padding，不以此宣称 NPU 已跑通。
+
+物理交付仍需同事提供 host 加载/注册、权重池、真实 transfer、prefill pipeline 及其物理 host-plan/bank 视图；我方的模型 hook、dispatch adapter、F adapter、runtime 组装不再列为对方任务。具体字段及注入示例见 [合并适配设计第 14 节](MERGE_ADAPTATION_DESIGN.zh-CN.md#14-本轮补齐我方真实框架适配)。LFU 参数和层内配对规则未改。
+
+本轮提交前 review 修正了图捕获失败路径：在 warmup 前获取 lease，重复 shape 在执行模型前拒绝；创建后立即由 backend 持有图，只有成功生成输出才允许 replay。失败后仍由 cleanup 排空设备、销毁未完成图，再释放 lease，不添加自动重试或 fallback。补充回归覆盖捕获失败、重复捕获、未加载 bank lane 含 NaN、零接收行的输出形状/类型，以及关闭后恢复 NPU 直接入口。
