@@ -24,9 +24,7 @@ from sglang.srt.offloading.moe.state import ResidencyState
 def make_cache(device):
     cat = ExpertCatalog(tuple(ExpertLayerSpec(i, 8, 2, 1) for i in (3, 4)))
     state = ResidencyState.allocate(8, 4, 2, device)
-    state.key_to_slot.copy_(
-        torch.tensor([0, -1, 1, -1, 2, -1, -1, 3], device=device)
-    )
+    state.key_to_slot.copy_(torch.tensor([0, -1, 1, -1, 2, -1, -1, 3], device=device))
     state.slot_to_key.copy_(torch.tensor([0, 2, 4, 7], device=device))
     state.slot_valid.fill_(True)
     policy = PeriodicLFUPolicy(PeriodicLFUConfig("unused.json"), cat)
@@ -76,9 +74,7 @@ class TestNPUCacheMetadata(unittest.TestCase):
 
         for step in range(10):
             host_routes = torch.tensor(
-                [[1, 1, 1], [1, 1, -1]]
-                if step < 5
-                else [[3, 3, 0], [2, 2, 0]]
+                [[1, 1, 1], [1, 1, -1]] if step < 5 else [[3, 3, 0], [2, 2, 0]]
             )
             host_valid = torch.ones_like(host_routes, dtype=torch.bool)
             host_valid[0, 2] = step % 2 == 0
@@ -95,10 +91,6 @@ class TestNPUCacheMetadata(unittest.TestCase):
                     getattr(cpu.policy_state, name),
                 )
             torch.testing.assert_close(npu.target_keys.cpu(), cpu.target_keys)
-            for name in ("keep", "admit", "evict"):
-                torch.testing.assert_close(
-                    getattr(npu.delta, name).cpu(), getattr(cpu.delta, name)
-                )
             for name in ("accesses", "hits", "misses"):
                 torch.testing.assert_close(
                     getattr(npu.stats, name).cpu(), getattr(cpu.stats, name)

@@ -14,7 +14,7 @@ CPU 测试使用延迟执行的测试搬运器和两分量专家权重，验证�
 | --- | --- |
 | [cache_runtime.py](cache_runtime.py) | `CacheRuntime` 实现 `BoundMoERuntime` 的 cache 生命周期和捕图 hook；`CacheLocalExpertProgram` 串联 D 后统计、bank 准备和原生 F。 |
 | [cache_residency.py](cache_residency.py) | `TensorResidencyOps` 实现实际需求计划、保留幸存 slot、分配替换位置、失效旧读者映射及就绪后发布。 |
-| [cache_metadata.py](cache_metadata.py) | 保持原职责：计数、LFU 调用、集合差分和元数据快照。 |
+| [cache_metadata.py](cache_metadata.py) | 保持原职责：计数、LFU 调用和元数据快照。 |
 | [ModelRunner](../../model_executor/model_runner.py) / [BaseOffloader](../base.py) / [MoEOffloaderV2](offloader.py) | 新增 eager step scope 的实际调用链；decode graph 分支直接返回，不重复执行 eager step hook。 |
 | [test_cache_runtime.py](../../../../../test/registered/unit/offloading/test_cache_runtime.py) | 测试 backend、延迟搬运、D/F/C 程序及框架调用链验证。 |
 
@@ -37,12 +37,16 @@ ModelRunner.forward -> offloader.forward_scope
      graph：已有 capture head/tail 记录 begin/end，replay 不重新调用 Python
   -> 每层、每波：D -> LocalRoutes -> 计数 -> 实际需求计划
        -> materialize_into(execution_bindings) -> wait -> 发布 bank -> native F -> C
-  -> 完整 step 末尾：LFU -> prepare_update
+  -> 完整 step 末尾：累计 LFU（eager 仅周期到期时继续）-> prepare_update
        -> materialize_into(hot_bindings) -> wait -> commit_update
   -> 记录本次提交的新完成事件 -> owner.finish_forward
 ```
 
 基础版本使用 compute -> copy -> compute 依赖串行保护复用内存；未实现跨波搬运与计算重叠。传输 API 仍为异步，不用每步 host synchronize。初始化和阶段切换允许主机等待。
+
+阶段判断不依赖 TBO 才提供的 `global_forward_mode`：结合 `is_extend_in_batch` 与全局 token 数推导。在全局 prefill 中，本地 IDLE 或 DECODE rank 都进入 prefill；在有效全局 decode 中，本地 IDLE rank 仍统计 dispatch 后的访问并推进周期。优先使用 `original_global_num_tokens_cpu`，避免把图 padding 当成有效 token；全局空闲时保持当前阶段，不触发无谓回填。
+
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 ## 2. 已落地的调用方数据约定
 
@@ -123,7 +127,7 @@ ModelRunner.forward -> offloader.forward_scope
 
 这证明调用方流程及 CPU 语义，不证明真实 NPU H2D、完整 graph、分布式正确性或性能收益。
 
-当前本地运行：调用链 14 项、NPU 脚本参考计算的 CPU 检查 2 项，加上原有 metadata、LFU、framework，合计 75 项 CPU 测试通过；Ruff 检查 / 格式及 isort 通过。测试环境有 PyTorch CPU，没有 torch_npu。
+当前本地运行：调用链 22 项、NPU 脚本参考计算的 CPU 检查 2 项，加上原有 metadata、LFU、framework，合计 82 项 CPU 测试通过；Ruff 检查 / 格式及 isort 通过。测试环境有 PyTorch CPU，没有 torch_npu。
 
 在具备项目依赖的环境中，可单独运行：
 

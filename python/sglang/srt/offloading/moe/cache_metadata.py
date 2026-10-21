@@ -38,46 +38,6 @@ def cache_update_enabled(
 
 
 @dataclass
-class CacheSetDelta:
-    """Expert-key masks [N], NOT slot-indexed arrays or ordered swap pairs."""
-
-    keep: object
-    admit: object
-    evict: object
-
-    @classmethod
-    def allocate(cls, num_experts, device):
-        import torch
-
-        return cls(
-            *(
-                torch.zeros(num_experts, dtype=torch.bool, device=device)
-                for _ in range(3)
-            )
-        )
-
-    def update(self, key_to_slot, target_keys):
-        """Pure set difference; no residency mutation or physical assignment.
-
-        Inputs follow CachePolicy: unique canonical keys, optionally -1 padded.
-        Tensor shapes are fixed; the result is independent of target key order.
-        Layer-local balance is guaranteed by PeriodicLFUPolicy, not imposed here.
-        """
-        import torch
-
-        count = key_to_slot.numel()
-        # One sentinel bucket accepts padding, including the N=0/K=0 case.
-        present = torch.zeros(count + 1, dtype=torch.int64, device=key_to_slot.device)
-        indexes = torch.where(target_keys >= 0, target_keys, count)
-        present.scatter_add_(0, indexes, torch.ones_like(target_keys))
-        wanted = present[:count] > 0
-        resident = key_to_slot >= 0
-        self.keep.copy_(resident & wanted)
-        self.admit.copy_(~resident & wanted)
-        self.evict.copy_(resident & ~wanted)
-
-
-@dataclass
 class CacheRouteStats:
     """Valid token-expert assignments, not unique experts or transferred bytes."""
 
@@ -160,7 +120,6 @@ class CacheMetadataAdapter:
         self.policy_state = policy.allocate_state(catalog.num_experts, device)
         self.saved_policy_state = policy.allocate_state(catalog.num_experts, device)
         self.target_keys = torch.full_like(residency.slot_to_key, -1)
-        self.delta = CacheSetDelta.allocate(catalog.num_experts, device)
         self.stats = CacheRouteStats.allocate(device)
         self.snapshot = HotMetadataSnapshot.allocate(residency)
         self._has_snapshot = False
@@ -233,19 +192,23 @@ class CacheMetadataAdapter:
             layer_id, global_expert_ids - global_start, valid, **kwargs
         )
 
-    def finish_step(self):
-        """Produce a target set and its delta; never allocate slots or publish."""
+    def finish_step(self, *, select_hot_set=True):
+        """Accumulate once; optionally select a target set, without publishing.
+
+        Eager callers can skip selection using the host forward-cycle counter.
+        Captured calls keep the default tensor-gated path. target_keys is only
+        an output when selection runs; skipped steps must not consume it.
+        """
         self.policy.update_statistics(
             self.policy_state,
             self.residency.step_access_count,
             self.residency.update_enabled,
         )
-        self.policy.select_hot_set(
-            self.policy_state, self.residency.key_to_slot, self.target_keys
-        )
+        if select_hot_set:
+            self.policy.select_hot_set(
+                self.policy_state, self.residency.key_to_slot, self.target_keys
+            )
         self.policy.finish_step(self.policy_state)
-        self.delta.update(self.residency.key_to_slot, self.target_keys)
-        return self.delta
 
     def save_decode_metadata(self):
         """Host phase transition, after prior streams have drained; no weights."""
@@ -270,8 +233,6 @@ class CacheMetadataAdapter:
         self.residency.update_enabled.zero_()
         self.stats.clear()
         self.target_keys.fill_(-1)
-        for field in fields(self.delta):
-            getattr(self.delta, field.name).zero_()
         self._has_snapshot = False
 
     def allocations(self):
@@ -283,7 +244,6 @@ class CacheMetadataAdapter:
         groups = {
             "policy": self.policy_state,
             "saved_policy": self.saved_policy_state,
-            "delta": self.delta,
             "stats": self.stats,
             "snapshot": self.snapshot,
         }

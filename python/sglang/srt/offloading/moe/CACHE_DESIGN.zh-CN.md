@@ -331,7 +331,7 @@ update_statistics(state, step_counts, update_enabled)
 # 禁用时保持 usage/step_mod 不变，并清空 update_due。
 
 select_hot_set(state, key_to_slot, target_keys)
-# 每次 forward 调用一次。
+# 图路径每次 forward 调用一次；eager 只在周期到期时调用。
 # 普通轮输出当前驻留集合；周期轮执行配对、限量，输出新目标集合。
 # 不改变 usage、不分配 slot、不搬运、不发布。
 
@@ -457,8 +457,8 @@ cache.begin_step(enabled)
 cache.record_local_routes(layer_id, local_ids, valid)
 
 # 所有层、所有 wave 结束后只调用一次。
-delta = cache.finish_step()
-# delta.keep / admit / evict 都是 bool[N]，按 expert key 索引。
+cache.finish_step()
+# 只输出目标集合；集合差分由 residency 准备更新计划时计算。
 # cache.target_keys 是目标集合；当前 residency 没有被修改。
 ```
 
@@ -471,13 +471,17 @@ delta = cache.finish_step()
 
 `stats.accesses/hits/misses` 是本次有效 token-expert 分配数。命中检查 key 到 slot、有效位及反向映射；不把“一个专家只搬一次”误计成一次访问。统计保留在设备 tensor 中，不在 replay 内读回 host。它不提供搬运字节数或流水时间等依赖后端的指标。
 
-### 14.2 模式开关与集合差分
+### 14.2 模式开关与目标集合
 
 `cache_update_enabled(forward_mode, has_global_tokens=..., warmup=..., capture=..., verify_enabled=False)` 在 host 根据真实调度信息计算开关，随后写入 replay 输入 tensor。不要把捕图期间的 False 固化为图内常量。
 
 传入 EP 协同执行所用的逻辑模式；不能直接用某个 rank 局部 IDLE 替代全组 decode 模式，也不能用本地计数和为零判断无有效 batch。prefill、warmup/capture、全组无 token 均关闭更新。verify 默认关闭；显式开启只提供计数语义，不解除 ModelRunner 现有的投机解码限制。
 
-`CacheSetDelta` 只计算当前集合与目标集合的交、差集，不决定专家放到哪个 slot。层内一换一由 LFU 保证，后续具体 residency 再将 admit/evict 转为双方约定的物理更新计划。
+metadata 只维护 `target_keys`。层内一换一由 LFU 保证，residency 直接根据目标集合与现有映射生成物理更新计划，不另存一份集合差分。
+
+阶段判断不依赖 TBO 才提供的 `global_forward_mode`：结合 `is_extend_in_batch` 与全局 token 数推导。在全局 prefill 中，本地 IDLE 或 DECODE rank 都进入 prefill；在有效全局 decode 中，本地 IDLE rank 仍统计 dispatch 后的访问并推进周期。优先使用 `original_global_num_tokens_cpu`，避免把图 padding 当成有效 token；全局空闲时保持当前阶段，不触发无谓回填。
+
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 ### 14.3 快照及资源归属
 
@@ -485,7 +489,7 @@ delta = cache.finish_step()
 - 后续权重恢复实现可读取 `cache.snapshot.slot_to_key/slot_valid`，确定原专家及原位置；本组件不生成 H2D 计划。
 - `restore_decode_metadata_after_refill()`：**仅在原权重已恢复到原 slot 后**还原元数据和 LFU 状态。方法本身不等待搬运，也不证明权重就绪。
 - 临时执行区内容不随快照保存，恢复时将 `execution_key/execution_valid` 失效，避免宣称旧权重仍在 bank 中。
-- `cache.allocations()` 报告组件持有的状态、快照、集合差分和统计 tensor。`residency.allocations()` 单独报告。排序等算子临时 workspace 仍由 backend 计入预算。
+- `cache.allocations()` 报告组件持有的状态、快照和统计 tensor。`residency.allocations()` 单独报告。排序等算子临时 workspace 仍由 backend 计入预算。
 
 ### 14.4 框架接入位置与尚待对齐部分
 
@@ -504,8 +508,8 @@ delta = cache.finish_step()
 
 ### 14.5 验证
 
-- CPU：`test/registered/unit/offloading/test_cache_metadata.py` 覆盖 batch/EP 计数、padding、互斥 wave、模式开关、同层差分、快照、资源核算和动态 tensor 回放。
-- NPU：`test/manual/test_moe_cache_metadata_npu.py` 可单独验证 LFU、计数和集合差分的 `NPUGraph` 捕获及变化输入回放，不依赖专家权重 H2D。在 Ascend 环境执行 `python test/manual/test_moe_cache_metadata_npu.py`。
+- CPU：`test/registered/unit/offloading/test_cache_metadata.py` 覆盖 batch/EP 计数、padding、互斥 wave、模式开关、目标集合、快照、资源核算和动态 tensor 回放。
+- NPU：`test/manual/test_moe_cache_metadata_npu.py` 可单独验证 LFU、计数和目标集合的 `NPUGraph` 捕获及变化输入回放，不依赖专家权重 H2D。在 Ascend 环境执行 `python test/manual/test_moe_cache_metadata_npu.py`。
 - NPU 小规模完整流程：`test/manual/test_moe_cache_runtime_npu.py` 新增 3 组测试，使用真实 H2D/D2D、事件等待、两块矩阵组成的专家权重，验证 LFU 替换、发布和回填恢复。它通过主机读取计划进行 eager 测试，不支持动态搬运入图；运行方式及验收标准见 [交接表第 6 节](CACHE_RUNTIME_HANDOFF.zh-CN.md#6-npu-小规模完整流程测试)。
 - 本地没有 `torch_npu`，不能宣称 NPU 算子/捕图已验证。CPU trace 只检查固定形状下的数据流；其静态形状判断警告不表示支持动态 shape 或真实设备图。
-- 当前本地回归：调用链测试 14 项、NPU 脚本参考计算的 CPU 检查 2 项，与元数据、LFU 和原框架测试合计 75 项 CPU 测试通过。本机没有 `torch_npu`，新增 NPU 完整流程脚本尚未实机验证。Ruff 检查及格式、isort 和空白检查通过。
+- 当前本地回归：调用链测试 22 项、NPU 脚本参考计算的 CPU 检查 2 项，与元数据、LFU 和原框架测试合计 82 项 CPU 测试通过。本机没有 `torch_npu`，新增 NPU 完整流程脚本尚未实机验证。Ruff 检查及格式、isort 和空白检查通过。

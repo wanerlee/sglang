@@ -310,7 +310,9 @@ ResidencyOps.prepare_update(target_keys)
 实际权重换入 → weights_ready → commit_update
 ```
 
-每个完整 forward 执行一次这条尾部流程。非周期轮输出当前集合，差分计划为空；关闭更新时 usage/step_mod 不变、due 为假，runtime 同时禁止 residency commit。
+图路径每个完整 forward 执行一次这条尾部流程，非周期轮由设备 due 屏蔽交换。实际 eager 路径每步累计 usage 和周期，只在周期到期时执行选集、计划、搬运及发布；其他步骤不产生新的 target_keys，也不消费旧目标。关闭更新时不推进周期。
+
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 职责不越界：
 
@@ -396,7 +398,7 @@ offloader = MoEOffloaderV2(
 
 1. 初始化调用 `policy.initial_keys(config.hot_slots(catalog), model_id)`，得到本 rank 的初始专家 key；装入完整权重并发布映射。此方法不会改在线 usage。
 2. 通过 `allocate_state()` 分配当前状态及快照状态；目标集合和相关工作区由后端管理并计入预算。
-3. 每个完整 forward 尾部调用 `update_statistics → select_hot_set → finish_step`，随后执行现有 residency/transfer 接口。有效访问计数和更新开关由 runtime 提供。
+3. 图路径每个完整 forward 尾部调用 `update_statistics → select_hot_set → finish_step`，随后执行现有 residency/transfer 接口；eager 非周期轮跳过选集与 residency/transfer，只累计统计。有效访问计数和更新开关由 runtime 提供。
 4. prefill 快照和恢复使用 `copy_state()`，三个状态 tensor 均原位复制。
 
 在线实现按静态层范围发出固定形状的排序、mask、索引和 scatter 操作，不使用 `.item()`、`.tolist()` 或 `.cpu()` 决定选取。所有状态更新保持原 tensor 地址；排序和其他临时 tensor 的实际设备内存峰值需由后端纳入预算。

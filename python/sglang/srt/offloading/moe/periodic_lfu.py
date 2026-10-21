@@ -62,10 +62,7 @@ class PeriodicLFUPolicy(CachePolicy):
         Frequencies use global expert IDs. Resident layers and foreign EP experts
         are excluded by the catalog. Online usage is not seeded with this data.
         """
-        if (
-            type(capacity) is not int
-            or not 0 <= capacity <= self.catalog.num_experts
-        ):
+        if type(capacity) is not int or not 0 <= capacity <= self.catalog.num_experts:
             raise ValueError("Hot capacity must be within the eligible expert count")
         with open(self.config.offline_stats_path, encoding="utf-8") as stream:
             profile = json.load(stream)
@@ -135,9 +132,7 @@ class PeriodicLFUPolicy(CachePolicy):
             cold_order = torch.argsort(
                 torch.where(~hot, usage, -torch.inf), descending=True, stable=True
             )
-            hot_order = torch.argsort(
-                torch.where(hot, usage, torch.inf), stable=True
-            )
+            hot_order = torch.argsort(torch.where(hot, usage, torch.inf), stable=True)
             gain = usage[cold_order] - usage[hot_order]
             valid = (
                 ~hot[cold_order]

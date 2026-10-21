@@ -10,6 +10,7 @@ import json
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -27,6 +28,7 @@ from sglang.srt.offloading.moe import (
     MoEOffloadConfig,
     MoEOffloaderV2,
     PeriodicLFUConfig,
+    Phase,
 )
 from sglang.srt.offloading.moe.config import fixed_waves
 from sglang.srt.offloading.moe.interfaces import (
@@ -345,13 +347,16 @@ class TestCacheRuntime(unittest.TestCase):
         self.offloader.bind_model_runner(self.runner)
         self.addCleanup(self.offloader.close)
 
-    def batch(self, name="DECODE", global_mode=None, counts=None):
+    def batch(self, name="DECODE", global_mode=None, counts=None, extend=False):
         return SimpleNamespace(
             forward_mode=Mode(name),
             global_forward_mode=Mode(global_mode) if global_mode else None,
             original_global_num_tokens_cpu=counts,
             global_num_tokens_cpu=None,
-            input_ids=torch.tensor([1]),
+            is_extend_in_batch=extend,
+            input_ids=torch.empty(0, dtype=torch.int64)
+            if name == "IDLE"
+            else torch.tensor([1]),
         )
 
     def model(self, routes):
@@ -431,6 +436,144 @@ class TestCacheRuntime(unittest.TestCase):
         self.run_step({3: []}, self.batch("IDLE", counts=[0, 0]))
         self.assertEqual(int(self.runtime.cache.policy_state.step_mod), 1)
 
+    def test_idle_without_tbo_counts_post_dispatch_routes(self):
+        self.run_step({3: [1, 1]}, self.batch("IDLE", counts=[3, 0]))
+        self.assertEqual(int(self.runtime.cache.policy_state.step_mod), 1)
+        self.assertEqual(float(self.runtime.cache.policy_state.usage[1]), 2)
+        self.run_step({3: []}, self.batch("IDLE", counts=[3, 0]))
+        self.assertEqual(int(self.runtime.cache.policy_state.step_mod), 2)
+        self.assertEqual(self.runtime._step_mod, 2)
+
+    def test_global_prefill_overrides_idle_and_local_decode_without_tbo(self):
+        self.run_step({3: [1, 1]})
+        usage = self.runtime.cache.policy_state.usage.clone()
+        for local in ("IDLE", "DECODE"):
+            batch = self.batch(local, counts=[3, 0], extend=True)
+            with self.offloader.forward_scope(batch):
+                with self.offloader.eager_step_scope(batch):
+                    self.assertIs(self.runtime._phase, Phase.PREFILL)
+                    self.assertTrue(self.runtime.cache._has_snapshot)
+                    self.assertTrue((self.backend.hot == -999).all())
+        torch.testing.assert_close(self.runtime.cache.policy_state.usage, usage)
+        self.assertEqual(self.runtime._step_mod, 1)
+        self.run_step({3: [1]})
+        self.assertFalse(self.runtime.cache._has_snapshot)
+        self.assertEqual(self.runtime._step_mod, 2)
+        self.assertEqual(int(self.runtime.cache.policy_state.step_mod), 2)
+        torch.testing.assert_close(self.backend.hot, self.backend.host[[0, 2, 4, 7]])
+
+    def test_global_idle_uses_unpadded_counts_and_preserves_prefill(self):
+        batch = self.batch("IDLE", counts=[0, 0])
+        batch.global_num_tokens_cpu = [4, 4]  # Graph padding is not real work.
+        self.run_step({}, batch)
+        self.assertEqual(self.runtime._step_mod, 0)
+        with self.offloader.forward_scope(self.batch("EXTEND")):
+            pass
+        before = len(self.backend.transfer.calls)
+        self.run_step({}, batch)
+        self.assertIs(self.runtime._phase, Phase.PREFILL)
+        self.assertEqual(len(self.backend.transfer.calls), before)
+        self.assertTrue(self.runtime.cache._has_snapshot)
+        self.assertEqual(self.runtime._step_mod, 0)
+
+    def test_idle_falls_back_to_global_counts_when_original_absent(self):
+        batch = self.batch("IDLE")
+        batch.global_num_tokens_cpu = [2, 0]
+        self.run_step({3: [1]}, batch)
+        self.assertEqual(self.runtime._step_mod, 1)
+        self.assertEqual(float(self.runtime.cache.policy_state.usage[1]), 1)
+        self.run_step({}, self.batch("IDLE"))
+        self.assertEqual(self.runtime._step_mod, 1)
+
+    def test_eager_skips_sorting_planning_and_hot_transfer_between_rounds(self):
+        policy, ops = self.runtime.cache.policy, self.runtime.residency_ops
+        for step in range(1, 9):
+            before = len(self.backend.transfer.calls)
+            with (
+                patch.object(torch, "argsort", wraps=torch.argsort) as argsort,
+                patch.object(torch, "sort", wraps=torch.sort) as sort,
+                patch.object(
+                    ops, "prepare_update", wraps=ops.prepare_update
+                ) as prepare,
+                patch.object(ops, "commit_update", wraps=ops.commit_update) as commit,
+            ):
+                self.run_step({3: [1, 1]})
+            due = step % policy.config.update_interval == 0
+            self.assertEqual(argsort.call_count, 6 if due else 0)
+            self.assertEqual(sort.call_count, 2 if due else 0)
+            self.assertEqual(prepare.call_count, int(due))
+            self.assertEqual(commit.call_count, int(due))
+            hot = [
+                c for c in self.backend.transfer.calls[before:] if c["pool"] == "hot"
+            ]
+            self.assertEqual(len(hot), int(due))
+            self.assertEqual(self.runtime._step_mod, step % 4)
+            self.assertEqual(int(self.runtime.cache.policy_state.step_mod), step % 4)
+        torch.testing.assert_close(
+            self.runtime.cache.policy_state.usage[1], torch.tensor((8 * 0.7 + 8) * 0.7)
+        )
+
+    def test_eager_period_survives_prefill_and_graph_execution(self):
+        self.run_step({3: [1, 1]})
+        # Execute the same tensor body a replay would submit; this is not a
+        # hardware graph test. Its host scope must advance the schedule once.
+        with self.offloader.forward_scope(self.batch()):
+            self.runtime.emit_step_begin(self.runtime.context)
+            self.model({3: [1, 1]})
+            self.runtime.emit_step_end(self.runtime.context)
+        with self.offloader.forward_scope(self.batch("EXTEND")):
+            with self.offloader.eager_step_scope(self.batch("EXTEND")):
+                pass
+        for step in (3, 4):
+            with patch.object(
+                self.runtime.cache.policy,
+                "select_hot_set",
+                wraps=self.runtime.cache.policy.select_hot_set,
+            ) as select:
+                self.run_step({3: [1, 1]})
+            self.assertEqual(select.call_count, int(step == 4))
+            self.assertEqual(self.runtime._step_mod, step % 4)
+            self.assertEqual(int(self.runtime.cache.policy_state.step_mod), step % 4)
+        self.assertEqual(self.runtime.residency.slot_to_key.tolist(), [1, 2, 4, 7])
+        self.assertAlmostEqual(
+            float(self.runtime.cache.policy_state.usage[1]), 5.6, places=5
+        )
+
+    def test_eager_respects_configured_period(self):
+        policy = self.runtime.cache.policy
+        for period in (1, 2, 5):
+            policy.config = replace(policy.config, update_interval=period)
+            for step in range(1, period + 1):
+                with patch.object(
+                    policy, "select_hot_set", wraps=policy.select_hot_set
+                ) as select:
+                    self.run_step({3: [1]})
+                self.assertEqual(select.call_count, int(step == period))
+                self.assertEqual(self.runtime._step_mod, step % period)
+                self.assertEqual(
+                    int(self.runtime.cache.policy_state.step_mod), step % period
+                )
+
+    def test_eager_schedule_does_not_read_device_state_on_host(self):
+        self.runtime.transfer = SimpleNamespace(
+            materialize_into=lambda *args: TransferTicket(ImmediateCompletion())
+        )
+        batch = self.batch()
+        routes = LocalRoutes(torch.tensor([1, 1]), torch.tensor([True, True]))
+        with ExitStack() as stack:
+            for method in ("item", "tolist", "cpu", "__bool__"):
+                stack.enter_context(
+                    patch.object(
+                        torch.Tensor, method, side_effect=AssertionError(method)
+                    )
+                )
+            for _ in range(4):
+                with self.offloader.forward_scope(batch):
+                    with self.offloader.eager_step_scope(batch):
+                        for wave in fixed_waves(4, 2):
+                            self.runtime.prepare_local_experts(3, routes, wave)
+        self.assertEqual(self.runtime.residency.slot_to_key.tolist(), [1, 2, 4, 7])
+
     def test_prefill_borrow_refill_preserves_slots_usage_and_cycle(self):
         self.run_step({3: [1, 1]})
         state = self.runtime.residency
@@ -467,12 +610,17 @@ class TestCacheRuntime(unittest.TestCase):
             self.runner.capture_tail_hooks[0](self.runner, None, self.batch(), 1)
         self.assertEqual(int(state.step_mod), 0)
         self.assertEqual(float(state.usage.sum()), 0)
+        self.assertEqual(self.runtime._step_mod, 0)
         self.run_step({3: [1, 1]})
         self.assertEqual(int(state.step_mod), 1)
         # A replay's host scope must not emit an additional Python step.
         with self.offloader.forward_scope(self.batch()):
-            pass
-        self.assertEqual(int(state.step_mod), 1)
+            # Stand-in for the recorded device operations, without eager scope.
+            self.runtime.emit_step_begin(self.runtime.context)
+            self.model({3: [1, 1]})
+            self.runtime.emit_step_end(self.runtime.context)
+        self.assertEqual(int(state.step_mod), 2)
+        self.assertEqual(self.runtime._step_mod, 2)
         self.assertFalse(bool(self.runtime._enabled))
         self.assertEqual(self.runtime._tickets, [])
 
@@ -494,6 +642,7 @@ class TestCacheRuntime(unittest.TestCase):
         torch.testing.assert_close(self.runtime.residency.key_to_slot, before)
         self.assertEqual(self.offloader.owner.state, OwnerState.FAILED)
         self.assertFalse(self.runtime.residency.slot_valid[0])
+        self.assertEqual(self.runtime._step_mod, 3)  # Failed forward is not committed.
 
     def test_verify_remains_unsupported(self):
         with self.assertRaises(NotImplementedError):
@@ -545,16 +694,25 @@ class TestCacheRuntime(unittest.TestCase):
             output = namespace["_forward_raw"](runner, batch, None)
         self.assertFalse(output.can_run_graph)
         self.assertEqual(int(self.runtime.cache.policy_state.step_mod), 1)
-        # Stand-in graph execution: the real branch must bypass eager hooks.
+
+        # Stand-in graph execution: the real branch must bypass eager hooks,
+        # while the recorded tensor operations advance the device cycle once.
+        def replay(*args, **kwargs):
+            self.runtime.emit_step_begin(self.runtime.context)
+            self.model({3: [1, 1]})
+            self.runtime.emit_step_end(self.runtime.context)
+            return "graph-result"
+
         runner.decode_cuda_graph_runner = SimpleNamespace(
             can_run_graph=lambda batch: True,
-            execute=lambda *args, **kwargs: "graph-result",
+            execute=replay,
         )
         with self.offloader.forward_scope(batch):
             output = namespace["_forward_raw"](runner, batch, None)
         self.assertTrue(output.can_run_graph)
         self.assertEqual(output.logits_output, "graph-result")
-        self.assertEqual(int(self.runtime.cache.policy_state.step_mod), 1)
+        self.assertEqual(int(self.runtime.cache.policy_state.step_mod), 2)
+        self.assertEqual(self.runtime._step_mod, 2)
 
     def test_copy_failure_during_restore_does_not_restore_metadata(self):
         with self.offloader.forward_scope(self.batch("EXTEND")):

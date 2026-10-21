@@ -6,7 +6,7 @@
 
 本轮工作实现了周期 LFU、cache 元数据管理、权重加载与替换计划，以及通过现有搬运接口串联的 cache 调用方流程。同时补充了 CPU 调用链测试和独立 NPU 测试脚本。
 
-当前结论：**cache 侧算法与调用方已经实现，75 项 CPU 测试通过；生产 NPU 后端和真实模型绑定尚未完成，NPU 脚本尚未实机验证。** 本文记录本轮新增和修改，不将原分支已有框架或工作区其他既有修改计入本轮成果。
+当前结论：**cache 侧算法与调用方已经实现，82 项 CPU 测试通过；生产 NPU 后端和真实模型绑定尚未完成，NPU 脚本尚未实机验证。** 本文记录本轮新增和修改，不将原分支已有框架或工作区其他既有修改计入本轮成果。
 
 ## 1. 周期 LFU 算法
 
@@ -33,7 +33,7 @@
 - 路由适配：支持层内、rank 内专家编号；连续 EP 分片的 global ID 可转换为 local ID。过滤 padding、无效编号和不属于当前 wave 的分配。
 - Batch 统计：同一专家被多个 token 选中时累计多次；多 wave 不重复统计同一分配。
 - `CacheRouteStats`：记录本步 accesses、hits、misses；这些是路由分配次数，不是搬运次数。
-- `CacheSetDelta`：输出 keep、admit、evict，描述集合差分，不直接分配物理 slot。
+- `target_keys`：LFU 选出的目标集合；与当前映射的差分仅由 residency 计算，不维护重复的 keep/admit/evict 数组。
 - `HotMetadataSnapshot`：保存热池映射、有效位、generation，以及配套 LFU 状态；恢复时失效临时 execution bank。
 - 模式开关：正常 decode 可以统计；prefill、warmup/capture、全局无 token 时关闭。全局有工作但本 rank 无路由时仍推进周期。
 - 资源核算：报告组件自身持有的元数据内存，不重复统计外部权重池。
@@ -73,9 +73,13 @@ forward 开始 → 清空本步计数
 每层 / 每波：dispatch → 计数 → 需求计划
              → materialize_into → 等待 → 准备 bank → 专家计算 → combine
                          ↓
-完整 forward 结束 → LFU → 替换计划
+完整 forward 结束 → 累计 LFU → 周期到期时生成替换计划
                  → materialize_into → 等待 → 发布新驻留映射
 ```
+
+阶段判断不依赖 TBO 才提供的 `global_forward_mode`：结合 `is_extend_in_batch` 与全局 token 数推导。在全局 prefill 中，本地 IDLE 或 DECODE rank 都进入 prefill；在有效全局 decode 中，本地 IDLE rank 仍统计 dispatch 后的访问并推进周期。优先使用 `original_global_num_tokens_cpu`，避免把图 padding 当成有效 token；全局空闲时保持当前阶段，不触发无谓回填。
+
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 阶段切换路径：
 
@@ -103,16 +107,16 @@ forward 开始 → 清空本步计数
 | 测试文件 | 主要覆盖 |
 | --- | --- |
 | [test_periodic_lfu.py](../../../../../test/registered/unit/offloading/test_periodic_lfu.py) | 离线初始化、周期、层内配对、阈值、限量和衰减。 |
-| [test_cache_metadata.py](../../../../../test/registered/unit/offloading/test_cache_metadata.py) | Batch/EP 计数、padding、多 wave、差分、快照、资源核算、固定地址数据流。 |
+| [test_cache_metadata.py](../../../../../test/registered/unit/offloading/test_cache_metadata.py) | Batch/EP 计数、padding、多 wave、目标集合、快照、资源核算、固定地址数据流。 |
 | [test_moe_framework.py](../../../../../test/registered/unit/offloading/test_moe_framework.py) | 在原框架测试基础上增加 LFU 策略注入验证。 |
-| [test_cache_runtime.py](../../../../../test/registered/unit/offloading/test_cache_runtime.py) | 14 项调用链测试：延迟复制、实际权重计算、替换后命中、回填、失败处理、零缓存、多 bank，以及真实 ModelRunner 方法体的分支接线。 |
+| [test_cache_runtime.py](../../../../../test/registered/unit/offloading/test_cache_runtime.py) | 22 项调用链测试：无 TBO 的空闲 rank、全局 prefill、周期跳过、图/eager 交替、延迟复制、实际权重计算、替换后命中、回填、失败处理、零缓存、多 bank，以及真实 ModelRunner 方法体的分支接线。 |
 | [test_cache_npu_test_support.py](../../../../../test/registered/unit/offloading/test_cache_npu_test_support.py) | 2 项 CPU 检查：NPU 脚本的独立参考结果和小模型 bank 计算逻辑。 |
 
-本地合计 **75 项 CPU 测试通过**。Ruff 检查与格式、isort、空白、Python 语法及文档本地链接检查通过。CPU 测试不构成 NPU 搬运或硬件图验证。
+本地合计 **82 项 CPU 测试通过**。Ruff 检查与格式、isort、空白、Python 语法及文档本地链接检查通过。CPU 测试不构成 NPU 搬运或硬件图验证。
 
 ### 5.2 NPU 元数据测试
 
-[test_moe_cache_metadata_npu.py](../../../../../test/manual/test_moe_cache_metadata_npu.py) 验证 LFU、计数和集合差分的 NPU 捕图及变化输入 replay，与 CPU 结果比较。它不搬运专家权重。
+[test_moe_cache_metadata_npu.py](../../../../../test/manual/test_moe_cache_metadata_npu.py) 验证 LFU、计数和目标集合的 NPU 捕图及变化输入 replay，与 CPU 结果比较。它不搬运专家权重。
 
 ### 5.3 NPU 小规模完整流程测试
 

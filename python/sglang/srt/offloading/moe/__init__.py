@@ -1,6 +1,6 @@
 """Opt-in MoE offloading framework; accelerator execution is backend supplied."""
 
-from .cache_metadata import CacheMetadataAdapter, CacheSetDelta, cache_update_enabled
+from .cache_metadata import CacheMetadataAdapter, cache_update_enabled
 from .cache_residency import CopySource, TensorResidencyOps
 from .cache_runtime import (
     CacheExecutionContext,
@@ -19,7 +19,6 @@ __all__ = [
     "CacheLocalExpertProgram",
     "CacheMetadataAdapter",
     "CacheRuntime",
-    "CacheSetDelta",
     "CopySource",
     "ExpertCatalog",
     "ExpertLayerSpec",

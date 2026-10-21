@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from ..transfer import EventCompletion, TransferTicket
-from .cache_metadata import CacheMetadataAdapter, cache_update_enabled
+from .cache_metadata import CacheMetadataAdapter
 from .cache_residency import TensorResidencyOps
 from .config import Phase
 from .interfaces import BoundMoERuntime, ForwardCompletion, LocalExpertProgram
@@ -133,6 +133,11 @@ class CacheRuntime(BoundMoERuntime):
         self._capture_tickets = []
         self._capturing = False
         self._serving_context = context
+        # Host schedule mirror, never read back from a device tensor. Advance
+        # once per successful serving forward, including graph replay. Prefill
+        # and capture leave it unchanged, just like the saved device LFU cycle.
+        self._step_mod = 0
+        self._adjust_eager = False
 
     def _materialize(self, plan, bindings):
         # Includes plan production and all previous native F readers. Thus reused
@@ -205,11 +210,7 @@ class CacheRuntime(BoundMoERuntime):
     def forward_scope(self, owner, forward_batch):
         mode = getattr(forward_batch, "global_forward_mode", None)
         mode = forward_batch.forward_mode if mode is None else mode
-        if mode.is_decode() or mode.is_idle():
-            phase = Phase.DECODE
-        elif mode.name in ("EXTEND", "MIXED"):
-            phase = Phase.PREFILL
-        else:
+        if not (mode.is_decode() or mode.is_idle() or mode.name in ("EXTEND", "MIXED")):
             raise NotImplementedError(f"Cache runtime does not support {mode.name}")
         counts = getattr(forward_batch, "original_global_num_tokens_cpu", None)
         if counts is None:
@@ -219,13 +220,26 @@ class CacheRuntime(BoundMoERuntime):
             if counts is not None
             else (forward_batch.input_ids.numel() > 0)
         )
+        # global_forward_mode is TBO-only and is normally None here. The
+        # scheduler's is_extend_in_batch is shared across ranks even when a
+        # local rank is IDLE or DECODE while peers are processing prefill.
+        if not has_tokens:
+            phase = owner.phase
+        elif getattr(forward_batch, "is_extend_in_batch", False) or mode.name in (
+            "EXTEND",
+            "MIXED",
+        ):
+            phase = Phase.PREFILL
+        else:
+            phase = Phase.DECODE
+        enabled = has_tokens and phase is Phase.DECODE
+        next_step = (self._step_mod + 1) % self.cache.policy.config.update_interval
         token = owner.begin_forward(phase, self.context.compute_stream)
         self._phase = phase
+        self._adjust_eager = enabled and next_step == 0
         try:
             with self.context.device_module.stream(self.context.compute_stream):
-                self._enabled.fill_(
-                    cache_update_enabled(mode, has_global_tokens=has_tokens)
-                )
+                self._enabled.fill_(enabled)
                 yield
                 # Fresh events after eager submission/replay, not capture tickets.
                 fence = self.context.fence()
@@ -235,6 +249,8 @@ class CacheRuntime(BoundMoERuntime):
                 owner.finish_forward(
                     token, ForwardCompletion(complete, complete, complete)
                 )
+                if enabled:
+                    self._step_mod = next_step
                 self._tickets.clear()
         except BaseException:
             owner.fail_forward(token)
@@ -243,6 +259,7 @@ class CacheRuntime(BoundMoERuntime):
             with self.context.device_module.stream(self.context.compute_stream):
                 self._enabled.zero_()
             self._capturing = False
+            self._adjust_eager = False
             self.context = self._serving_context
 
     @contextmanager
@@ -253,7 +270,7 @@ class CacheRuntime(BoundMoERuntime):
             self.emit_step_begin(self.context)
         yield
         if self._phase is Phase.DECODE:
-            self.emit_step_end(self.context)
+            self.emit_step_end(self.context, adjust=self._adjust_eager)
 
     def emit_step_begin(self, context):
         self.cache.begin_step(self._enabled)
@@ -306,8 +323,12 @@ class CacheRuntime(BoundMoERuntime):
         ticket = self._materialize(plan, self.execution_bindings)
         self.residency_ops.publish_execution(ticket, self.context)
 
-    def emit_step_end(self, context):
-        self.cache.finish_step()
+    def emit_step_end(self, context, *, adjust=True):
+        # adjust is a host scheduling decision for eager only. Captured graphs
+        # retain all operations and gate actual swaps using device update_due.
+        self.cache.finish_step(select_hot_set=adjust)
+        if not adjust:
+            return
         plan = self.residency_ops.prepare_update(self.cache.target_keys, context)
         ticket = self._materialize(plan.copies, self.hot_bindings)
         self.residency_ops.commit_update(plan, ticket, context)

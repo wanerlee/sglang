@@ -11,7 +11,6 @@ import torch
 
 from sglang.srt.offloading.moe import (
     CacheMetadataAdapter,
-    CacheSetDelta,
     ExpertCatalog,
     ExpertLayerSpec,
     PeriodicLFUConfig,
@@ -55,10 +54,6 @@ def adapter(capacity=4):
     return CacheMetadataAdapter(
         cat, state, PeriodicLFUPolicy(PeriodicLFUConfig("unused.json"), cat)
     )
-
-
-def selected(mask):
-    return mask.nonzero().flatten().tolist()
 
 
 class TestCacheUpdateGate(unittest.TestCase):
@@ -157,7 +152,7 @@ class TestRouteAccounting(unittest.TestCase):
         self.assertEqual(cache.policy_state.usage.sum().item(), 0)
         self.assertEqual(cache.stats.accesses.item(), 0)
         self.assertEqual(cache.policy_state.step_mod.item(), 0)
-        self.assertEqual(selected(cache.delta.admit), [])
+        self.assertEqual(cache.target_keys.tolist(), [0, 2, 4, 7])
         # Empty local demand is still a valid global decode step.
         for _ in range(4):
             cache.begin_step(torch.tensor(True))
@@ -183,26 +178,27 @@ class TestRouteAccounting(unittest.TestCase):
             cache.record_local_routes(3, ids, valid.long())
 
 
-class TestCacheSetDelta(unittest.TestCase):
-    def test_delta_is_order_independent_and_does_not_change_mapping(self):
+class TestCacheTargets(unittest.TestCase):
+    def test_skipped_selection_only_accumulates_statistics(self):
         cache = adapter()
-        before = cache.residency.key_to_slot.clone()
-        for target in ([1, 2, 5, 7], [7, 5, 2, 1]):
-            cache.delta.update(cache.residency.key_to_slot, torch.tensor(target))
-            self.assertEqual(selected(cache.delta.keep), [2, 7])
-            self.assertEqual(selected(cache.delta.admit), [1, 5])
-            self.assertEqual(selected(cache.delta.evict), [0, 4])
-            torch.testing.assert_close(cache.residency.key_to_slot, before)
-
-    def test_zero_capacity_empty_catalog_and_padding(self):
-        for count, target in ((0, []), (8, []), (8, [-1, -1])):
-            delta = CacheSetDelta.allocate(count, "cpu")
-            delta.update(
-                torch.full((count,), -1, dtype=torch.int64),
-                torch.tensor(target, dtype=torch.int64),
-            )
-            for name in ("keep", "admit", "evict"):
-                self.assertEqual(selected(getattr(delta, name)), [])
+        cache.target_keys.fill_(-1)
+        with patch.object(
+            cache.policy, "select_hot_set", wraps=cache.policy.select_hot_set
+        ) as select:
+            for _ in range(3):
+                cache.begin_step(torch.tensor(True))
+                cache.record_local_routes(
+                    3, torch.tensor([1, 1]), torch.tensor([True, True])
+                )
+                cache.finish_step(select_hot_set=False)
+            select.assert_not_called()
+        self.assertEqual(cache.target_keys.tolist(), [-1] * 4)
+        self.assertEqual(cache.policy_state.step_mod.item(), 3)
+        self.assertEqual(cache.policy_state.usage[1].item(), 6)
+        cache.begin_step(torch.tensor(True))
+        cache.finish_step()
+        self.assertEqual(cache.target_keys.tolist(), [1, 2, 4, 7])
+        self.assertAlmostEqual(cache.policy_state.usage[1].item(), 4.2, places=5)
 
     def test_complete_step_sequence_matches_document(self):
         cache = adapter()
@@ -220,10 +216,9 @@ class TestCacheSetDelta(unittest.TestCase):
                 )
             cache.finish_step()
             if i < 3:
-                self.assertEqual(selected(cache.delta.admit), [])
+                self.assertEqual(cache.target_keys.tolist(), [0, 2, 4, 7])
             torch.testing.assert_close(cache.residency.key_to_slot, before)
         self.assertEqual(cache.target_keys.tolist(), [1, 2, 5, 7])
-        self.assertEqual(selected(cache.delta.evict), [0, 4])
         torch.testing.assert_close(
             cache.policy_state.usage, torch.tensor([2, 8, 5, 3, 1, 7, 2, 4]) * 0.7
         )
@@ -273,6 +268,7 @@ class TestMetadataSnapshot(unittest.TestCase):
         ledger = ResourceLedger({ResourceKind.METADATA: total}, allocations)
         self.assertEqual(ledger.usage[ResourceKind.METADATA], total)
         self.assertTrue(all(item.kind == ResourceKind.METADATA for item in allocations))
+        self.assertFalse(any("delta" in item.name for item in allocations))
 
 
 class TestCacheTensorDataFlow(unittest.TestCase):
@@ -304,7 +300,6 @@ class TestCacheTensorDataFlow(unittest.TestCase):
                     ("residency", cache.residency),
                     ("policy", cache.policy_state),
                     ("stats", cache.stats),
-                    ("delta", cache.delta),
                 ):
                     for name, tensor in vars(group).items():
                         self.register_buffer(f"{prefix}_{name}", tensor)
@@ -314,7 +309,7 @@ class TestCacheTensorDataFlow(unittest.TestCase):
                 cache.begin_step(enabled)
                 cache.record_local_routes(3, ids, valid)
                 cache.finish_step()
-                return cache.target_keys, cache.policy_state.usage, cache.delta.admit
+                return cache.target_keys, cache.policy_state.usage
 
         ids, valid = torch.tensor([1, 1, 1]), torch.tensor([True] * 3)
         traced = torch.jit.trace(
@@ -327,7 +322,7 @@ class TestCacheTensorDataFlow(unittest.TestCase):
         before = cache.policy_state.usage.clone()
         traced(ids, valid, torch.tensor(False))
         torch.testing.assert_close(cache.policy_state.usage, before)
-        self.assertEqual(selected(cache.delta.admit), [])
+        self.assertEqual(cache.target_keys.tolist(), [0, 2, 4, 7])
         ids.fill_(3)
         for _ in range(4):
             output = traced(ids, valid, torch.tensor(True))
