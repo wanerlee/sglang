@@ -74,6 +74,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         # Event of the last replay; the next rebind waits on it so the device is
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
+        model_runner = getattr(cuda_graph_runner, "model_runner", None)
+        offloader = getattr(model_runner, "offloader", None)
+        self._moe_owner = getattr(offloader, "owner", None)
+        self._moe_graph_leases = {}
 
     @contextmanager
     def capture_session(self, stream):
@@ -95,6 +99,18 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
+        if self._moe_owner is not None:
+            # Acquire before warmup: reject duplicate buckets without running
+            # another model invocation against an existing graph's pools.
+            self._moe_graph_leases[shape_key] = self._moe_owner.acquire_graph(
+                (id(self), shape_key)
+            )
+        graph = torch.npu.NPUGraph()
+        # Own even an incomplete graph until cleanup drains the device. If
+        # capture raises, no output is published and can_run stays false.
+        self._graphs[shape_key] = graph
+        self._outputs.pop(shape_key, None)
+
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
@@ -103,8 +119,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
-
-        graph = torch.npu.NPUGraph()
 
         if self._enable_torch_compile:
             skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
@@ -134,11 +148,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         ):
             out = forward_fn()
 
-        self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
-        return shape_key in self._graphs
+        return shape_key in self._outputs
 
     @contextmanager
     def replay_session(self):
@@ -195,6 +208,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def cleanup(self) -> None:
         self._update_executor.shutdown(wait=True, cancel_futures=True)
+        if self._moe_owner is not None:
+            self._device_module.synchronize()
         self._graphs.clear()
         self._outputs.clear()
+        for lease in self._moe_graph_leases.values():
+            lease.close()
+        self._moe_graph_leases.clear()
         self._pool = None

@@ -8,11 +8,24 @@ called again on graph replay. Runtime bindings must own all captured addresses.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 from ..transfer import Completion, TransferTicket
 from .config import Phase
 from .state import ResidencyState
+
+
+@dataclass(frozen=True)
+class LocalRoutes:
+    """Post-dispatch assignments; expert IDs are local to this rank/layer."""
+
+    expert_ids: torch.Tensor
+    valid: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -88,6 +101,9 @@ class ExpertFormat(ABC):
 
 
 class CachePolicy(ABC):
+    def finish_step(self, state):
+        """Finish policy accounting after selection (e.g. periodic LFU decay)."""
+
     @abstractmethod
     def allocate_state(self, num_experts, device):
         pass
@@ -262,6 +278,10 @@ class BoundMoERuntime(ABC):
     decode_program: WholeMoEProgram
     cache_updates = None  # Optional bound CacheUpdateCoordinator.
 
+    def eager_step_scope(self, forward_batch):
+        """Optional step emission; capture uses separately installed hooks."""
+        return nullcontext()
+
     @abstractmethod
     def install_model_hooks(self, offloader, model_runner):
         """Bind layer-start/router hooks and capture_head_hooks/capture_tail_hooks.
@@ -304,6 +324,10 @@ class BoundMoERuntime(ABC):
     def emit_step_end(self, context):
         """Decode: policy update/select, materialize new hot set, then commit.
 
+        A PeriodicLFUPolicy binding calls finish_step after select_hot_set and
+        before preparing transfers. It must not gate valid steps on whether this
+        EP rank has local routes. Disable both policy updates and commits during
+        warmup/capture; selection alone does not publish residency.
         Prefill: no hotness updates. Whole-model step counts must ignore padding.
         All background work must join the resources_idle completion.
         """
@@ -357,7 +381,13 @@ class MoEBackend(ABC):
 
     @abstractmethod
     def finalize(self, layers, catalog, config, policy) -> BoundMoERuntime:
-        """After quantization post-load: freeze formats/addresses, bind programs."""
+        """After quantization post-load: freeze formats/addresses, bind programs.
+
+        For PeriodicLFUPolicy, call initial_keys(config.hot_slots(catalog),
+        model_id) on the host, load the complete bundles and publish their
+        mappings before serving. Allocate zeroed policy state independently of
+        offline frequencies, and wire finish_step into the bound runtime.
+        """
 
     @abstractmethod
     def close_unbound(self):

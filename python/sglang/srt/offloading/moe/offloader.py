@@ -3,6 +3,7 @@
 from ..base import BaseOffloader
 from .config import ExpertCatalog, ExpertLayerSpec
 from .owner import MoEOffloadOwner
+from .periodic_lfu import PeriodicLFUPolicy
 from .policy import TensorLFUPolicy
 
 
@@ -37,11 +38,16 @@ class MoEOffloaderV2(BaseOffloader):
     bounded host loading; finalize must supply a full-graph-capable binding.
     """
 
-    def __init__(self, config, backend, *, adapter=None, policy=None):
+    def __init__(
+        self, config, backend, *, adapter=None, policy=None, periodic_lfu_config=None
+    ):
+        if policy is not None and periodic_lfu_config is not None:
+            raise ValueError("Supply either policy or periodic_lfu_config, not both")
         self.config = config
         self.backend = backend
         self.adapter = adapter or DeepSeekV4Adapter()
         self.policy = policy or TensorLFUPolicy()
+        self.periodic_lfu_config = periodic_lfu_config
         self.owner = None
         self._runtime = None
         self._layers = None
@@ -95,6 +101,10 @@ class MoEOffloaderV2(BaseOffloader):
             raise RuntimeError("Register modules before finalizing exactly once")
         runtime = None
         try:
+            if self.periodic_lfu_config is not None:
+                # Layer registration determines rank-local keys. Bind the policy
+                # only now, before the backend allocates state or captures ops.
+                self.policy = PeriodicLFUPolicy(self.periodic_lfu_config, self._catalog)
             runtime = self.backend.finalize(
                 self._layers, self._catalog, self.config, self.policy
             )
@@ -131,6 +141,9 @@ class MoEOffloaderV2(BaseOffloader):
         if not self._installed or self._failed or self._closed:
             raise RuntimeError("MoE runtime/model hooks have not been bound")
         return self.owner.runtime.forward_scope(self.owner, forward_batch)
+
+    def eager_step_scope(self, forward_batch):
+        return self.owner.runtime.eager_step_scope(forward_batch)
 
     @property
     def forbid_copy_engine_usage(self):
