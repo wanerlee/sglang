@@ -13,30 +13,6 @@ from .resources import Allocation, ResourceKind
 from .state import ResidencyState
 
 
-def cache_update_enabled(
-    forward_mode,
-    *,
-    has_global_tokens: bool,
-    warmup: bool = False,
-    capture: bool = False,
-    verify_enabled: bool = False,
-) -> bool:
-    """Host-side gate computed before eager execution or graph replay.
-
-    forward_mode is the group's logical ForwardMode, not a rank's local IDLE
-    substitution. A valid DECODE with zero local routes still advances the LFU.
-    The caller writes this result to a fixed-address device bool replay input;
-    do not embed the capture-time False as a constant inside the graph.
-    verify_enabled is opt-in for future integration, not permission to bypass
-    ModelRunner's current speculative-decoding restriction.
-    """
-    if warmup or capture or not has_global_tokens:
-        return False
-    return forward_mode.is_decode() or (
-        verify_enabled and forward_mode.is_target_verify()
-    )
-
-
 @dataclass
 class CacheRouteStats:
     """Valid token-expert assignments, not unique experts or transferred bytes."""
@@ -88,7 +64,7 @@ class CacheMetadataAdapter:
     """Metadata-only step lifecycle for a bound PeriodicLFU policy.
 
     Allocate before capture. The runtime calls begin_step once, records each
-    actual assignment once across disjoint waves, then calls finish_step once.
+    actual assignment once across disjoint waves; the coordinator finishes LFU.
     It supplies synchronization for phase transitions and handles H2D/publication
     separately. No routine here modifies live hot residency during a decode step.
     """
@@ -141,6 +117,8 @@ class CacheMetadataAdapter:
         across waves, pass disjoint [local_start, local_end) ranges. Otherwise
         supply each wave's distinct dispatched rows; never count both forms.
         The range is static scheduling metadata, not a device routing value.
+        Return per-expert demand counts, independent of the LFU update gate so
+        warmup/capture can still prepare the weights needed by native F.
         """
         import torch
 
@@ -155,16 +133,20 @@ class CacheMetadataAdapter:
         if valid.dtype != torch.bool:
             raise TypeError("Route validity must be bool")
         ids = local_expert_ids.reshape(-1)
-        active = (
-            valid.reshape(-1)
-            & (ids >= local_start)
-            & (ids < end)
-            & self.residency.update_enabled
+        active = valid.reshape(-1) & (ids >= local_start) & (ids < end)
+        # One histogram serves both LFU accounting and current-wave demand.
+        # The sentinel absorbs invalid/padded IDs without a host read.
+        counts = torch.zeros(size + 1, dtype=torch.int64, device=ids.device)
+        counts.scatter_add_(
+            0, torch.where(active, ids.to(torch.int64), size), active.to(torch.int64)
         )
-        # Invalid IDs use a safe index and a zero increment.
+        counts = counts[:size]
+        self.residency.step_access_count[offset : offset + size].add_(
+            torch.where(self.residency.update_enabled, counts, 0)
+        )
+        active = active & self.residency.update_enabled
         keys = ids.clamp(0, size - 1).to(torch.int64) + offset
         increments = active.to(torch.int64)
-        self.residency.step_access_count.scatter_add_(0, keys, increments)
 
         slots = self.residency.key_to_slot[keys]
         capacity = self.residency.slot_to_key.numel()
@@ -184,11 +166,12 @@ class CacheMetadataAdapter:
         self.stats.accesses.add_(accesses)
         self.stats.hits.add_(hits)
         self.stats.misses.add_(accesses - hits)
+        return counts
 
     def record_global_routes(self, layer_id, global_expert_ids, valid, **kwargs):
         """Normalize contiguous EP ownership; foreign experts are not counted."""
         _, _, global_start = self._layers[layer_id]
-        self.record_local_routes(
+        return self.record_local_routes(
             layer_id, global_expert_ids - global_start, valid, **kwargs
         )
 

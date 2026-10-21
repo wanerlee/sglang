@@ -118,8 +118,6 @@ class CacheRuntime(BoundMoERuntime):
             self.access,
         )
         self.context = context
-        self.hot_bindings = hot_bindings
-        self.execution_bindings = execution_bindings
         self.bank_slots = bank_slots
         self.prefill_program = prefill_program
         self.decode_program = None  # Bound before install_model_hooks.
@@ -150,7 +148,6 @@ class CacheRuntime(BoundMoERuntime):
             + tuple(extra)
         )
         self._runner = None
-        self._phase = Phase.DECODE
         self._initialized = False
         self._capture_contexts = []
         self._serving_context = context
@@ -258,7 +255,6 @@ class CacheRuntime(BoundMoERuntime):
         enabled = has_tokens and phase is Phase.DECODE
         next_step = (self._step_mod + 1) % self.cache.policy.config.update_interval
         token = owner.begin_forward(phase, self.context.compute_stream)
-        self._phase = phase
         previous = self.context
         self.context = CacheExecutionContext(
             previous.device_module,
@@ -294,10 +290,10 @@ class CacheRuntime(BoundMoERuntime):
     def eager_step_scope(self, forward_batch):
         # ModelRunner enters only around an actual eager model invocation.
         # Captured decode has its own head/tail, so replay never double-counts.
-        if self._phase is Phase.DECODE:
+        if self.context.phase is Phase.DECODE:
             self.emit_step_begin(self.context)
         yield
-        if self._phase is Phase.DECODE:
+        if self.context.phase is Phase.DECODE:
             self.emit_step_end(self.context, adjust=self._adjust_eager)
 
     def emit_step_begin(self, context):
@@ -320,25 +316,16 @@ class CacheRuntime(BoundMoERuntime):
             and start + self.bank_slots <= self._demand.numel()
         ):
             raise ValueError("Wave does not fit the declared execution bank")
-        self.cache.record_local_routes(
+        counts = self.cache.record_local_routes(
             layer_id,
             routes.expert_ids,
             routes.valid,
             local_start=wave.local_start,
             local_end=wave.local_end,
         )
-        ids = routes.expert_ids.reshape(-1)
-        active = (
-            routes.valid.reshape(-1)
-            & (ids >= wave.local_start)
-            & (ids < wave.local_end)
+        experts = torch.arange(
+            wave.local_start, wave.local_end, device=routes.expert_ids.device
         )
-        # Count assignments for LFU above; deduplicate only the load demand.
-        counts = torch.zeros(size + 1, dtype=torch.int64, device=ids.device)
-        counts.scatter_add_(
-            0, torch.where(active, ids.to(torch.int64), size), active.to(torch.int64)
-        )
-        experts = torch.arange(wave.local_start, wave.local_end, device=ids.device)
         self._demand.fill_(-1)
         self._demand[start : start + width].copy_(
             torch.where(counts[experts] > 0, experts + offset, -1)
@@ -372,7 +359,7 @@ class CacheRuntime(BoundMoERuntime):
     def synchronize(self):
         # abort stops/join prefill submitters before draining their device work.
         pipeline = getattr(self.prefill_program, "pipeline", None)
-        if pipeline is not None:
+        if pipeline is not None and self.context.phase is Phase.PREFILL:
             self.context.retain(pipeline.abort(self.context))
         self.context.device_module.synchronize()
         for resource in self.context.retained():

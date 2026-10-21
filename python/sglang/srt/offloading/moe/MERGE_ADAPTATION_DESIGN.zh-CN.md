@@ -2,7 +2,7 @@
 
 日期：2026-10-21
 目标分支：`wanerlee/sglang:codex/moe-offload-dev`
-状态：**已完成本地代码合并与 cache/框架调用方适配，117 项 CPU UT 通过。真实 NPU 后端与模型绑定仍待联调。**
+状态：**已完成本地代码合并与 cache/框架调用方适配，review 精简后 119 项 CPU UT 通过。真实 NPU 后端与模型绑定仍待联调。**
 
 ## 1. 基线与目标
 
@@ -325,3 +325,5 @@ NPU 手工测试继续用小规模专家 bundle，核验真实 H2D、D2D、等�
 - 已更新 NPU 手工脚本；本地无 torch_npu，未执行真实 NPU 测试。
 - 原双方测试 108 项，新增衔接测试 9 项，合计 **117 项 CPU UT 通过**。新增覆盖发布、读者保护、线程安全保活、独立上下文、dispatch-once 计数、prefill 复制/回填和失败停止。
 - 真实模型 dispatch/native F、ACL/MemFabric 后端和 NPU graph 验证仍依赖后端交付，未降低 capability gate。
+
+后续 review：删除未使用的独立统计 gate 和重复 runtime 字段，复用路由直方图，修正 decode 清理调用 prefill abort。119 项 CPU UT 通过，详见 [修改总结第 8 节](CHANGE_SUMMARY.zh-CN.md#8-合并后的代码-review-与精简)。

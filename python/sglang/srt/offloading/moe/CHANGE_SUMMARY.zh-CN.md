@@ -6,7 +6,7 @@
 
 本次合并同事 `59cbb5d` 的 dispatch-once、H2D 公共接口和资源重命名；详细边界见 [合并适配设计](MERGE_ADAPTATION_DESIGN.zh-CN.md)。累计工作实现了周期 LFU、cache 元数据管理、权重加载与替换计划，以及通过现有搬运接口串联的 cache 调用方流程。同时补充了 CPU 调用链测试和独立 NPU 测试脚本。
 
-当前结论：**cache 侧算法与调用方已经实现，117 项 CPU 测试通过；生产 NPU 后端和真实模型绑定尚未完成，NPU 脚本尚未实机验证。** 同事的公共 Program/transfer 接口沿用其提交；我方负责本文列出的 cache 功能和接口适配。
+当前结论：**cache 侧算法与调用方已经实现，119 项 CPU 测试通过；生产 NPU 后端和真实模型绑定尚未完成，NPU 脚本尚未实机验证。** 同事的公共 Program/transfer 接口沿用其提交；我方负责本文列出的 cache 功能和接口适配。
 
 ## 1. 周期 LFU 算法
 
@@ -119,7 +119,7 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 | [test_cache_runtime.py](../../../../../test/registered/unit/offloading/test_cache_runtime.py) | 22 项调用链测试：无 TBO 的空闲 rank、全局 prefill、周期跳过、图/eager 交替、延迟复制、实际权重计算、替换后命中、回填、失败处理、零缓存、多 bank，以及真实 ModelRunner 方法体的分支接线。 |
 | [test_cache_npu_test_support.py](../../../../../test/registered/unit/offloading/test_cache_npu_test_support.py) | 2 项 CPU 检查：NPU 脚本的独立参考结果和小模型 bank 计算逻辑。 |
 
-本地合计 **117 项 CPU 测试通过**（双方原有 108 项，新增 `test_cache_integration.py` 9 项）。Ruff 检查与格式、isort、空白、Python 语法及文档本地链接检查通过。CPU 测试不构成 NPU 搬运或硬件图验证。
+本地合计 **119 项 CPU 测试通过**（合并后原有 117 项，本轮删除 1 项无调用方测试、增加 3 项回归）。Ruff 检查与格式、isort、空白、Python 语法及文档本地链接检查通过。CPU 测试不构成 NPU 搬运或硬件图验证。
 
 ### 5.2 NPU 元数据测试
 
@@ -168,3 +168,19 @@ MOE_TEST_NPU_DEVICE=1 PYTHONPATH=python python test/manual/test_moe_cache_runtim
 | Verify | 仍受原分支限制，未接入实际投机解码推理。 |
 
 Cache/runtime 统一维护和发布驻留映射；搬运实现接收计划并报告完成依赖。无需同事实现 LFU 算法，具体接口清单见交接文档。
+
+
+## 8. 合并后的代码 Review 与精简
+
+Review 范围：相对同事 `59cbb5d` 的 cache/LFU、框架接入、公共接口适配，以及 CPU/NPU 测试调用链。按基础功能范围检查，不增加 fallback 或新的抽象层。
+
+| 发现 | 处理 |
+| --- | --- |
+| runtime 在 decode 清理时也调用 prefill abort，可能把 decode context 交给只接受 prefill 的流水。 | 只在 prefill context 下停止提交线程；保留“先停止线程、再 drain 设备”的顺序。新增两项回归。 |
+| 同一 wave 在 metadata 和 runtime 重复计算路由直方图。 | metadata 返回每专家需求，runtime 复用；需求不受统计开关影响。新增 warmup/capture 关闭统计仍有加载需求的回归。 |
+| 独立 cache_update_enabled 没有推理调用方，预留 verify 开关与当前拒绝投机解码的范围不一致。 | 删除函数、导出和仅覆盖它的 UT；保留真实 runtime 的 phase/capture/IDLE 回归。 |
+| runtime 重复保存 phase 和未使用的 bindings 引用。 | phase 统一读取 context，bindings 由 residency 持有，删除冗余字段。 |
+
+LFU 的层内配对、周期 4、门槛 2/差值 1.5、最多 96 次交换、衰减 0.7 均未变化。发布完成票据、F 最后读者依赖和异步资源保活仍是正确性所需，予以保留。
+
+验证：原 117 项测试删除 1 项无调用方辅助 gate 测试，增加 3 项针对性回归，**119 项 CPU UT 全部通过**。真实 NPU H2D/D2D、生产模型绑定及完整 graph 尚未在本机验证。

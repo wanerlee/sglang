@@ -134,7 +134,7 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 
 这证明调用方流程及 CPU 语义，不证明真实 NPU H2D、完整 graph、分布式正确性或性能收益。
 
-当前本地运行：双方原有测试 108 项，加上 `test_cache_integration.py` 的 9 项读者依赖、调用链和 prefill/恢复衔接测试，合计 117 项 CPU 测试通过；Ruff 检查 / 格式及 isort 通过。测试环境有 PyTorch CPU，没有 torch_npu。
+当前本地运行：合并适配后原有 117 项，经本轮 review 删除 1 项无调用方辅助函数测试、增加 3 项回归，合计 119 项 CPU 测试通过；Ruff 检查 / 格式及 isort 通过。测试环境有 PyTorch CPU，没有 torch_npu。
 
 在具备项目依赖的环境中，可单独运行：
 

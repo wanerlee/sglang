@@ -1,10 +1,7 @@
 """Cache bookkeeping tests with real tensors and no transfer/backend mocks."""
 
-import ast
 import unittest
 from contextlib import ExitStack
-from enum import IntEnum, auto
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,7 +15,6 @@ from sglang.srt.offloading.moe import (
     PeriodicLFUConfig,
     PeriodicLFUPolicy,
     Phase,
-    cache_update_enabled,
 )
 from sglang.srt.offloading.moe.resources import AllocationLedger, ResourceKind
 from sglang.srt.offloading.moe.state import ResidencyState
@@ -39,24 +35,6 @@ def finish_cache(cache, *, adjust=True):
     ).emit_step_end(context, adjust=adjust)
 
 
-def actual_forward_mode():
-    # Test the real enum/predicates without loading unrelated model/GPU imports.
-    root = Path(__file__).resolve().parents[4]
-    path = root / "python/sglang/srt/model_executor/forward_batch_info.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    node = next(
-        item
-        for item in tree.body
-        if isinstance(item, ast.ClassDef) and item.name == "ForwardMode"
-    )
-    namespace = {"IntEnum": IntEnum, "auto": auto}
-    exec(
-        compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"),
-        namespace,
-    )
-    return namespace["ForwardMode"]
-
-
 def adapter(capacity=4):
     cat = ExpertCatalog(tuple(ExpertLayerSpec(i, 8, 2, 1, i < 3) for i in range(5)))
     state = ResidencyState.allocate(8, capacity, 2, "cpu")
@@ -71,32 +49,21 @@ def adapter(capacity=4):
     )
 
 
-class TestCacheUpdateGate(unittest.TestCase):
-    def test_real_forward_modes(self):
-        mode = actual_forward_mode()
-        for value in mode:
-            with self.subTest(mode=value.name):
-                self.assertEqual(
-                    cache_update_enabled(value, has_global_tokens=True),
-                    value == mode.DECODE,
-                )
-                self.assertEqual(
-                    cache_update_enabled(
-                        value, has_global_tokens=True, verify_enabled=True
-                    ),
-                    value in (mode.DECODE, mode.TARGET_VERIFY),
-                )
-                for flags in (
-                    {"warmup": True},
-                    {"capture": True},
-                    {"has_global_tokens": False},
-                ):
-                    args = {"has_global_tokens": True, "verify_enabled": True}
-                    args.update(flags)
-                    self.assertFalse(cache_update_enabled(value, **args))
-
-
 class TestRouteAccounting(unittest.TestCase):
+    def test_disabled_statistics_still_returns_actual_weight_demand(self):
+        cache = adapter()
+        cache.begin_step(torch.tensor(False))
+        counts = cache.record_local_routes(
+            3,
+            torch.tensor([0, 1, 1, 3, -1, 8]),
+            torch.tensor([True] * 6),
+            local_start=0,
+            local_end=2,
+        )
+        self.assertEqual(counts.tolist(), [1, 2, 0, 0])
+        self.assertEqual(cache.residency.step_access_count.tolist(), [0] * 8)
+        self.assertEqual(int(cache.stats.accesses), 0)
+
     def test_batch_counts_hits_misses_and_padding(self):
         cache = adapter()
         cache.begin_step(torch.tensor(True))

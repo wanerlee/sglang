@@ -471,13 +471,13 @@ cache_updates.emit_step_end(context)
 - 每波只传该波 dispatch 后的有效分配，每条分配只提交一次。
 - 同一份完整路由张量用于多个 wave 时，传入互不重叠的 `local_start/local_end` 区间。区间由未来实际执行程序提供；组件不预设 bank 数或 wave 大小。
 
+`record_local_routes` 返回当前 wave 的每专家需求次数，runtime 直接复用以构造装载计划，不重复做直方图。返回需求不受 LFU 开关影响，保证 warmup/capture 仍能准备计算所需权重；usage 和命中统计受开关控制。
+
 `stats.accesses/hits/misses` 是本次有效 token-expert 分配数。命中检查 key 到 slot、有效位及反向映射；不把“一个专家只搬一次”误计成一次访问。统计保留在设备 tensor 中，不在 replay 内读回 host。它不提供搬运字节数或流水时间等依赖后端的指标。
 
 ### 14.2 模式开关与目标集合
 
-`cache_update_enabled(forward_mode, has_global_tokens=..., warmup=..., capture=..., verify_enabled=False)` 在 host 根据真实调度信息计算开关，随后写入 replay 输入 tensor。不要把捕图期间的 False 固化为图内常量。
-
-传入 EP 协同执行所用的逻辑模式；不能直接用某个 rank 局部 IDLE 替代全组 decode 模式，也不能用本地计数和为零判断无有效 batch。prefill、warmup/capture、全组无 token 均关闭更新。verify 默认关闭；显式开启只提供计数语义，不解除 ModelRunner 现有的投机解码限制。
+更新开关只由 `CacheRuntime.forward_scope` 根据全局 phase 和原始 token 数决定，并写入固定地址的设备 bool。prefill、全局空步和捕图/warmup 不更新 LFU；真实 decode replay 使用运行时写入的开关。未接入推理的独立辅助 gate 已删除，不预留 verify 开关；投机解码仍由现有框架明确拒绝。
 
 metadata 只维护 `target_keys`。层内一换一由 LFU 保证，residency 直接根据目标集合与现有映射生成物理更新计划，不另存一份集合差分。
 
@@ -514,4 +514,4 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 - NPU：`test/manual/test_moe_cache_metadata_npu.py` 可单独验证 LFU、计数和目标集合的 `NPUGraph` 捕获及变化输入回放，不依赖专家权重 H2D。在 Ascend 环境执行 `python test/manual/test_moe_cache_metadata_npu.py`。
 - NPU 小规模完整流程：`test/manual/test_moe_cache_runtime_npu.py` 新增 3 组测试，使用真实 H2D/D2D、事件等待、两块矩阵组成的专家权重，验证 LFU 替换、发布和回填恢复。它通过主机读取计划进行 eager 测试，不支持动态搬运入图；运行方式及验收标准见 [交接表第 6 节](CACHE_RUNTIME_HANDOFF.zh-CN.md#6-npu-小规模完整流程测试)。
 - 本地没有 `torch_npu`，不能宣称 NPU 算子/捕图已验证。CPU trace 只检查固定形状下的数据流；其静态形状判断警告不表示支持动态 shape 或真实设备图。
-- 当前本地回归：调用链测试 22 项、NPU 脚本参考计算的 CPU 检查 2 项，与元数据、LFU 和原框架测试合计 117 项 CPU 测试通过。本机没有 `torch_npu`，新增 NPU 完整流程脚本尚未实机验证。Ruff 检查及格式、isort 和空白检查通过。
+- 当前本地回归：调用链测试 22 项、NPU 脚本参考计算的 CPU 检查 2 项，与元数据、LFU 和原框架测试合并时 117 项；本轮 review 删除 1 项无调用方测试、增加 3 项回归，119 项 CPU 测试通过。本机没有 `torch_npu`，新增 NPU 完整流程脚本尚未实机验证。Ruff 检查及格式、isort 和空白检查通过。

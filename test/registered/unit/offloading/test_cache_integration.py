@@ -376,6 +376,37 @@ class TestMergedCacheIntegration(unittest.TestCase):
         self.assertTrue(self.runtime.context.retained())
         self.assertTrue(self.runtime.cache._has_snapshot)
 
+    def test_decode_cleanup_does_not_abort_prefill_with_decode_context(self):
+        pipeline, _, _ = self.make_prefill()
+        with patch.object(
+            pipeline, "abort", side_effect=AssertionError("decode abort")
+        ):
+            self.fixture.run_step({3: [1]})
+            self.fixture.offloader.close()
+
+    def test_prefill_cleanup_stops_submitter_before_device_drain(self):
+        pipeline, _, _ = self.make_prefill()
+        calls = []
+        with self.fixture.offloader.forward_scope(self.fixture.batch("EXTEND")):
+            self.runtime.emit_layer_start(3, self.runtime.context)
+        with (
+            patch.object(
+                pipeline,
+                "abort",
+                side_effect=lambda ctx: (
+                    calls.append(("abort", ctx.phase)),
+                    ctx.record_compute_completion(),
+                )[1],
+            ),
+            patch.object(
+                self.backend.device,
+                "synchronize",
+                side_effect=lambda: calls.append("drain"),
+            ),
+        ):
+            self.runtime.synchronize()
+        self.assertEqual(calls, [("abort", Phase.PREFILL), "drain"])
+
 
 if __name__ == "__main__":
     unittest.main()

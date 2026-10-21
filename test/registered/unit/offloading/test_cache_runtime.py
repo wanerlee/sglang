@@ -463,7 +463,7 @@ class TestCacheRuntime(unittest.TestCase):
             batch = self.batch(local, counts=[3, 0], extend=True)
             with self.offloader.forward_scope(batch):
                 with self.offloader.eager_step_scope(batch):
-                    self.assertIs(self.runtime._phase, Phase.PREFILL)
+                    self.assertIs(self.runtime.context.phase, Phase.PREFILL)
                     self.assertTrue(self.runtime.cache._has_snapshot)
                     self.assertTrue((self.backend.hot == -999).all())
         torch.testing.assert_close(self.runtime.cache.policy_state.usage, usage)
@@ -483,7 +483,7 @@ class TestCacheRuntime(unittest.TestCase):
             pass
         before = len(self.backend.transfer.calls)
         self.run_step({}, batch)
-        self.assertIs(self.runtime._phase, Phase.PREFILL)
+        self.assertIs(self.runtime.context.phase, Phase.PREFILL)
         self.assertEqual(len(self.backend.transfer.calls), before)
         self.assertTrue(self.runtime.cache._has_snapshot)
         self.assertEqual(self.runtime._step_mod, 0)
