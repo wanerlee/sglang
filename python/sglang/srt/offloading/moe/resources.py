@@ -29,7 +29,9 @@ class Allocation:
     keepalive: Any
 
 
-class ResourceLedger:
+class AllocationLedger:
+    """Account unique physical allocations and enforce byte budgets."""
+
     def __init__(self, limits, allocations):
         self.limits = dict(limits)
         self.allocations = tuple(allocations)
@@ -52,10 +54,15 @@ class ResourceLedger:
 class SlotLease:
     slots: Tuple[int, ...]
     generation: int
-    arena_token: Any
+    manager_token: Any
 
 
-class SlotArena:
+class SlotLeaseManager:
+    """Reserve logical slot regions until their device consumers finish.
+
+    Physical tensors belong to the runtime; this manager tracks usage rights.
+    """
+
     def __init__(self, capacity):
         if capacity < 0:
             raise ValueError("Slot capacity cannot be negative")
@@ -77,7 +84,7 @@ class SlotArena:
         if not slots or len(set(slots)) != len(slots):
             raise ValueError("A lease needs distinct slots")
         if any(slot < 0 or slot >= self.capacity for slot in slots):
-            raise ValueError("Slot outside arena")
+            raise ValueError("Slot outside lease manager capacity")
         occupied = {slot for lease in self._live.values() for slot in lease.slots}
         if occupied.intersection(slots):
             raise RuntimeError("Slots are still reserved or have unfinished readers")
@@ -88,7 +95,7 @@ class SlotArena:
 
     def retire(self, lease, resources_idle):
         if (
-            lease.arena_token is not self._token
+            lease.manager_token is not self._token
             or self._live.get(lease.generation) is not lease
             or lease.generation in self._retiring
         ):
@@ -99,4 +106,4 @@ class SlotArena:
     def require_empty(self):
         self.collect()
         if self._live:
-            raise RuntimeError("Arena still has live program leases")
+            raise RuntimeError("Slot lease manager still has live program leases")

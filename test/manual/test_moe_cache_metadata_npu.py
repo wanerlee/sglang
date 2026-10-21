@@ -8,17 +8,21 @@ This validates bookkeeping and LFU only, NOT weight readiness or model outputs.
 
 import importlib.util
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.offloading.moe import (
     CacheMetadataAdapter,
+    CacheUpdateCoordinator,
     ExpertCatalog,
     ExpertLayerSpec,
     PeriodicLFUConfig,
     PeriodicLFUPolicy,
+    Phase,
 )
 from sglang.srt.offloading.moe.state import ResidencyState
+from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
 
 
 def make_cache(device):
@@ -35,7 +39,15 @@ def run_step(cache, routes, valid, enabled):
     cache.begin_step(enabled)
     cache.record_local_routes(3, routes[0], valid[0])
     cache.record_local_routes(4, routes[1], valid[1])
-    cache.finish_step()
+    CacheUpdateCoordinator(
+        cache.policy,
+        cache.policy_state,
+        cache.residency,
+        cache.target_keys,
+        SimpleNamespace(
+            apply_update=lambda *args: TransferTicket(ImmediateCompletion())
+        ),
+    ).emit_step_end(SimpleNamespace(phase=Phase.DECODE, retain=lambda resource: None))
 
 
 class TestNPUCacheMetadata(unittest.TestCase):

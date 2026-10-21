@@ -6,26 +6,58 @@ The same orchestration is exercised by a delayed CPU transport in unit tests.
 """
 
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
+from threading import Lock
 
-from ..transfer import EventCompletion, TransferTicket
+from ..transfer import EventCompletion, JoinedCompletion, TransferTicket
 from .cache_metadata import CacheMetadataAdapter
 from .cache_residency import TensorResidencyOps
 from .config import Phase
-from .interfaces import BoundMoERuntime, ForwardCompletion, LocalExpertProgram
+from .execution import CacheUpdateCoordinator, ExecutionRequest, ExpertWeightAccess
+from .interfaces import BoundMoERuntime, ExecutionContext, ForwardCompletion
 from .resources import Allocation, ResourceKind
 
 
-@dataclass(frozen=True)
-class CacheExecutionContext:
+@dataclass(eq=False)
+class CacheExecutionContext(ExecutionContext):
     device_module: object
     compute_stream: object
     copy_stream: object
+    phase: Phase = Phase.DECODE
+    capturing: bool = False
+    _resources: list = field(default_factory=list, init=False, repr=False)
+    _lock: object = field(default_factory=Lock, init=False, repr=False)
 
-    def fence(self):
+    def retain(self, resource):
+        with self._lock:
+            self._resources.append(resource)
+
+    def retained(self):
+        with self._lock:
+            return tuple(self._resources)
+
+    def clear(self):
+        with self._lock:
+            self._resources.clear()
+
+    def record_compute_completion(self):
         event = self.device_module.Event()
         event.record(self.compute_stream)
         return TransferTicket(EventCompletion(event), (event,))
+
+    def finish(self):
+        # Record after this eager submission/replay, never reuse a capture event
+        # as host evidence that a later replay completed.
+        output = self.record_compute_completion()
+        retained = self.retained()
+        idle = TransferTicket(
+            JoinedCompletion(
+                (output.completion,)
+                + tuple(r.completion for r in retained if isinstance(r, TransferTicket))
+            ),
+            (output, retained),
+        )
+        return ForwardCompletion(output, output, idle)
 
 
 @dataclass(frozen=True)
@@ -36,31 +68,11 @@ class LocalRoutes:
     valid: object
 
 
-class CacheLocalExpertProgram(LocalExpertProgram):
-    """Concrete D -> count -> prepare bank -> native F link for ComposedDFCProgram.
-
-    route_adapter(layer, dispatch_output, wave) -> LocalRoutes is format-specific.
-    run_experts keeps the existing LocalExpertProgram.run argument signature; it
-    reads the fixed bank selected by wave.bank and must join readers on compute.
-    It must not repeat routing statistics or weight preparation.
-    """
-
-    def __init__(self, runtime, route_adapter, run_experts):
-        self.runtime = runtime
-        self.route_adapter = route_adapter
-        self.run_experts = run_experts
-
-    def run(self, layer, dispatch_output, wave, context):
-        routes = self.route_adapter(layer, dispatch_output, wave)
-        self.runtime.prepare_local_experts(layer.layer_id, routes, wave)
-        return self.run_experts(layer, dispatch_output, wave, context)
-
-
 class CacheRuntime(BoundMoERuntime):
     """Concrete cache lifecycle; hardware capabilities must be supplied honestly.
 
     backend.finalize creates this, builds decode_program with
-    CacheLocalExpertProgram, initializes hot weights, then returns the runtime.
+    DecodeLocalExpertProgram, initializes hot weights, then returns the runtime.
     install_programs binds those programs to the model (native backend concern).
     The baseline serializes copies against readers; pipelined overlap can replace
     the scheduling after the transport contract is validated.
@@ -83,6 +95,7 @@ class CacheRuntime(BoundMoERuntime):
         prefill_program,
         install_programs,
         borrow_hot_arena,
+        residency_ops=None,
     ):
         import torch
 
@@ -92,8 +105,18 @@ class CacheRuntime(BoundMoERuntime):
         self.expert_nbytes = expert_nbytes
         self.residency = residency
         self.cache = CacheMetadataAdapter(catalog, residency, policy)
-        self.residency_ops = TensorResidencyOps(residency)
+        self.residency_ops = residency_ops or TensorResidencyOps(
+            residency, hot_bindings, execution_bindings
+        )
         self.transfer = transfer
+        self.access = ExpertWeightAccess(self.residency_ops, transfer)
+        self.cache_updates = CacheUpdateCoordinator(
+            policy,
+            self.cache.policy_state,
+            residency,
+            self.cache.target_keys,
+            self.access,
+        )
         self.context = context
         self.hot_bindings = hot_bindings
         self.execution_bindings = execution_bindings
@@ -129,9 +152,7 @@ class CacheRuntime(BoundMoERuntime):
         self._runner = None
         self._phase = Phase.DECODE
         self._initialized = False
-        self._tickets = []
-        self._capture_tickets = []
-        self._capturing = False
+        self._capture_contexts = []
         self._serving_context = context
         # Host schedule mirror, never read back from a device tensor. Advance
         # once per successful serving forward, including graph replay. Prefill
@@ -139,17 +160,17 @@ class CacheRuntime(BoundMoERuntime):
         self._step_mod = 0
         self._adjust_eager = False
 
-    def _materialize(self, plan, bindings):
-        # Includes plan production and all previous native F readers. Thus reused
-        # plans/banks cannot be overwritten while an earlier copy/F reads them.
-        produced = self.context.fence()
-        produced.completion.wait_on(self.context.copy_stream)
+    def _refill(self, slot_keys):
+        # Exact-slot lifecycle operation, not LFU admission or a fake forward.
+        plan = self.residency_ops.prepare_refill(slot_keys, self.context)
+        self.context.retain(plan)
+        for dependency in plan.copy_dependencies:
+            dependency.wait_on(self.context.copy_stream)
         ticket = self.transfer.materialize_into(
-            plan, bindings, self.context.copy_stream
+            plan.copy_plan, plan.bindings, self.context.copy_stream
         )
-        tickets = self._capture_tickets if self._capturing else self._tickets
-        tickets.extend((produced, ticket))
-        return ticket
+        self.context.retain(ticket)
+        return plan, ticket
 
     def initialize(self, model_id):
         """Host-only initial TopK -> actual copy -> publish, before serving/capture."""
@@ -161,15 +182,15 @@ class CacheRuntime(BoundMoERuntime):
             self.residency.slot_to_key.numel(), model_id
         )
         with self.context.device_module.stream(self.context.compute_stream):
-            plan = self.residency_ops.prepare_refill(
+            plan, ticket = self._refill(
                 torch.tensor(
                     keys, dtype=torch.int64, device=self.residency.key_to_slot.device
                 )
             )
-            ticket = self._materialize(plan.copies, self.hot_bindings)
-            self.residency_ops.commit_update(plan, ticket, self.context)
-            self.context.fence().completion.synchronize()
-        self._tickets.clear()
+            published = self.residency_ops.commit_update(plan, ticket, self.context)
+            self.context.retain(published)
+            published.completion.synchronize()
+        self.context.clear()
         self._initialized = True
 
     def install_model_hooks(self, offloader, model_runner):
@@ -192,18 +213,20 @@ class CacheRuntime(BoundMoERuntime):
     def _capture_head(self, runner, forward_batch, num_tokens):
         # _enabled is zero outside serving. Do not capture a fill_(False): the
         # serving host writes this fixed-address input before each real replay.
-        self._capturing = True
-        self.context = replace(
-            self._serving_context,
-            compute_stream=self.context.device_module.current_stream(),
+        self.context = CacheExecutionContext(
+            self._serving_context.device_module,
+            self.context.device_module.current_stream(),
+            self._serving_context.copy_stream,
+            phase=Phase.DECODE,
+            capturing=True,
         )
+        self._capture_contexts.append(self.context)
         self.emit_step_begin(self.context)
 
     def _capture_tail(self, runner, output, forward_batch, num_tokens):
         try:
             self.emit_step_end(self.context)
         finally:
-            self._capturing = False
             self.context = self._serving_context
 
     @contextmanager
@@ -236,29 +259,34 @@ class CacheRuntime(BoundMoERuntime):
         next_step = (self._step_mod + 1) % self.cache.policy.config.update_interval
         token = owner.begin_forward(phase, self.context.compute_stream)
         self._phase = phase
+        previous = self.context
+        self.context = CacheExecutionContext(
+            previous.device_module,
+            previous.compute_stream,
+            previous.copy_stream,
+            phase=phase,
+        )
+        # Phase switching may have retained refill plans in the old context.
+        for resource in previous.retained():
+            self.context.retain(resource)
+        previous.clear()
+        self._serving_context = self.context
         self._adjust_eager = enabled and next_step == 0
         try:
             with self.context.device_module.stream(self.context.compute_stream):
                 self._enabled.fill_(enabled)
                 yield
-                # Fresh events after eager submission/replay, not capture tickets.
-                fence = self.context.fence()
-                complete = TransferTicket(
-                    fence.completion, (fence, tuple(self._tickets))
-                )
-                owner.finish_forward(
-                    token, ForwardCompletion(complete, complete, complete)
-                )
+                owner.finish_forward(token, self.context.finish())
                 if enabled:
                     self._step_mod = next_step
-                self._tickets.clear()
+                # Owner's completion retains the resources until idle.
+                self.context.clear()
         except BaseException:
             owner.fail_forward(token)
             raise
         finally:
             with self.context.device_module.stream(self.context.compute_stream):
                 self._enabled.zero_()
-            self._capturing = False
             self._adjust_eager = False
             self.context = self._serving_context
 
@@ -275,15 +303,11 @@ class CacheRuntime(BoundMoERuntime):
     def emit_step_begin(self, context):
         self.cache.begin_step(self._enabled)
 
-    def emit_layer_start(self, layer_id, context):
-        # Prefill prefetch belongs to the supplied prefill program.
-        pass
-
     def emit_after_router(self, layer_id, routing, context):
         # Actual rank-local assignments are recorded AFTER dispatch below.
         pass
 
-    def prepare_local_experts(self, layer_id, routes, wave):
+    def make_execution_request(self, layer_id, routes, wave, context):
         import torch
 
         offset, size = self._layers[layer_id]
@@ -319,39 +343,42 @@ class CacheRuntime(BoundMoERuntime):
         self._demand[start : start + width].copy_(
             torch.where(counts[experts] > 0, experts + offset, -1)
         )
-        plan = self.residency_ops.resolve_execution(self._demand, self.context)
-        ticket = self._materialize(plan, self.execution_bindings)
-        self.residency_ops.publish_execution(ticket, self.context)
+        return ExecutionRequest(layer_id, self._demand, wave, context.phase)
 
     def emit_step_end(self, context, *, adjust=True):
-        # adjust is a host scheduling decision for eager only. Captured graphs
-        # retain all operations and gate actual swaps using device update_due.
-        self.cache.finish_step(select_hot_set=adjust)
-        if not adjust:
-            return
-        plan = self.residency_ops.prepare_update(self.cache.target_keys, context)
-        ticket = self._materialize(plan.copies, self.hot_bindings)
-        self.residency_ops.commit_update(plan, ticket, context)
+        ticket = self.cache_updates.emit_step_end(context, adjust=adjust)
+        # Join publication streams into the captured tail as well as eager F.
+        # A fresh post-replay compute event then covers residency publication.
+        ticket.completion.wait_on(context.compute_stream)
+        context.retain(ticket)
+        return ticket
 
     def snapshot_decode_state(self):
         with self.context.device_module.stream(self.context.compute_stream):
             self.cache.save_decode_metadata()
-            return self.context.fence()
+            return self.context.record_compute_completion()
 
     def borrow_hot_arena(self):
         self._borrow_hot_arena()
 
     def restore_decode_state(self):
         with self.context.device_module.stream(self.context.compute_stream):
-            plan = self.residency_ops.prepare_refill(self.cache.snapshot.slot_to_key)
-            ticket = self._materialize(plan.copies, self.hot_bindings)
+            plan, ticket = self._refill(self.cache.snapshot.slot_to_key)
             ticket.completion.wait_on(self.context.compute_stream)
             self.cache.restore_decode_metadata_after_refill()
-            return self.context.fence()
+            published = self.context.record_compute_completion()
+            return TransferTicket(published.completion, (published, ticket, plan))
 
     def synchronize(self):
+        # abort stops/join prefill submitters before draining their device work.
+        pipeline = getattr(self.prefill_program, "pipeline", None)
+        if pipeline is not None:
+            self.context.retain(pipeline.abort(self.context))
         self.context.device_module.synchronize()
-        self._tickets.clear()
+        for resource in self.context.retained():
+            if isinstance(resource, TransferTicket):
+                resource.completion.synchronize()
+        self.context.clear()
 
     def close(self):
         # Owner synchronizes and releases graph leases before calling close.
@@ -359,5 +386,5 @@ class CacheRuntime(BoundMoERuntime):
             self._runner.capture_head_hooks.remove(self._capture_head)
             self._runner.capture_tail_hooks.remove(self._capture_tail)
             self._runner = None
-        self._tickets.clear()
-        self._capture_tickets.clear()
+        self.context.clear()
+        self._capture_contexts.clear()

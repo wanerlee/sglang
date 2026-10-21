@@ -114,10 +114,12 @@ class ExpertWave:
 
 
 def fixed_waves(local_experts, bank_slots, bank_count=1):
-    """Same collective count/order on every EP rank, including empty waves.
+    """Static partition of all local experts, including empty execution waves.
 
     Communication keeps original global expert IDs. Bank lanes are a local F
     concern. Never renormalize top-k weights when masking routes for a wave.
+    Repeated DFC uses the same collective count/order on every EP rank; a
+    dispatch-once program uses the waves only for local F between its D and C.
     """
     if min(local_experts, bank_slots, bank_count) <= 0:
         raise ValueError("Expert and bank capacities must be positive")

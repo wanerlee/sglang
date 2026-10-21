@@ -62,6 +62,70 @@ class TransferTicket:
     keepalive: Tuple[Any, ...] = ()
 
 
+class JoinedCompletion(Completion):
+    """Join dependencies without inventing a host-side completion signal."""
+
+    def __init__(self, completions):
+        self.completions = tuple(completions)
+
+    def wait_on(self, stream):
+        for completion in self.completions:
+            completion.wait_on(stream)
+
+    def synchronize(self):
+        for completion in self.completions:
+            completion.synchronize()
+
+    def done(self):
+        return all(completion.done() for completion in self.completions)
+
+
+@dataclass(frozen=True)
+class HostCopyRegion:
+    """Byte ranges relative to backend-recognized allocation bases, not tensor shapes.
+
+    The backend validates physical layout, registration, direction and aliasing.
+    No dtype conversion or weight staging is implied by this descriptor.
+    """
+
+    source: Any
+    destination: Any
+    source_offset: int
+    destination_offset: int
+    nbytes: int
+    source_capacity: int
+    destination_capacity: int
+
+    def __post_init__(self):
+        if (
+            min(
+                self.source_offset,
+                self.destination_offset,
+                self.nbytes,
+                self.source_capacity,
+                self.destination_capacity,
+            )
+            < 0
+        ):
+            raise ValueError("Copy byte ranges must be nonnegative")
+        if self.source_offset + self.nbytes > self.source_capacity:
+            raise ValueError("Copy exceeds source allocation")
+        if self.destination_offset + self.nbytes > self.destination_capacity:
+            raise ValueError("Copy exceeds destination allocation")
+
+
+@dataclass(frozen=True)
+class HostCopyPlan:
+    """Eager-only descriptors covering complete expert bundles, including scales."""
+
+    regions: Tuple[HostCopyRegion, ...]
+    keepalive: Tuple[Any, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "regions", tuple(self.regions))
+        object.__setattr__(self, "keepalive", tuple(self.keepalive))
+
+
 @dataclass(frozen=True)
 class DeviceCopyPlan:
     """Fixed-capacity tensors; active entries/count are device values.
@@ -80,6 +144,19 @@ class DeviceCopyPlan:
     capacity: int
 
 
+class HostTransferOps(ABC):
+    """Host-planned copies into owned storage; never a dynamic replay fallback.
+
+    An ACL batch implementation must preserve torch_npu host queue ordering,
+    reject dependent/overlapping batch entries and record bundle readiness only
+    after every submitted copy. A failed submission may still have live writes.
+    """
+
+    @abstractmethod
+    def materialize_into(self, plan: HostCopyPlan, bindings, stream) -> TransferTicket:
+        """Submit on stream; retain registrations/descriptors through completion."""
+
+
 class DeviceTransferOps(ABC):
     """Hardware lowering for device-selected sources and fixed destinations."""
 
@@ -89,6 +166,10 @@ class DeviceTransferOps(ABC):
 
 
 class WeightTransferBackend(ABC):
+    def materialize_host_into(self, plan, bindings, stream) -> TransferTicket:
+        """Optional eager entry point; existing device-only backends stay valid."""
+        raise NotImplementedError("Host-planned transfers require HostTransferOps")
+
     @property
     @abstractmethod
     def supports_device_plans(self) -> bool:
@@ -97,6 +178,43 @@ class WeightTransferBackend(ABC):
     @abstractmethod
     def materialize_into(self, plan, bindings, stream) -> TransferTicket:
         pass
+
+
+class ComposedTransferBackend(WeightTransferBackend):
+    """Independent host/device implementations sharing fixed-storage semantics.
+
+    Having device ops does not certify full graph support. The runtime must
+    validate that separately. Neither entry point allocates expert storage.
+    """
+
+    def __init__(self, *, host_ops=None, device_ops=None):
+        self.host_ops = host_ops
+        self.device_ops = device_ops
+
+    @property
+    def supports_device_plans(self):
+        return self.device_ops is not None
+
+    def materialize_host_into(self, plan, bindings, stream):
+        if not isinstance(plan, HostCopyPlan):
+            raise TypeError("Host transfers require HostCopyPlan")
+        return self._materialize(self.host_ops, plan, bindings, stream)
+
+    def materialize_into(self, plan, bindings, stream):
+        if not isinstance(plan, DeviceCopyPlan):
+            raise TypeError("Device transfers require DeviceCopyPlan")
+        return self._materialize(self.device_ops, plan, bindings, stream)
+
+    @staticmethod
+    def _materialize(ops, plan, bindings, stream):
+        if ops is None:
+            raise NotImplementedError(
+                "The requested transfer implementation is unbound"
+            )
+        ticket = ops.materialize_into(plan, bindings, stream)
+        if not isinstance(ticket, TransferTicket):
+            raise TypeError("Transfer implementations must return TransferTicket")
+        return TransferTicket(ticket.completion, (ticket, plan, bindings, ops))
 
 
 class TorchTransferBackend(WeightTransferBackend):

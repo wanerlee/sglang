@@ -23,11 +23,12 @@ import torch
 
 from sglang.srt.offloading.moe import (
     CacheExecutionContext,
-    CacheLocalExpertProgram,
     CacheRuntime,
     CopySource,
+    DecodeLocalExpertProgram,
     ExpertCatalog,
     ExpertLayerSpec,
+    LocalExecution,
     LocalRoutes,
     PeriodicLFUConfig,
     PeriodicLFUPolicy,
@@ -108,6 +109,8 @@ class AuditedCompletion(Completion):
     def wait_on(self, stream):
         self.inner.wait_on(stream)
         self.audit.waits += 1
+        if self.audit.waits > 1:
+            return
         # These copies enqueue AFTER the real device wait but BEFORE the caller
         # publishes. No .cpu(), .item() or synchronize after H2D submission here.
         with self.device_module.stream(stream):
@@ -315,9 +318,13 @@ class TestNPUCacheRuntime(unittest.TestCase):
             self.runtime.decode_program = ComposedDFCProgram(
                 fixed_waves(4, 2),
                 ToyDispatcher(),
-                CacheLocalExpertProgram(
-                    self.runtime,
-                    lambda layer, output, wave: output.routes,
+                DecodeLocalExpertProgram(
+                    self.runtime.access,
+                    lambda layer, output, wave, context: (
+                        self.runtime.make_execution_request(
+                            layer.layer_id, output.routes, wave, context
+                        )
+                    ),
                     self.native_experts,
                 ),
             )
@@ -343,13 +350,18 @@ class TestNPUCacheRuntime(unittest.TestCase):
             )
         )
 
-    def native_experts(self, layer, dispatched, wave, context):
+    def native_experts(self, layer, dispatched, bindings, context):
         hidden, routes = dispatched.hidden, dispatched.routes
         ids = routes.expert_ids.reshape(-1)
         active = routes.valid.reshape(-1)
-        lanes = (ids - wave.local_start).clamp(0, 1) + wave.bank * 2
+        keys = ids + self.catalog.key(layer.layer_id, 0)
+        lanes = (
+            (keys[:, None] == bindings.state.execution_key)
+            .to(torch.int64)
+            .argmax(dim=1)
+        )
         # Only bank weights on NPU participate in the result, never host oracle.
-        selected = self.execution[lanes]
+        selected = bindings.destination[lanes]
         x = hidden.repeat_interleave(routes.expert_ids.shape[1], dim=0).unsqueeze(1)
         inner = torch.relu(torch.bmm(x, selected[:, 0]))
         output = torch.bmm(inner, selected[:, 1]).squeeze(1)
@@ -363,7 +375,10 @@ class TestNPUCacheRuntime(unittest.TestCase):
                 (ids + self.catalog.key(layer.layer_id, 0)).clone(),
             )
         )
-        return output.reshape(hidden.shape[0], 2, DIM).sum(dim=1)
+        return LocalExecution(
+            output.reshape(hidden.shape[0], 2, DIM).sum(dim=1),
+            context.record_compute_completion(),
+        )
 
     def borrow_hot(self):
         # Stand-in for prefill overwriting borrowed storage; not a prefill model.
@@ -400,11 +415,11 @@ class TestNPUCacheRuntime(unittest.TestCase):
                     self.catalog.key(layer.layer_id, 0),
                 )
             self.runtime.emit_step_end(self.runtime.context)
-            self.runtime.context.fence().completion.synchronize()
+            self.runtime.context.record_compute_completion().completion.synchronize()
         torch.testing.assert_close(hidden.cpu(), reference, rtol=1e-3, atol=1e-4)
         self.validate_audits()
         self.assertEqual(self.addresses(), self.original_addresses)
-        self.runtime._tickets.clear()  # All test work has completed at the fence.
+        self.runtime.context.clear()  # All test work has completed at the fence.
 
     def validate_audits(self):
         for audit in self.transfer.audits:
@@ -485,7 +500,13 @@ class TestNPUCacheRuntime(unittest.TestCase):
             plan = self.runtime.residency_ops.prepare_update(
                 target, self.runtime.context
             )
-            ticket = self.runtime._materialize(plan.copies, self.runtime.hot_bindings)
+            self.runtime.context.retain(plan)
+            for dependency in plan.copy_dependencies:
+                dependency.wait_on(self.copy)
+            ticket = self.transfer.materialize_into(
+                plan.copy_plan, plan.bindings, self.copy
+            )
+            self.runtime.context.retain(ticket)
             # Diagnostic host wait: explicitly stop between copying and commit.
             ticket.completion.synchronize()
         torch.testing.assert_close(state.key_to_slot.cpu(), before)
@@ -496,7 +517,7 @@ class TestNPUCacheRuntime(unittest.TestCase):
         )
         with torch.npu.stream(self.compute):
             self.runtime.residency_ops.commit_update(plan, ticket, self.runtime.context)
-            self.runtime.context.fence().completion.synchronize()
+            self.runtime.context.record_compute_completion().completion.synchronize()
         self.assert_hot(REPLACED_KEYS)
         self.validate_audits()
 

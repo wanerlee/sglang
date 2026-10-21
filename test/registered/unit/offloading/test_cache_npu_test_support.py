@@ -9,14 +9,15 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.offloading.moe import (
-    CacheLocalExpertProgram,
     ExpertCatalog,
     ExpertLayerSpec,
     LocalRoutes,
 )
 from sglang.srt.offloading.moe.config import fixed_waves
+from sglang.srt.offloading.moe.interfaces import LocalExpertProgram
 from sglang.srt.offloading.moe.programs import ComposedDFCProgram
 from sglang.srt.offloading.moe.state import ResidencyState
+from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -76,17 +77,23 @@ class TestNPUTestSupport(unittest.TestCase):
                 state.execution_key[lane] = offset + local
                 state.execution_valid[lane] = True
 
-        fixture.runtime = SimpleNamespace(
-            residency=state, prepare_local_experts=prepare
+        fixture.runtime = SimpleNamespace(residency=state)
+        bindings = SimpleNamespace(state=state, destination=fixture.execution)
+        context = SimpleNamespace(
+            record_compute_completion=lambda: TransferTicket(ImmediateCompletion())
         )
+
+        class OracleProgram(LocalExpertProgram):
+            def run(self, layer, dispatched, wave, context):
+                prepare(layer.layer_id, dispatched.routes, wave)
+                return fixture.native_experts(
+                    layer, dispatched, bindings, context
+                ).output
+
         program = ComposedDFCProgram(
             fixed_waves(4, 2),
             manual.ToyDispatcher(),
-            CacheLocalExpertProgram(
-                fixture.runtime,
-                lambda layer, output, wave: output.routes,
-                fixture.native_experts,
-            ),
+            OracleProgram(),
         )
         for assignments in ([0, 1, 1, 3], [1, 1], []):
             hidden = torch.arange(2 * manual.DIM).reshape(2, manual.DIM).float() / 32
@@ -98,7 +105,7 @@ class TestNPUTestSupport(unittest.TestCase):
                         layer,
                         hidden,
                         LocalRoutes(routes.expert_ids, routes.valid),
-                        None,
+                        context,
                     )
                     expected = manual.cpu_reference(
                         hidden, routes, weights, fixture.catalog.key(layer.layer_id, 0)

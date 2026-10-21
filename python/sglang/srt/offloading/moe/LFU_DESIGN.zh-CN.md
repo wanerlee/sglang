@@ -1,5 +1,7 @@
 # MoE 周期 LFU 策略设计
 
+接口更新：已合并同事 `59cbb5d`；cache 执行统一接入公共 `ExpertWeightAccess` / `CacheUpdateCoordinator`。算法参数及层内配对不变，详见 [合并适配设计](MERGE_ADAPTATION_DESIGN.zh-CN.md)。
+
 适用分支：`codex/moe-offload-dev`
 
 状态：已实现独立的 `PeriodicLFUPolicy`、离线初始集合选择和 offloader 策略注入入口；CPU 算法测试通过。现已通过 `CacheRuntime` 串联计划、搬运调用与就绪后发布，见 [调用链与 H2D 交接表](CACHE_RUNTIME_HANDOFF.zh-CN.md)；真实 NPU 搬运、模型绑定与 graph 验证仍待后端接入。原有 `TensorLFUPolicy` 保留，算法阈值及周期不变。
@@ -312,7 +314,7 @@ ResidencyOps.prepare_update(target_keys)
 
 图路径每个完整 forward 执行一次这条尾部流程，非周期轮由设备 due 屏蔽交换。实际 eager 路径每步累计 usage 和周期，只在周期到期时执行选集、计划、搬运及发布；其他步骤不产生新的 target_keys，也不消费旧目标。关闭更新时不推进周期。
 
-Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache_updates.emit_step_end(context, adjust=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `adjust=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 职责不越界：
 

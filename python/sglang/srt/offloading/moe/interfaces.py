@@ -11,7 +11,8 @@ from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
 
-from ..transfer import TransferTicket
+from ..transfer import Completion, TransferTicket
+from .config import Phase
 from .state import ResidencyState
 
 
@@ -43,6 +44,33 @@ class ForwardCompletion:
     # idle joins copy/compute/communication/prefetch.
 
 
+class ExecutionContext(ABC):
+    """Runtime-owned invocation/capture context; phase/capturing are host constants.
+
+    emit_* submits eager operations or emits captured nodes. Python is not rerun
+    on replay. Prefill may start host work only when capturing is false.
+    """
+
+    phase: Phase
+    capturing: bool
+    compute_stream: object
+    copy_stream: object
+
+    @abstractmethod
+    def retain(self, resource):
+        """Pin before submission, through failure drain and graph leases.
+
+        TransferTicket dependencies also join resources_idle. A partial submission
+        without a ticket is drained by the runtime's stream/worker failure path.
+        Capture-time tickets are not host proof of a subsequent replay finishing.
+        Eager implementations must support calls from the prefill submitter thread.
+        """
+
+    @abstractmethod
+    def record_compute_completion(self) -> TransferTicket:
+        """Record the current compute frontier, without host synchronization."""
+
+
 class ExpertFormat(ABC):
     """Extend the existing paged_experts format concepts for native backend layout.
 
@@ -61,6 +89,9 @@ class ExpertFormat(ABC):
 
 
 class CachePolicy(ABC):
+    def finish_step(self, state):
+        """Finish policy accounting after selection (e.g. periodic LFU decay)."""
+
     @abstractmethod
     def allocate_state(self, num_experts, device):
         pass
@@ -83,18 +114,41 @@ class ResidencyOps(ABC):
 
     @abstractmethod
     def resolve_execution(self, local_demand, context):
-        """Produce a bounded bank load plan; misses do not imply hot admission."""
+        """Return ExecutionReservation; misses do not imply hot admission.
+
+        Accept ExecutionRequest; include plan-ready, old target readers and source
+        readiness in copy_dependencies. Keep source readers pinned through copy.
+        """
+
+    @abstractmethod
+    def publish_execution(self, reservation, weights_ready, context) -> TransferTicket:
+        """Wait for the whole bundle, publish temporary bindings, return readiness.
+
+        Do not change the hot set. The returned ticket covers metadata publication
+        as well as all streams used to establish execution validity.
+        """
+
+    @abstractmethod
+    def finish_execution(self, reservation, read_done, context):
+        """Retire temporary/source leases after the final reader; never on return."""
 
     @abstractmethod
     def prepare_update(self, target_keys, context):
-        """Retain surviving slots; wait for readers before reserving victims."""
+        """Return UpdatePlan, retaining survivors and reserving protected victims.
+
+        Include plan-ready and all old reader dependencies. Honor the runtime's
+        device update_enabled guard during capture/warmup without reading it on CPU.
+        """
 
     @abstractmethod
-    def commit_update(self, update_plan, weights_ready, context):
-        """Publish key/slot/generation only after the complete bundle is ready."""
+    def commit_update(self, update_plan, weights_ready, context) -> TransferTicket:
+        """Wait, publish hot key/slot/generation, return publication completion."""
 
 
 class WholeMoEProgram(ABC):
+    def layer_start(self, layer_id, context):
+        """Optional eager prefill hook. Decode does not prefetch weights."""
+
     @abstractmethod
     def run(self, layer, hidden_states, routing, context):
         """Full routed-expert execution; shared experts stay outside this program."""
@@ -106,19 +160,42 @@ class LocalExpertProgram(ABC):
         """Prepare fixed bank bindings, wait for readiness, run F, record readers."""
 
 
-class WaveDispatcher(ABC):
-    """Adapter to existing Dispatcher/CombineInput without changing EP identity."""
+class MoEDispatcher(ABC):
+    """Common D/C boundary; preserve EP identity and original routing weights.
 
-    @abstractmethod
-    def mask_routes(self, routing, wave, context):
-        pass
+    The runtime retains the dispatch handle and all communication buffers until
+    their device consumers finish, including work submitted before an exception.
+    A Python return from combine does not establish device completion.
+    """
 
     @abstractmethod
     def dispatch(self, hidden_states, routing, context):
         pass
 
+    def dispatch_completion(self, dispatched, context) -> Completion:
+        """Cover actual receive readiness, including communication streams.
+
+        Required by prefill feedback. Python dispatch returning is not completion.
+        Static schedules retain compatibility without implementing this method.
+        """
+        raise NotImplementedError(
+            "Dispatch completion is required for prefill feedback"
+        )
+
     @abstractmethod
     def combine(self, local_output, context):
+        pass
+
+    @abstractmethod
+    def finish(self, accumulator, context):
+        """Apply any common tail/reduction exactly once."""
+
+
+class WaveDispatcher(MoEDispatcher):
+    """Repeated DFC additionally needs route masking and result accumulation."""
+
+    @abstractmethod
+    def mask_routes(self, routing, wave, context):
         pass
 
     @abstractmethod
@@ -129,9 +206,48 @@ class WaveDispatcher(ABC):
     def accumulate(self, accumulator, partial, context):
         pass
 
+
+class DispatchLayoutAdapter(ABC):
+    """Slice a single full dispatch and assemble its original combine layout.
+
+    These methods emit device operations; Python is not rerun during replay.
+    Use device counts/masks with fixed-capacity storage, never host decisions
+    from .item()/.tolist(). Compact and padded layouts need backend adapters.
+    """
+
     @abstractmethod
-    def finish(self, accumulator, context):
-        """Apply any common tail/reduction exactly once."""
+    def bind(self, dispatch_output, context):
+        """Return a per-invocation layout over runtime-owned, budgeted buffers.
+
+        Retain the full dispatch metadata, activation scales and combine handle.
+        Initialize output/padding as required, including entirely empty demand.
+        The runtime keeps buffers alive through resources_idle and graph leases;
+        releasing this Python layout must not release in-flight device storage.
+        """
+
+    @abstractmethod
+    def select_wave(self, layout, wave, context):
+        """Return LocalExpertProgram input for [local_start, local_end).
+
+        Preserve scales, counts and inverse row mapping; bank lanes are local to
+        F and must not change EP IDs. Support empty waves and the partial tail.
+        """
+
+    @abstractmethod
+    def write_wave(self, layout, wave, local_output, context):
+        """Place F output at its original receive rows, without top-k weighting.
+
+        Establish dependencies before reusing per-wave input/output scratch.
+        This assembles the full combine input; it is not token accumulation.
+        """
+
+    @abstractmethod
+    def combine_input(self, layout, context):
+        """Join all wave writes; return full output with original D metadata.
+
+        Preserve the backend's weighting convention without applying weights a
+        second time. Keep layout storage live until combine finishes reading it.
+        """
 
 
 class BoundMoERuntime(ABC):
@@ -148,6 +264,7 @@ class BoundMoERuntime(ABC):
     residency: ResidencyState
     prefill_program: WholeMoEProgram
     decode_program: WholeMoEProgram
+    cache_updates = None  # Optional bound CacheUpdateCoordinator.
 
     def eager_step_scope(self, forward_batch):
         """Optional step emission; capture uses separately installed hooks."""
@@ -176,15 +293,22 @@ class BoundMoERuntime(ABC):
     def emit_step_begin(self, context):
         """Clear step accesses and establish fixed per-forward device state."""
 
-    @abstractmethod
     def emit_layer_start(self, layer_id, context):
-        """Prefill starts all-local-expert prefetch before the router."""
+        """Start eager prefill at layer entry; decode emits no weight prefetch.
+
+        Bind resident layers to a no-op program or skip this hook for those layers.
+        """
+        if context.phase is Phase.PREFILL:
+            if context.capturing:
+                raise RuntimeError("Prefill layer-start cannot run during capture")
+            self.prefill_program.layer_start(layer_id, context)
+        elif context.phase is not Phase.DECODE:
+            raise ValueError("Unsupported execution phase")
 
     @abstractmethod
     def emit_after_router(self, layer_id, routing, context):
         """Emit routing bookkeeping; complete local demand is known after D."""
 
-    @abstractmethod
     def emit_step_end(self, context):
         """Decode: policy update/select, materialize new hot set, then commit.
 
@@ -195,6 +319,15 @@ class BoundMoERuntime(ABC):
         Prefill: no hotness updates. Whole-model step counts must ignore padding.
         All background work must join the resources_idle completion.
         """
+        if context.phase is Phase.PREFILL:
+            if context.capturing:
+                raise RuntimeError("Prefill step-end cannot run during capture")
+            return None
+        if context.phase is not Phase.DECODE:
+            raise ValueError("Unsupported execution phase")
+        if self.cache_updates is None:
+            raise NotImplementedError("Bind cache_updates or implement emit_step_end")
+        return self.cache_updates.emit_step_end(context)
 
     @abstractmethod
     def snapshot_decode_state(self):

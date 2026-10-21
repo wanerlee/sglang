@@ -1,5 +1,7 @@
 # MoE 专家 Cache 基础功能设计
 
+接口更新：已合并同事 `59cbb5d`；cache 执行统一接入公共 `ExpertWeightAccess` / `CacheUpdateCoordinator`。算法参数及层内配对不变，详见 [合并适配设计](MERGE_ADAPTATION_DESIGN.zh-CN.md)。
+
 适用分支：`codex/moe-offload-dev`
 
 状态：周期 LFU、元数据适配，以及 cache 调用方的初始化、实际需求计划、slot 替换、传输调用和就绪后发布已实现。见 [LFU 独立设计](LFU_DESIGN.zh-CN.md)、第 14 节及 [调用链与 H2D 交接表](CACHE_RUNTIME_HANDOFF.zh-CN.md)。CPU 测试搬运器验证调用链；真实 NPU transport、模型原生绑定和完整 graph 联调尚未完成。
@@ -402,7 +404,7 @@ commit_update(update_plan, weights_ready, context)
 | 模型和执行入口 | 接通 decode；接通目标模型 verify 的计数和模式识别后，再调整现有投机解码限制。 |
 | 测试 | 策略参考测试及 NPU 搬运/执行联调。 |
 
-本设计不实现新的 CPU offload 框架或新的内存池管理器；继续使用 `HostExpertStore`、`ResourceLedger`、`MoEOffloadOwner`。新增具体后端来填补接口。
+本设计不实现新的 CPU offload 框架或新的内存池管理器；继续使用 `HostExpertStore`、`AllocationLedger`、`MoEOffloadOwner`。新增具体后端来填补接口。
 
 ## 12. 最小验收用例
 
@@ -416,7 +418,7 @@ commit_update(update_plan, weights_ready, context)
 | 衰减 | 使用衰减前热度选取；周期轮所有 usage 乘 0.7，无交换也衰减。 |
 | 按需执行 | wave 覆盖 E4/E5、实际只需 E5 时只加载 E5；空波无多余权重搬运，保持 D/F/C 顺序。 |
 | Miss 执行 | 临时加载后能正确计算，但周期准入前仍显示非驻留。 |
-| 集合与物理位置 | 改变 target_keys 的排列不移动幸存专家；新专家只占本层被淘汰专家的 slot。 |
+| 集合与物理位置 | 改变 target_keys 的排列不移动幸存专家；层内配对决定集合及各层驻留数量；物理 slot 由 residency 分配，不绑定层。 |
 | 发布顺序 | 复制完成前没有新映射可被下一轮使用；执行 bank 不覆盖未读完的权重。 |
 | Graph | 同一 graph 多次 replay 改变路由，hit/miss、替换和 usage 随之改变；warmup/capture 不改变 usage、周期或热布局。 |
 | 模式切换 | decode → prefill → prefill → decode 后，恢复原 slot、usage 和周期位置。 |
@@ -456,10 +458,10 @@ cache.begin_step(enabled)
 # local_ids 是该层、本 rank 内的专家编号，valid 标记真实行而非 padding。
 cache.record_local_routes(layer_id, local_ids, valid)
 
-# 所有层、所有 wave 结束后只调用一次。
-cache.finish_step()
-# 只输出目标集合；集合差分由 residency 准备更新计划时计算。
-# cache.target_keys 是目标集合；当前 residency 没有被修改。
+# 所有层、所有 wave 结束后，由预先绑定的公共 coordinator 收尾一次。
+cache_updates.emit_step_end(context)
+# 统计 -> 选择 -> policy.finish_step -> access.apply_update。
+# metadata 不执行 H2D 或映射发布；这两者经公共 access/residency 完成。
 ```
 
 `record_global_routes()` 可将连续 EP 分片下的全局专家编号转换为 local ID；其他 rank 的专家、负编号、越界项及 padding 不计数。若调用方持有的是每专家聚合 token 数，需要先另接计数适配，不能把一个专家编号当成只有一次访问。
@@ -481,7 +483,7 @@ metadata 只维护 `target_keys`。层内一换一由 LFU 保证，residency 直
 
 阶段判断不依赖 TBO 才提供的 `global_forward_mode`：结合 `is_extend_in_batch` 与全局 token 数推导。在全局 prefill 中，本地 IDLE 或 DECODE rank 都进入 prefill；在有效全局 decode 中，本地 IDLE rank 仍统计 dispatch 后的访问并推进周期。优先使用 `original_global_num_tokens_cpu`，避免把图 padding 当成有效 token；全局空闲时保持当前阶段，不触发无谓回填。
 
-Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache_updates.emit_step_end(context, adjust=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `adjust=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 ### 14.3 快照及资源归属
 
@@ -497,8 +499,8 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 | --- | --- |
 | `MoEBackend.finalize()` | 可构造 `CacheRuntime` 并调用 `initialize(model_id)`；真实 backend 注入权重 bindings、程序和 transport。 |
 | `BoundMoERuntime.emit_step_begin()` | `CacheRuntime` 调用 `cache.begin_step(enabled)`。 |
-| EP dispatch 后的实际分配 | `CacheLocalExpertProgram` 调用路由 adapter、计数、按实际需求准备 bank，再调用原生 F。具体 dispatcher 的 adapter 仍需提供。 |
-| `BoundMoERuntime.emit_step_end()` | 已接 `finish_step -> prepare_update -> materialize_into -> commit_update`。 |
+| EP dispatch 后的实际分配 | `DecodeLocalExpertProgram` 调用 make_request 适配路由并计数，经 `ExpertWeightAccess` 准备 bank，再调用原生 F。具体 dispatcher 的 adapter 仍需提供。 |
+| `BoundMoERuntime.emit_step_end()` | 已接 `CacheUpdateCoordinator -> update_statistics/select_hot_set/finish_step -> ExpertWeightAccess.apply_update`。 |
 | `ModelRunner.forward_scope()` | `CacheRuntime.forward_scope` 处理全局模式、owner 生命周期及本次提交的新完成事件。 |
 | `ModelRunner` eager 分支 | 新 `eager_step_scope` 包围实际 eager 调用，graph 分支绕过此入口。 |
 | `capture_head_hooks/capture_tail_hooks` | `CacheRuntime.install_model_hooks` 注册一次；图 replay 不重新执行 Python 计数。真实 NPU capture 验证仍待完成。 |
@@ -512,4 +514,4 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 - NPU：`test/manual/test_moe_cache_metadata_npu.py` 可单独验证 LFU、计数和目标集合的 `NPUGraph` 捕获及变化输入回放，不依赖专家权重 H2D。在 Ascend 环境执行 `python test/manual/test_moe_cache_metadata_npu.py`。
 - NPU 小规模完整流程：`test/manual/test_moe_cache_runtime_npu.py` 新增 3 组测试，使用真实 H2D/D2D、事件等待、两块矩阵组成的专家权重，验证 LFU 替换、发布和回填恢复。它通过主机读取计划进行 eager 测试，不支持动态搬运入图；运行方式及验收标准见 [交接表第 6 节](CACHE_RUNTIME_HANDOFF.zh-CN.md#6-npu-小规模完整流程测试)。
 - 本地没有 `torch_npu`，不能宣称 NPU 算子/捕图已验证。CPU trace 只检查固定形状下的数据流；其静态形状判断警告不表示支持动态 shape 或真实设备图。
-- 当前本地回归：调用链测试 22 项、NPU 脚本参考计算的 CPU 检查 2 项，与元数据、LFU 和原框架测试合计 82 项 CPU 测试通过。本机没有 `torch_npu`，新增 NPU 完整流程脚本尚未实机验证。Ruff 检查及格式、isort 和空白检查通过。
+- 当前本地回归：调用链测试 22 项、NPU 脚本参考计算的 CPU 检查 2 项，与元数据、LFU 和原框架测试合计 117 项 CPU 测试通过。本机没有 `torch_npu`，新增 NPU 完整流程脚本尚未实机验证。Ruff 检查及格式、isort 和空白检查通过。

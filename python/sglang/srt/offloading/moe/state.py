@@ -35,7 +35,10 @@ class ResidencyState:
         )
 
     def allocations(self):
-        """The binder adds these, policy state, snapshots and plans to the ledger."""
+        """Report residency tensors for the binder's allocation ledger.
+
+        The binder also reports policy state, snapshots and plans.
+        """
         allocations = []
         for field in fields(self):
             tensor = getattr(self, field.name)

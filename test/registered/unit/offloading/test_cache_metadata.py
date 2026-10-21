@@ -5,23 +5,38 @@ import unittest
 from contextlib import ExitStack
 from enum import IntEnum, auto
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.offloading.moe import (
     CacheMetadataAdapter,
+    CacheUpdateCoordinator,
     ExpertCatalog,
     ExpertLayerSpec,
     PeriodicLFUConfig,
     PeriodicLFUPolicy,
+    Phase,
     cache_update_enabled,
 )
-from sglang.srt.offloading.moe.resources import ResourceKind, ResourceLedger
+from sglang.srt.offloading.moe.resources import AllocationLedger, ResourceKind
 from sglang.srt.offloading.moe.state import ResidencyState
+from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def finish_cache(cache, *, adjust=True):
+    # Exercise the public coordinator, isolating metadata from physical copies.
+    access = SimpleNamespace(
+        apply_update=lambda *args: TransferTicket(ImmediateCompletion())
+    )
+    context = SimpleNamespace(phase=Phase.DECODE, retain=lambda resource: None)
+    return CacheUpdateCoordinator(
+        cache.policy, cache.policy_state, cache.residency, cache.target_keys, access
+    ).emit_step_end(context, adjust=adjust)
 
 
 def actual_forward_mode():
@@ -148,7 +163,7 @@ class TestRouteAccounting(unittest.TestCase):
         cache = adapter()
         cache.begin_step(torch.tensor(False))
         cache.record_local_routes(3, torch.tensor([1, 1]), torch.tensor([True, True]))
-        cache.finish_step()
+        finish_cache(cache)
         self.assertEqual(cache.policy_state.usage.sum().item(), 0)
         self.assertEqual(cache.stats.accesses.item(), 0)
         self.assertEqual(cache.policy_state.step_mod.item(), 0)
@@ -159,7 +174,7 @@ class TestRouteAccounting(unittest.TestCase):
             cache.record_local_routes(
                 3, torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.bool)
             )
-            cache.finish_step()
+            finish_cache(cache)
         self.assertEqual(cache.policy_state.step_mod.item(), 0)
         self.assertEqual(cache.stats.accesses.item(), 0)
 
@@ -190,13 +205,13 @@ class TestCacheTargets(unittest.TestCase):
                 cache.record_local_routes(
                     3, torch.tensor([1, 1]), torch.tensor([True, True])
                 )
-                cache.finish_step(select_hot_set=False)
+                finish_cache(cache, adjust=False)
             select.assert_not_called()
         self.assertEqual(cache.target_keys.tolist(), [-1] * 4)
         self.assertEqual(cache.policy_state.step_mod.item(), 3)
         self.assertEqual(cache.policy_state.usage[1].item(), 6)
         cache.begin_step(torch.tensor(True))
-        cache.finish_step()
+        finish_cache(cache)
         self.assertEqual(cache.target_keys.tolist(), [1, 2, 4, 7])
         self.assertAlmostEqual(cache.policy_state.usage[1].item(), 4.2, places=5)
 
@@ -214,7 +229,7 @@ class TestCacheTargets(unittest.TestCase):
                     torch.tensor(routes),
                     torch.ones(len(routes), dtype=torch.bool),
                 )
-            cache.finish_step()
+            finish_cache(cache)
             if i < 3:
                 self.assertEqual(cache.target_keys.tolist(), [0, 2, 4, 7])
             torch.testing.assert_close(cache.residency.key_to_slot, before)
@@ -256,7 +271,7 @@ class TestMetadataSnapshot(unittest.TestCase):
         self.assertEqual(state.execution_key.tolist(), [-1, -1])
         self.assertFalse(state.execution_valid.any().item())
         cache.begin_step(torch.tensor(True))
-        cache.finish_step()
+        finish_cache(cache)
         self.assertEqual(cache.policy_state.step_mod.item(), 3)
         with self.assertRaises(RuntimeError):
             cache.restore_decode_metadata_after_refill()
@@ -265,7 +280,7 @@ class TestMetadataSnapshot(unittest.TestCase):
         cache = adapter()
         allocations = cache.residency.allocations() + cache.allocations()
         total = sum(item.nbytes for item in allocations)
-        ledger = ResourceLedger({ResourceKind.METADATA: total}, allocations)
+        ledger = AllocationLedger({ResourceKind.METADATA: total}, allocations)
         self.assertEqual(ledger.usage[ResourceKind.METADATA], total)
         self.assertTrue(all(item.kind == ResourceKind.METADATA for item in allocations))
         self.assertFalse(any("delta" in item.name for item in allocations))
@@ -286,7 +301,7 @@ class TestCacheTensorDataFlow(unittest.TestCase):
             for _ in range(4):
                 cache.begin_step(enabled)
                 cache.record_local_routes(3, ids, valid)
-                cache.finish_step()
+                finish_cache(cache)
         self.assertEqual(cache.target_keys.tolist(), [0, 1, 4, 7])
 
     def test_trace_uses_live_routes_and_gate(self):
@@ -308,7 +323,7 @@ class TestCacheTensorDataFlow(unittest.TestCase):
             def forward(self, ids, valid, enabled):
                 cache.begin_step(enabled)
                 cache.record_local_routes(3, ids, valid)
-                cache.finish_step()
+                finish_cache(cache)
                 return cache.target_keys, cache.policy_state.usage
 
         ids, valid = torch.tensor([1, 1, 1]), torch.tensor([True] * 3)

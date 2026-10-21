@@ -1,10 +1,12 @@
 # Cache 调用链实现与 H2D 交接表
 
+接口更新：已合并同事 `59cbb5d`；cache 执行统一接入公共 `ExpertWeightAccess` / `CacheUpdateCoordinator`。算法参数及层内配对不变，详见 [合并适配设计](MERGE_ADAPTATION_DESIGN.zh-CN.md)。
+
 适用分支：`codex/moe-offload-dev`。
 
 本轮全部修改概览见 [修改总结](CHANGE_SUMMARY.zh-CN.md)。
 
-当前已实现 cache 调用方：初始化、step 生命周期、dispatch 后计数、按实际需求准备 execution bank、LFU 更新、slot 计划、复制完成后发布、prefill 借池前快照及回填后恢复。搬运调用统一使用已有 `WeightTransferBackend.materialize_into(plan, bindings, stream)`。
+当前已实现 cache 调用方：初始化、step 生命周期、dispatch 后计数、按实际需求准备 execution bank、LFU 更新、slot 计划、复制完成后发布、prefill 借池前快照及回填后恢复。decode 通过公共 access 调用 `materialize_into`，prefill pipeline 调用 `materialize_host_into`。
 
 CPU 测试使用延迟执行的测试搬运器和两分量专家权重，验证实际权重复制与计算结果。另新增 NPU 完整流程脚本，使用真实 stream/event 和小矩阵权重，见第 6 节；本机没有 NPU，尚未实机验证。测试实现只位于测试目录，不作为 serving fallback。尚未提供生产 NPU transport、原生专家算子或 EP dispatcher；也未验证完整 NPU graph 或重叠性能。
 
@@ -12,16 +14,16 @@ CPU 测试使用延迟执行的测试搬运器和两分量专家权重，验证�
 
 | 文件 | 本次实现 |
 | --- | --- |
-| [cache_runtime.py](cache_runtime.py) | `CacheRuntime` 实现 `BoundMoERuntime` 的 cache 生命周期和捕图 hook；`CacheLocalExpertProgram` 串联 D 后统计、bank 准备和原生 F。 |
+| [cache_runtime.py](cache_runtime.py) | `CacheRuntime` 实现 `BoundMoERuntime` 的 cache 生命周期和捕图 hook；`make_execution_request` 接 D 后统计，公共 `DecodeLocalExpertProgram` / `ExpertWeightAccess` 串联 bank 准备和原生 F。 |
 | [cache_residency.py](cache_residency.py) | `TensorResidencyOps` 实现实际需求计划、保留幸存 slot、分配替换位置、失效旧读者映射及就绪后发布。 |
-| [cache_metadata.py](cache_metadata.py) | 保持原职责：计数、LFU 调用和元数据快照。 |
+| [cache_metadata.py](cache_metadata.py) | 保持原职责：计数、策略状态和元数据快照；LFU 收尾由公共 coordinator 统一调用。 |
 | [ModelRunner](../../model_executor/model_runner.py) / [BaseOffloader](../base.py) / [MoEOffloaderV2](offloader.py) | 新增 eager step scope 的实际调用链；decode graph 分支直接返回，不重复执行 eager step hook。 |
 | [test_cache_runtime.py](../../../../../test/registered/unit/offloading/test_cache_runtime.py) | 测试 backend、延迟搬运、D/F/C 程序及框架调用链验证。 |
 
 ```text
 backend.finalize
   -> CacheRuntime(... backend bindings / streams / programs ...)
-  -> 组装 decode_program = ComposedDFCProgram(..., CacheLocalExpertProgram(...))
+  -> 组装 decode_program = DispatchOnceProgram(..., DecodeLocalExpertProgram(...))
   -> runtime.initialize(model_id)
        offline TopK -> prepare_refill -> materialize_into -> wait -> commit
   -> 返回 runtime，创建现有 owner
@@ -35,18 +37,18 @@ ModelRunner.forward -> offloader.forward_scope
   -> 写固定地址的统计开关
   -> eager：ModelRunner 调用 eager_step_scope 的 begin/end
      graph：已有 capture head/tail 记录 begin/end，replay 不重新调用 Python
-  -> 每层、每波：D -> LocalRoutes -> 计数 -> 实际需求计划
-       -> materialize_into(execution_bindings) -> wait -> 发布 bank -> native F -> C
-  -> 完整 step 末尾：累计 LFU（eager 仅周期到期时继续）-> prepare_update
-       -> materialize_into(hot_bindings) -> wait -> commit_update
+  -> 每层一次 D -> 各 wave 的 LocalRoutes -> 计数 -> ExecutionRequest
+       -> access.stage -> wait_ready -> native F -> release_after -> 一次 C
+  -> 完整 step 末尾：coordinator 累计 LFU、选择、finish_step
+       -> access.apply_update -> prepare_update -> 搬运 -> commit_update
   -> 记录本次提交的新完成事件 -> owner.finish_forward
 ```
 
-基础版本使用 compute -> copy -> compute 依赖串行保护复用内存；未实现跨波搬运与计算重叠。传输 API 仍为异步，不用每步 host synchronize。初始化和阶段切换允许主机等待。
+decode 使用 compute -> copy -> compute 依赖串行保护复用内存，不做下一 wave 预取。prefill hook 已接到公共 pipeline，真实优化流水由同事提供。传输 API 仍为异步，不用每步 host synchronize。初始化和阶段切换允许主机等待。
 
 阶段判断不依赖 TBO 才提供的 `global_forward_mode`：结合 `is_extend_in_batch` 与全局 token 数推导。在全局 prefill 中，本地 IDLE 或 DECODE rank 都进入 prefill；在有效全局 decode 中，本地 IDLE rank 仍统计 dispatch 后的访问并推进周期。优先使用 `original_global_num_tokens_cpu`，避免把图 padding 当成有效 token；全局空闲时保持当前阶段，不触发无谓回填。
 
-Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache_updates.emit_step_end(context, adjust=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `adjust=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 ## 2. 已落地的调用方数据约定
 
@@ -66,26 +68,31 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 
 一次条目表示一个完整专家 bundle，包括所有权重、scale 等必要组件。所有组件就绪才能返回覆盖本次操作的完成依赖。`bindings` 是后端对象，本次未假定它必须是 dict 或特定内存布局。
 
-### 2.2 CacheUpdatePlan
+### 2.2 公共 reservation 与 UpdatePlan
 
-这是 cache 内部数据，不要求 H2D 负责人理解 LFU：
+`ExecutionReservation` 和 `UpdatePlan` 复用公共 `copy_plan / bindings / copy_dependencies / keepalive / state`；原私有 CacheUpdatePlan 已删除。
 
-- `copies`：传给已有 transport 的 `DeviceCopyPlan`。
-- `slot_keys`：期望的 slot -> key 映射；与 LFU 无序目标集合不同。
-- `publish_enabled`：设备 bool。关闭更新时，不发布新的驻留元数据。
+- `resolve_execution(ExecutionRequest, context)` 返回 execution reservation。
+- `publish_execution(reservation, weights_ready, context)` 返回执行映射发布完成的 `TransferTicket`。
+- `finish_execution(reservation, read_done, context)` 记录最终读者，保护下一次计划与 bank 复用。
+- `prepare_update(target_keys, context)` 返回 `UpdatePlan`；`commit_update(plan, weights_ready, context)` 返回热映射发布票据。
+- 热更新的 `state` 保存 `slot_keys` 和设备 `publish_enabled`，不再复制一份搬运计划。
+- `prepare_refill(slot_keys, context)` 是精确位置初始化/恢复的 cache 生命周期方法，不调用 LFU。
 
-热更新保留所有幸存专家的物理 slot；将新专家按 key 顺序分配到空出的 slot。LFU 仍按层内冷热配对选集合，各层驻留数量不变；同质物理 slot 本身不绑定层。
+热更新保留幸存专家位置，将新专家按 key 顺序分配到空出的 slot。LFU 层内配对，各层驻留数量不变；同质物理 slot 本身不绑定层。
+
+默认 `TensorResidencyOps` 生成 decode 的 DeviceCopyPlan。真实 prefill backend 在 pipeline 的 access 中提供 HOST_ONLY 的 HostCopyPlan/reservation 和 bank 布局。runtime 可注入扩展的 cache residency，其需保留 `prepare_refill` 和 `allocations`；不新增 host-copy 生产 fallback。
 
 ### 2.3 路由与执行 bank
 
-`route_adapter(layer, dispatch_output, wave) -> LocalRoutes(expert_ids, valid)`：
+`DecodeLocalExpertProgram` 接收 `make_request(layer, dispatch_output, wave, context)`；后端转换成 `LocalRoutes` 后调用 `runtime.make_execution_request(layer.layer_id, routes, wave, context)`：
 
 - IDs 是该层、本 EP rank 内的 local expert ID，int32/int64；valid 为同形状 bool。
 - 每个有效 token-expert 分配计数一次，不能把去重后的专家列表交给计数器。
 - 当前 wave 外的分配及 padding 不计数。装载需求在计数之后去重。
 - bank 内 lane = local_id - wave.local_start；物理目标 = wave.bank * bank_slots + lane。
 - 只准备实际有需求的 lane，空 wave 仍保留原 D/F/C 顺序，但不搬运专家。
-- `run_experts(layer, dispatch_output, wave, context)` 读取已就绪的固定 bank；不重复统计或准备权重。原生 F 若使用其他流，需要将读者完成依赖接回 compute 流。
+- `run_experts(layer, dispatch_output, bindings, context)` 读取已就绪的 bank，返回 `LocalExecution(output, read_done)`；不重复统计或准备权重。read_done 覆盖全部权重读取流，公共 Program 将其 join 回 compute。bindings 提供原生 F 使用的视图/映射信息，不依赖旧签名的 wave。
 
 ## 3. 需要与 H2D 同事确认的事项
 
@@ -127,7 +134,7 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 
 这证明调用方流程及 CPU 语义，不证明真实 NPU H2D、完整 graph、分布式正确性或性能收益。
 
-当前本地运行：调用链 22 项、NPU 脚本参考计算的 CPU 检查 2 项，加上原有 metadata、LFU、framework，合计 82 项 CPU 测试通过；Ruff 检查 / 格式及 isort 通过。测试环境有 PyTorch CPU，没有 torch_npu。
+当前本地运行：双方原有测试 108 项，加上 `test_cache_integration.py` 的 9 项读者依赖、调用链和 prefill/恢复衔接测试，合计 117 项 CPU 测试通过；Ruff 检查 / 格式及 isort 通过。测试环境有 PyTorch CPU，没有 torch_npu。
 
 在具备项目依赖的环境中，可单独运行：
 

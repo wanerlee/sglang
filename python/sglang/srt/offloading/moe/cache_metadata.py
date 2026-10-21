@@ -192,24 +192,6 @@ class CacheMetadataAdapter:
             layer_id, global_expert_ids - global_start, valid, **kwargs
         )
 
-    def finish_step(self, *, select_hot_set=True):
-        """Accumulate once; optionally select a target set, without publishing.
-
-        Eager callers can skip selection using the host forward-cycle counter.
-        Captured calls keep the default tensor-gated path. target_keys is only
-        an output when selection runs; skipped steps must not consume it.
-        """
-        self.policy.update_statistics(
-            self.policy_state,
-            self.residency.step_access_count,
-            self.residency.update_enabled,
-        )
-        if select_hot_set:
-            self.policy.select_hot_set(
-                self.policy_state, self.residency.key_to_slot, self.target_keys
-            )
-        self.policy.finish_step(self.policy_state)
-
     def save_decode_metadata(self):
         """Host phase transition, after prior streams have drained; no weights."""
         self.snapshot.save(self.residency)

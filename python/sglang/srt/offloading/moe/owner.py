@@ -8,7 +8,7 @@ from functools import wraps
 from threading import RLock
 
 from .config import Phase
-from .resources import ResourceKind, ResourceLedger, SlotArena
+from .resources import AllocationLedger, ResourceKind, SlotLeaseManager
 
 
 def _serialized(method):
@@ -82,7 +82,7 @@ class MoEOffloadOwner:
         self.catalog = catalog
         self.runtime = runtime
         hot_slots = config.hot_slots(catalog)
-        self.ledger = ResourceLedger(
+        self.allocation_ledger = AllocationLedger(
             {
                 ResourceKind.HOST_WEIGHTS: catalog.num_experts * runtime.expert_nbytes,
                 ResourceKind.HOT_WEIGHTS: hot_slots * runtime.expert_nbytes,
@@ -98,10 +98,13 @@ class MoEOffloadOwner:
             ResourceKind.HOT_WEIGHTS,
             ResourceKind.EXECUTION_WEIGHTS,
         ):
-            if self.ledger.usage[kind] != self.ledger.limits[kind]:
+            if (
+                self.allocation_ledger.usage[kind]
+                != self.allocation_ledger.limits[kind]
+            ):
                 raise ValueError(f"{kind.value} allocation does not match slot budget")
-        self.hot_arena = SlotArena(hot_slots)
-        self.execution_arena = SlotArena(config.execution_slots)
+        self.hot_slot_leases = SlotLeaseManager(hot_slots)
+        self.execution_slot_leases = SlotLeaseManager(config.execution_slots)
         self.state = OwnerState.READY
         self.phase = Phase.DECODE
         self.prefill = PrefillController(self)
@@ -237,13 +240,13 @@ class MoEOffloadOwner:
         try:
             self.runtime.synchronize()
             self.wait_idle()
-            self.hot_arena.require_empty()
-            self.execution_arena.require_empty()
+            self.hot_slot_leases.require_empty()
+            self.execution_slot_leases.require_empty()
             self.runtime.close()
         except BaseException:
             self.state = OwnerState.FAILED
             raise
         self._transition_ticket = None
         # Release allocation keepalives only after the backend is quiescent.
-        self.ledger = None
+        self.allocation_ledger = None
         self.state = OwnerState.CLOSED

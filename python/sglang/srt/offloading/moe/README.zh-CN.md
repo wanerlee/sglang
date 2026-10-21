@@ -8,7 +8,24 @@
 
 **当前交付是代码框架，尚未提供可运行的 A5 / CUDA MoE offload 推理后端。** 已实现公共控制逻辑、Tensor LFU 和 CPU 契约测试；完整 decode graph 是首版必须满足的验收条件，不能用 eager fallback 替代。
 
-本文以 `moe-offload-proto-v1` 分支的框架提交 `65e5c53ebb` 为实现基线，更新于 **2026-10-20**。下文保留之前讨论的三张 UML 的主题，并按实际代码名称更新、标注实现状态；另补一张 prefill/decode 切换状态图。
+本文以 `moe-offload-proto-v1` 分支的框架提交 `65e5c53ebb` 及后续 DispatchOnce 扩展为实现基线，更新于 **2026-10-20**。下文保留之前讨论的三张 UML 的主题，并按实际代码名称更新、标注实现状态；另补一张 prefill/decode 切换状态图。
+
+## 2026 年 10 月 21 日 H2D 抽象落地
+
+[H2D 设计与调用契约](moe-h2d-design.zh-CN.md) 对应的公共抽象和组合逻辑已落地：
+
+| 入口 | 当前实现 |
+| --- | --- |
+| [transfer.py](../transfer.py) | `HostCopyRegion` / `HostCopyPlan`、`HostTransferOps`、`ComposedTransferBackend`，与已有 `DeviceTransferOps` 组合；不绑定默认硬件后端 |
+| [execution.py](execution.py) | `ExecutionRequest`、`ExecutionReservation`、`UpdatePlan`、`WeightLease`、`ExpertWeightAccess`、`CacheUpdateCoordinator` |
+| [interfaces.py](interfaces.py) | `ExecutionContext` 的保活/完成契约；临时驻留发布与 reader 结束；Dispatch completion；runtime 层首/尾部默认委托 |
+| [prefill.py](prefill.py) | `PrefillWeightPipeline` 抽象：start / validate_session / seal / acquire / finish / abort；具体 worker 和 ACL 调度待实现 |
+| [programs.py](programs.py) | `PrefillDispatchOnceProgram`、`PrefillLocalExpertProgram`、`DecodeLocalExpertProgram`；复用公共 D/F/C，不复制整套 forward |
+| [test_h2d_contracts.py](../../../../../test/registered/unit/offloading/test_h2d_contracts.py) | CPU 契约测试：模式隔离、每趟 K、异步依赖、失败保活、LFU 尾部更新及无预取 decode |
+
+实际接入时，runtime 绑定 `ComposedTransferBackend(host_ops=..., device_ops=...)` 和 `ExpertWeightAccess`，并设置 `cache_updates = CacheUpdateCoordinator(...)`。prefill 另行注入具体 pipeline；local program 的 `run_experts` 返回 `LocalExecution(output, read_done)`。所有对象与物理分配仍由 bound runtime / owner 管理。
+
+**ACL batch 扩展、MemFabric device lowering、设备 ResidencyOps、prefetch worker、真实模型 hooks 与完整 A5 graph 验收仍待实现。** 当前代码不会用 Torch copy 或 CPU 决策偷偷替代这些后端。Decode 当前 wave 的复制还需等待计算流 frontier，保证相邻 wave 即使用不同 bank 也不提前搬运。
 
 ## 1. 已确认的设计边界
 
@@ -21,7 +38,7 @@
 | 临时执行 | miss 权重进入显式执行区；临时使用不等于热缓存准入。双缓冲、hit 的执行副本也计入预算。 |
 | Prefill | 按本层所有本地专家组织全量流式预取；从 layer-start 开始预取，router 后进入分波计算。全量表示覆盖全部专家，不要求同时驻留整个层。 |
 | 模式切换 | 第一次进入 prefill 时保存精确热布局及策略状态，借用热池；连续 prefill 不反复保存或恢复。切回 decode 时恢复原 slot、专家、有效位、generation 和 LFU 状态。prefill 不更新热度。 |
-| 执行单元 | 一次 step 是一个 batch 的一次完整模型 forward；多个 D/F/C 波次保持完整配对。 |
+| 执行单元 | 一次 step 是一个 batch 的一次完整模型 forward；支持多轮完整 D/F/C，或一次 D、分片 F、一次 C。 |
 | Decode | 本次 forward 内保持热集合不变，尾部才根据策略更新热集合；完整动态路径必须进入 graph。 |
 | 并发 | 不允许两个 forward 同时使用资源；连续异步提交通过设备完成依赖串行化。 |
 | 首版排除 | EPLB、弹性或重映射 EP、在线权重更新、投机解码、MoE TP、forward 重叠及不兼容的 shared-expert 融合。 |
@@ -71,7 +88,8 @@ offloader = MoEOffloaderV2(config, backend, policy=TensorLFUPolicy())
 | [owner.py](owner.py) | 唯一 owner、两个模式控制器、forward token、graph lease、切换与关闭流程。 |
 | [resources.py](resources.py)、[storage.py](storage.py) | 物理内存记账、host 侧 slot 预约、pinned 权重及注册句柄持有。 |
 | [state.py](state.py)、[policy.py](policy.py) | 公共缓存 tensor 状态、独立 LFU 状态及策略实现。 |
-| [interfaces.py](interfaces.py)、[programs.py](programs.py) | 后端扩展点、固定多轮 DFC 编排。 |
+| [interfaces.py](interfaces.py)、[programs.py](programs.py) | 后端扩展点、固定多轮 DFC 和一次 D / 分片 F / 一次 C 编排。 |
+| [test_dispatch_once.py](../../../../../test/registered/unit/offloading/test_dispatch_once.py) | DispatchOnce 的 CPU 数值对照与边界测试；不验证真实 DeepEP 或 graph。 |
 | [test_moe_framework.py](../../../../../test/registered/unit/offloading/test_moe_framework.py) | CPU 契约测试与测试用 fake runtime；fake runtime 不属于推理后端。 |
 
 ## 3. UML：从当前框架生长
@@ -128,6 +146,9 @@ classDiagram
     }
     class MoEOffloadOwner {
         <<framework>>
+        allocation_ledger
+        hot_slot_leases
+        execution_slot_leases
         begin_forward()
         finish_forward()
         switch_phase()
@@ -159,6 +180,9 @@ classDiagram
     direction TB
     class MoEOffloadOwner {
         <<framework>>
+        allocation_ledger
+        hot_slot_leases
+        execution_slot_leases
         begin_forward()
         finish_forward()
         fail_forward()
@@ -166,11 +190,11 @@ classDiagram
         acquire_graph()
         close()
     }
-    class ResourceLedger {
+    class AllocationLedger {
         <<framework>>
         physical_allocation_budgets
     }
-    class SlotArena {
+    class SlotLeaseManager {
         <<framework>>
         acquire()
         retire()
@@ -235,6 +259,23 @@ classDiagram
         <<framework>>
         fixed_DFC_waves
     }
+    class DispatchOnceProgram {
+        <<framework>>
+        single_D_sliced_F_single_C
+    }
+    class MoEDispatcher {
+        <<interface>>
+        dispatch()
+        combine()
+        finish()
+    }
+    class DispatchLayoutAdapter {
+        <<interface>>
+        bind()
+        select_wave()
+        write_wave()
+        combine_input()
+    }
     class FusedDFCProgram {
         <<future>>
     }
@@ -262,8 +303,8 @@ classDiagram
         <<interface>>
         materialize_into()
     }
-    MoEOffloadOwner *-- ResourceLedger
-    MoEOffloadOwner *-- "2" SlotArena : hot / execution reservations
+    MoEOffloadOwner *-- AllocationLedger
+    MoEOffloadOwner *-- "2" SlotLeaseManager : hot / execution reservations
     MoEOffloadOwner *-- PrefillController
     MoEOffloadOwner *-- DecodeController
     MoEOffloadOwner *-- BoundMoERuntime
@@ -277,6 +318,11 @@ classDiagram
     BoundMoERuntime --> WholeMoEProgram
     CachePolicy <|.. TensorLFUPolicy
     WholeMoEProgram <|.. ComposedDFCProgram
+    WholeMoEProgram <|.. DispatchOnceProgram
+    MoEDispatcher <|-- WaveDispatcher
+    DispatchOnceProgram --> MoEDispatcher
+    DispatchOnceProgram --> DispatchLayoutAdapter
+    DispatchOnceProgram --> LocalExpertProgram
     WholeMoEProgram <|.. FusedDFCProgram
     ComposedDFCProgram --> WaveDispatcher
     ComposedDFCProgram --> LocalExpertProgram
@@ -288,19 +334,29 @@ classDiagram
     FusedDFCProgram --> ResidencyOps : public state protocol
 ```
 
-图中 runtime 的资源持有关系、local program 对 runner 的绑定是后端必须兑现的契约。`SlotArena` 本身只管理 host 侧预约与 generation，不分配专家权重 tensor，也不执行 replay 中的动态替换；物理池由 runtime 创建并列入 `resources`。
+几个组件的职责边界可以这样理解：
+
+- **HostExpertStore**：持有本 rank 可卸载专家完整权重 bundle 的 pinned DRAM 权威副本及相关主机内存注册句柄。
+- **CachePolicy**：决定谁值得留在热缓存。
+- **ResidencyState**：保存“谁在哪个 slot”的设备 tensor 数据。
+- **ResidencyOps**：查询和修改这些数据，生成安全的加载、替换计划。
+- **WeightTransferBackend（传输后端）**：执行实际权重搬运。
+- **AllocationLedger**：记录唯一物理内存分配、校验字节预算，并持有分配对象的保活引用。
+- **SlotLeaseManager**：在图外预约 bank/区域的使用权。
+
+图中 runtime 的资源持有关系、local program 对 runner 的绑定是后端必须兑现的契约。`AllocationLedger` 通过 `owner.allocation_ledger` 记录唯一物理分配并校验字节预算；`SlotLeaseManager` 通过 `owner.hot_slot_leases` 和 `owner.execution_slot_leases` 管理 host 侧 slot 预约、租约 generation 与延迟回收。归还租约只释放使用权，物理权重 tensor 仍由 runtime 持有。replay 内的动态替换由设备侧 `ResidencyOps` 实现；物理池由 runtime 创建并列入 `resources`。
 
 之前 UML 中的概念与当前代码对应如下，避免把设计名当作已存在的类：
 
 | 原设计名称 | 当前落点与状态 |
 | --- | --- |
 | `OffloadStorage` | 新 MoE 路径为 `HostExpertStore`；旧 V2 仍使用原参数适配器，没有名为 `OffloadStorage` 的统一实现。 |
-| `ExpertArena` / `HotArena` / `ExecutionArena` | owner 的两个 `SlotArena` 预约管理器，加上 runtime 提供的实际物理池。 |
+| `ExpertArena` / `HotArena` / `ExecutionArena` | owner 的两个 `SlotLeaseManager` 预约管理器，加上 runtime 提供的实际物理池。 |
 | `ResidencyManager` | 拆为已实现的 `ResidencyState` 数据协议和待实现的 `ResidencyOps` 设备操作。 |
 | `LFUPolicy` | `TensorLFUPolicy`；算法状态为独立 `LFUState`。 |
 | `begin_step()` / `finish_step()` | host 事务为 `begin_forward()` / `finish_forward()`；图内每步操作为 runtime 的 `emit_step_begin()` / `emit_step_end()`。 |
 | `snapshot()` / `restore()` | 策略状态通过 `CachePolicy.copy_state()` 复制；完整模式恢复通过 runtime 的 snapshot/restore 接口完成。 |
-| `WaveActivationAdapter` / `WeightMaterializer` | 尚无独立同名类，相关转换和物化职责留在 `WaveDispatcher`、`LocalExpertProgram` 及传输接口。 |
+| `WaveActivationAdapter` / `WeightMaterializer` | 一次 D/C 的分片布局由新接口 `DispatchLayoutAdapter` 承接；权重物化仍由 `LocalExpertProgram` 及传输接口承接，无独立同名类。 |
 | `FusedDFCProgram` | 扩展方向，代码中尚无该类；未来实现 `WholeMoEProgram` 即可接入。 |
 
 ### 图三：decode 执行顺序与完整 graph 边界
@@ -358,9 +414,32 @@ sequenceDiagram
     Note over Host,Owner: output_ready、residency_ready、resources_idle 分开管理
 ```
 
-router 后可以发出路由记账及规划操作，但 EP dispatch 后才得到该 owner rank 的完整本地需求。通信继续使用原 global expert ID；只有本地 F 将专家转换为执行 bank lane。所有 rank 执行相同数量、相同顺序的 DFC，空波也必须有经过验证的处理。
+router 后可以发出路由记账及规划操作，但 EP dispatch 后才得到该 owner rank 的完整本地需求。通信继续使用原 global expert ID；只有本地 F 将专家转换为执行 bank lane。上图采用多轮 DFC：所有 rank 执行相同数量、相同顺序的 DFC，空波也必须有经过验证的处理。
 
 `ComposedDFCProgram` 顺序执行 `D0/F0/C0 → D1/F1/C1`，不跨波覆盖 dispatcher handle；各波结果累加后只调用一次公共 `finish()`。shared experts 在 routed program 外执行。下一波权重可以预取，但预取不能破坏当前 bank 的读者保护。
+
+### 一次 D、分片 F、一次 C：DispatchOnceProgram
+
+新增 `DispatchOnceProgram` 继承同一 `WholeMoEProgram`，流程为 `D → F0 → F1 → … → C → finish`。后端可将它绑定为 `runtime.prefill_program` 或 `runtime.decode_program`，owner、模式控制器、缓存策略和传输能力继续复用；不自动改变当前模型路径。
+
+```python
+program = DispatchOnceProgram(
+    fixed_waves(spec.local_experts, bank_slots, bank_count),
+    dispatcher,
+    local_program,
+    layout_adapter,
+    local_experts=spec.local_experts,
+)
+```
+
+- `MoEDispatcher` 提取公共 D/C/finish 契约；原 `WaveDispatcher` 继承它并保留 mask/accumulate，已有多轮 DFC 实现仍可使用。
+- 构造时检查 waves 连续、无重叠、无遗漏，覆盖 `[0, local_experts)`；bank 容量与格式仍由 runtime 校验。D 接收原路由，不按 wave 屏蔽或重归一化权重。
+- `DispatchLayoutAdapter.bind()` 绑定完整接收布局；`select_wave()` 提供每片 activation、scales、counts；`write_wave()` 将 F 结果放回原接收位置；`combine_input()` 提供原通信元数据与完整输出。这里不是 token 累加，也不额外应用 top-k 权重。
+- `LocalExpertProgram` 继续负责权重准备、等待、F 与读者保护。当前类顺序执行各片 F，**交替 bank 编号不等于已经实现 H2D 双缓冲**；预取与跨片流水仍需具体后端实现。
+- 完整接收/输出和必要 packing workspace 必须由 runtime 持有、计入预算，并保留至设备消费者完成；异常后的资源排空继续遵守 owner 协议。不得因 Python 方法返回就复用通信或分片缓冲。
+- graph 中使用静态 wave 数量和设备侧动态 counts/masks；禁止 `.item()` 驱动动态切片。紧凑布局、padded 布局、空组和尾片均需后端适配，当前没有 A5/CUDA 的具体布局实现。
+
+CPU 测试对照未分片 FFN，验证 top-k 加权、原接收位置回填、scales、空 rank/空波、尾片、复用临时 F 输出、改变路由和异常传播。它们验证公共编排，不代表真实 DeepEP 或完整 decode graph 已通过。
 
 ### 补充图：prefill 借池与恢复生命周期
 
@@ -400,7 +479,7 @@ EXECUTION_WEIGHTS = S * B
 
 首版预算按同构专家 bundle 计算。若各层格式或专家字节数不同，必须扩展格式分组和预算协议，不能用平均字节数掩盖差异。常驻权重由原模型持有，不计入上述可卸载池。
 
-`ResourceLedger` 对 host/hot/execution 三类权重要求实际申报量与 slot 预算一致，metadata/workspace 则不能超过显式上限，默认上限为零。LFU 排序临时量、快照、传输计划、graph 内存峰值及任何 staging 都要申报。视图不重复计费；不得省略真实分配。它校验的是后端的资源申报，实机仍需核对 allocator 峰值。
+`AllocationLedger` 对 host/hot/execution 三类权重要求实际申报量与 slot 预算一致，metadata/workspace 则不能超过显式上限，默认上限为零。LFU 排序临时量、快照、传输计划、graph 内存峰值及任何 staging 都要申报。视图不重复计费；不得省略真实分配。它校验的是后端的资源申报，实机仍需核对 allocator 峰值。
 
 三种身份必须分开：global expert ID 用于路由和 EP，`ExpertCatalog.key(layer_id, local_id)` 用于本 rank 的跨层缓存，bank lane 用于本轮专家计算。cache slot 数不能替换模型的逻辑专家数或通信专家数。
 
@@ -457,6 +536,7 @@ EXECUTION_WEIGHTS = S * B
 | `HostExpertStore`、`ResidencyState` | 数据结构和存储契约已实现 | loader、原生 FP4 format、设备池绑定和注册实现。 |
 | `TensorLFUPolicy` | 算法已实现，CPU 已验证 | NPU / CUDA 算子、排序 workspace、反复 graph replay 验证。 |
 | `ComposedDFCProgram` / `fixed_waves()` | 编排已实现，CPU 已验证 | `WaveDispatcher`、`LocalExpertProgram` 与真实 EP / runner 适配。 |
+| `DispatchOnceProgram` | 一次 D、分片 F、一次 C 编排已实现，CPU 数值对照已验证 | `MoEDispatcher`、`DispatchLayoutAdapter` 与真实 EP 布局/设备动态分片适配；实际 H2D 流水。 |
 | 普通 PyTorch 传输 | 静态拷贝包装已实现 | accelerator 回归及图内动态 lowering。 |
 | `ExpertFormat` / `MoEBackend` / `BoundMoERuntime` | 接口已定义 | 有界权重加载、布局转换、资源创建、hooks、prefetch、恢复和清理。 |
 | `ResidencyOps` / `DeviceTransferOps` | 接口已定义 | device miss 规划、victim 保护、动态搬运、generation 检查和安全发布。 |
@@ -472,7 +552,7 @@ EXECUTION_WEIGHTS = S * B
 | --- | --- | --- |
 | **M0：A5 最小技术闭环** | A5 双卡 EP、原生 FP4 bundle、固定目标 buffer、动态搬运和计算进入同一 graph；改变路由反复 replay，覆盖 hit/miss、非对称需求、空组，对齐常驻基线。 | 待实机验证。 |
 | **M1：共享底座与资源所有权** | 具体存储/传输绑定、有界原生加载、精确物理预算与故障测试；加载阶段也不能先占用完整 routed HBM；旧 V2 回归通过。 | 公共 owner/store/ledger/lease 已实现；加载和硬件绑定待完成。 |
-| **M2：单层执行程序** | prefill 全专家分片预取和双缓冲；decode hit/miss 完整 graph；容量不足、多 DFC、尾波和空波正确，公共尾处理仅一次。 | 固定 waves 与 DFC 编排已实现；真实执行和流水待完成。 |
+| **M2：单层执行程序** | prefill 全专家分片预取和双缓冲；decode hit/miss 完整 graph；容量不足、多 DFC、尾波和空波正确，公共尾处理仅一次。 | 固定 waves、多轮 DFC 和 DispatchOnce 编排已实现；真实执行和流水待完成。 |
 | **M3：可替换策略与跨层 LFU** | device residency、跨层热集合选择及尾部换入事务；CPU 参考差分验证；replay 中热集合持续变化，临时 miss 不直接准入。 | policy 接口及 Tensor LFU 已实现；设备事务和 replay 验证待完成。 |
 | **M4：模式切换与恢复** | prefill 借池、连续 prefill、原 slot/LFU 精确恢复；所有读写受保护，warmup/capture 不污染状态，各 graph bucket 恢复一致。 | host 状态机已实现；实际快照/重载及设备验证待完成。 |
 | **M5：整模型交付** | V4 Flash 原生权重、A5 多卡 TP + EP、完整 decode graph、模式交替、多 batch bucket 与适用的 IDLE；CUDA 契约验证；内存、流量、命中率和性能报告。 | 待前序节点通过。 |
@@ -489,12 +569,15 @@ python -m unittest discover -s test/registered/unit/offloading -v
 
 框架提交时已通过 **31 项 CPU 契约测试**，覆盖专家归属及容量、隐藏分配/超预算拒绝、slot retiring、transfer keepalive、forward 串行、失败保护、模式恢复调用、graph lease、LFU、wave 顺序与 hook 边界等。另完成 Python 语法、格式、静态检查及 `git diff --check`。
 
-这些测试使用 fake runtime 或 CPU tensor，未覆盖 A5 / CUDA 执行、原生 FP4 repack、真实 EP 通信、完整 graph 捕获及性能。本次文档更新不改变这些验证结论。
+DispatchOnce 扩展另增加 **6 项 CPU 测试**，合计 **37 项**，覆盖紧凑/padded 布局的数值对照、空 rank、零 token、连续调用路由变化、非法分片和异常中断。测试在本地通过包路径加载实际 offloading 模块，绕过 serving 顶层依赖初始化。
+
+这些测试使用 fake runtime 或 CPU tensor，未覆盖 A5 / CUDA 执行、原生 FP4 repack、真实 EP 通信、完整 graph 捕获及性能。
 
 ## 10. 更新记录
 
 | 日期 | 版本 / 变更 | 更新内容 | 验证与剩余边界 |
 | --- | --- | --- | --- |
+| 2026-10-20 | DispatchOnce 编排扩展 | 新增 `DispatchOnceProgram`、公共 `MoEDispatcher` 与 `DispatchLayoutAdapter`；复用本地 F/权重传输契约，新增完整分片校验，更新 UML 与中英文文档。 | 新增 6 项 CPU 测试，合计 37 项通过；真实 DeepEP 布局、H2D 双缓冲和设备 graph 仍待适配。 |
 | 2026-10-20 | 中文文档补充 | 新增本 README；收录并对齐此前三张 UML，补充模式生命周期图；标注实现状态、旧设计名映射、代码入口、H2D 扩展方式与 M0–M5 进度；英文 README 增加中文入口。 | 四张 Mermaid 图渲染及相对链接校验通过；不新增硬件能力，状态以 `65e5c53ebb` 为基线。 |
 | 2026-10-20 | `65e5c53ebb` — 框架初版 | 提取 `BaseOffloader`，共享 PyTorch 传输入口；加入 MoE 门面、唯一 owner、两模式控制器、预算与 lease、pinned store、公共 tensor 状态、LFU、DFC 编排及 backend 接口；接入 ModelRunner 和 capture head。 | 31 项 CPU 契约测试及静态检查通过；无具体 accelerator runtime，M0 实机门槛尚未通过。 |
 

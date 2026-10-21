@@ -20,10 +20,11 @@ import torch
 
 from sglang.srt.offloading.moe import (
     CacheExecutionContext,
-    CacheLocalExpertProgram,
     CacheRuntime,
     CopySource,
+    DecodeLocalExpertProgram,
     ExpertLayerSpec,
+    LocalExecution,
     LocalRoutes,
     MoEOffloadConfig,
     MoEOffloaderV2,
@@ -263,21 +264,32 @@ class Backend(MoEBackend):
             borrow_hot_arena=lambda: self.hot.fill_(-999),
         )
 
-        def native(layer, routes, wave, context):
+        def native(layer, routes, bindings, context):
             # Compute from execution weights, never from the host oracle.
             active = routes.valid
             ids = routes.expert_ids[active]
-            lanes = ids - wave.local_start + wave.bank * 2
+            keys = ids + catalog.key(layer.layer_id, 0)
+            lanes = (
+                (keys[:, None] == bindings.state.execution_key)
+                .to(torch.int64)
+                .argmax(dim=1)
+            )
             assert self.runtime.residency.execution_valid[lanes].all()
             result = self.execution[lanes].sum()
-            self.device.log.append(("native", layer.layer_id, wave.index))
-            return result
+            self.device.log.append(("native", layer.layer_id))
+            return LocalExecution(result, context.record_compute_completion())
 
         self.runtime.decode_program = ComposedDFCProgram(
             fixed_waves(4, 2),
             Dispatcher(),
-            CacheLocalExpertProgram(
-                self.runtime, lambda layer, output, wave: output, native
+            DecodeLocalExpertProgram(
+                self.runtime.access,
+                lambda layer, output, wave, context: (
+                    self.runtime.make_execution_request(
+                        layer.layer_id, output, wave, context
+                    )
+                ),
+                native,
             ),
         )
         self.runtime.initialize("toy")
@@ -555,7 +567,7 @@ class TestCacheRuntime(unittest.TestCase):
                 )
 
     def test_eager_schedule_does_not_read_device_state_on_host(self):
-        self.runtime.transfer = SimpleNamespace(
+        self.runtime.access.transfer_backend = SimpleNamespace(
             materialize_into=lambda *args: TransferTicket(ImmediateCompletion())
         )
         batch = self.batch()
@@ -571,7 +583,20 @@ class TestCacheRuntime(unittest.TestCase):
                 with self.offloader.forward_scope(batch):
                     with self.offloader.eager_step_scope(batch):
                         for wave in fixed_waves(4, 2):
-                            self.runtime.prepare_local_experts(3, routes, wave)
+                            lease = self.runtime.access.stage(
+                                self.runtime.make_execution_request(
+                                    3, routes, wave, self.runtime.context
+                                ),
+                                self.runtime.context,
+                            )
+                            self.runtime.access.wait_ready(
+                                lease, self.runtime.context.compute_stream
+                            )
+                            self.runtime.access.release_after(
+                                lease,
+                                self.runtime.context.record_compute_completion(),
+                                self.runtime.context,
+                            )
         self.assertEqual(self.runtime.residency.slot_to_key.tolist(), [1, 2, 4, 7])
 
     def test_prefill_borrow_refill_preserves_slots_usage_and_cycle(self):
@@ -622,7 +647,7 @@ class TestCacheRuntime(unittest.TestCase):
         self.assertEqual(int(state.step_mod), 2)
         self.assertEqual(self.runtime._step_mod, 2)
         self.assertFalse(bool(self.runtime._enabled))
-        self.assertEqual(self.runtime._tickets, [])
+        self.assertEqual(self.runtime.context.retained(), ())
 
     def test_failed_copy_never_publishes_new_expert(self):
         for _ in range(3):
@@ -782,7 +807,7 @@ class TestCacheRuntime(unittest.TestCase):
     def test_cache_caller_does_not_read_device_routes_on_host(self):
         # No-op transport isolates production tensor planning from the test
         # transport's Python copy loop. It is never used to validate weights.
-        self.runtime.transfer = SimpleNamespace(
+        self.runtime.access.transfer_backend = SimpleNamespace(
             materialize_into=lambda *args: TransferTicket(ImmediateCompletion())
         )
         self.runtime._enabled.fill_(True)
@@ -799,7 +824,20 @@ class TestCacheRuntime(unittest.TestCase):
             for _ in range(4):
                 self.runtime.emit_step_begin(self.runtime.context)
                 for wave in fixed_waves(4, 2):
-                    self.runtime.prepare_local_experts(3, routes, wave)
+                    lease = self.runtime.access.stage(
+                        self.runtime.make_execution_request(
+                            3, routes, wave, self.runtime.context
+                        ),
+                        self.runtime.context,
+                    )
+                    self.runtime.access.wait_ready(
+                        lease, self.runtime.context.compute_stream
+                    )
+                    self.runtime.access.release_after(
+                        lease,
+                        self.runtime.context.record_compute_completion(),
+                        self.runtime.context,
+                    )
                 self.runtime.emit_step_end(self.runtime.context)
         self.assertEqual(self.runtime.residency.slot_to_key.tolist(), [1, 2, 4, 7])
 

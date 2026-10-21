@@ -46,7 +46,7 @@ class HostExpertStore:
     def allocations(self):
         if not self._sealed:
             raise RuntimeError(
-                "Seal host storage before finalizing its resource ledger"
+                "Seal host storage before finalizing its allocation ledger"
             )
         seen, allocations = set(), []
         for (layer_id, name), tensor in self._components.items():

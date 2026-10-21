@@ -30,9 +30,9 @@ from sglang.srt.offloading.moe.policy import TensorLFUPolicy
 from sglang.srt.offloading.moe.programs import ComposedDFCProgram
 from sglang.srt.offloading.moe.resources import (
     Allocation,
+    AllocationLedger,
     ResourceKind,
-    ResourceLedger,
-    SlotArena,
+    SlotLeaseManager,
 )
 from sglang.srt.offloading.moe.state import ResidencyState
 from sglang.srt.offloading.moe.storage import HostExpertStore
@@ -213,9 +213,9 @@ class TestIdentityAndBudget(unittest.TestCase):
         a = Allocation("bank", ResourceKind.EXECUTION_WEIGHTS, 16, "storage", object())
         b = Allocation("view", ResourceKind.EXECUTION_WEIGHTS, 16, "storage", object())
         with self.assertRaises(ValueError):
-            ResourceLedger({ResourceKind.EXECUTION_WEIGHTS: 32}, (a, b))
+            AllocationLedger({ResourceKind.EXECUTION_WEIGHTS: 32}, (a, b))
         with self.assertRaises(ValueError):
-            ResourceLedger({ResourceKind.EXECUTION_WEIGHTS: 8}, (a,))
+            AllocationLedger({ResourceKind.EXECUTION_WEIGHTS: 8}, (a,))
 
     def test_owner_requires_complete_weight_accounting(self):
         runtime = FakeRuntime()
@@ -236,8 +236,10 @@ class TestIdentityAndBudget(unittest.TestCase):
         self.assertFalse(state.update_enabled.item())
         allocations = state.allocations()
         total = sum(item.nbytes for item in allocations)
-        ledger = ResourceLedger({ResourceKind.METADATA: total}, allocations)
-        self.assertEqual(ledger.usage[ResourceKind.METADATA], total)
+        allocation_ledger = AllocationLedger(
+            {ResourceKind.METADATA: total}, allocations
+        )
+        self.assertEqual(allocation_ledger.usage[ResourceKind.METADATA], total)
 
     def test_deepseek_adapter_keeps_hash_and_first_three_layers_resident(self):
         for layer_id, is_hash, expected in (
@@ -373,30 +375,30 @@ class TestLifetime(unittest.TestCase):
         self.runtime.synchronize = fail
         with self.assertRaises(RuntimeError):
             self.owner.close()
-        self.assertIsNotNone(self.owner.ledger)
+        self.assertIsNotNone(self.owner.allocation_ledger)
         self.assertIs(self.owner.state, OwnerState.FAILED)
         with self.assertRaises(RuntimeError):
             self.owner.begin_forward(Phase.DECODE, None)
         self.runtime.synchronize = synchronize
         self.owner.close()
-        self.assertIsNone(self.owner.ledger)
+        self.assertIsNone(self.owner.allocation_ledger)
 
     def test_slot_generation_and_pending_reader_protection(self):
-        arena = SlotArena(2)
+        lease_manager = SlotLeaseManager(2)
         delayed = DelayedCompletion()
-        lease = arena.acquire([0])
-        arena.retire(lease, TransferTicket(delayed))
+        lease = lease_manager.acquire([0])
+        lease_manager.retire(lease, TransferTicket(delayed))
         with self.assertRaises(RuntimeError):
-            arena.acquire([0])
+            lease_manager.acquire([0])
         with self.assertRaises(ValueError):
-            arena.retire(lease, immediate())
+            lease_manager.retire(lease, immediate())
         delayed.ready = True
-        new_lease = arena.acquire([0])
+        new_lease = lease_manager.acquire([0])
         self.assertGreater(new_lease.generation, lease.generation)
         with self.assertRaises(ValueError):
-            arena.retire(lease, immediate())
-        arena.retire(new_lease, immediate())
-        arena.require_empty()
+            lease_manager.retire(lease, immediate())
+        lease_manager.retire(new_lease, immediate())
+        lease_manager.require_empty()
 
 
 class TestLFU(unittest.TestCase):

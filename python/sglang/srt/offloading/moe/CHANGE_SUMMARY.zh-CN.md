@@ -4,9 +4,9 @@
 
 整理日期：2026-10-21
 
-本轮工作实现了周期 LFU、cache 元数据管理、权重加载与替换计划，以及通过现有搬运接口串联的 cache 调用方流程。同时补充了 CPU 调用链测试和独立 NPU 测试脚本。
+本次合并同事 `59cbb5d` 的 dispatch-once、H2D 公共接口和资源重命名；详细边界见 [合并适配设计](MERGE_ADAPTATION_DESIGN.zh-CN.md)。累计工作实现了周期 LFU、cache 元数据管理、权重加载与替换计划，以及通过现有搬运接口串联的 cache 调用方流程。同时补充了 CPU 调用链测试和独立 NPU 测试脚本。
 
-当前结论：**cache 侧算法与调用方已经实现，82 项 CPU 测试通过；生产 NPU 后端和真实模型绑定尚未完成，NPU 脚本尚未实机验证。** 本文记录本轮新增和修改，不将原分支已有框架或工作区其他既有修改计入本轮成果。
+当前结论：**cache 侧算法与调用方已经实现，117 项 CPU 测试通过；生产 NPU 后端和真实模型绑定尚未完成，NPU 脚本尚未实机验证。** 同事的公共 Program/transfer 接口沿用其提交；我方负责本文列出的 cache 功能和接口适配。
 
 ## 1. 周期 LFU 算法
 
@@ -29,7 +29,7 @@
 
 新增 [cache_metadata.py](cache_metadata.py)。
 
-- `CacheMetadataAdapter`：组织 `begin_step → record_local_routes → finish_step`，每个完整 forward 推进一次周期。
+- `CacheMetadataAdapter`：负责 `begin_step → record_local_routes`、状态与快照；策略收尾由公共 `CacheUpdateCoordinator` 统一调用。
 - 路由适配：支持层内、rank 内专家编号；连续 EP 分片的 global ID 可转换为 local ID。过滤 padding、无效编号和不属于当前 wave 的分配。
 - Batch 统计：同一专家被多个 token 选中时累计多次；多 wave 不重复统计同一分配。
 - `CacheRouteStats`：记录本步 accesses、hits、misses；这些是路由分配次数，不是搬运次数。
@@ -52,15 +52,15 @@
 | 映射发布 | 等待完整专家权重就绪后，更新 key↔slot、有效位和 generation。 |
 | 初始化与回填 | 支持将指定专家装入指定 slot，用于初始加载和快照原位置恢复。 |
 
-复用现有 `DeviceCopyPlan`，没有新增生产 H2D 引擎。`CacheUpdatePlan` 是 cache 内部计划，包含复制计划、期望 slot 映射和发布开关。
+复用现有 `DeviceCopyPlan`，没有新增生产 H2D 引擎。采用公共 `ExecutionReservation` / `UpdatePlan`；热更新的 state 包含期望 slot 映射和发布开关，已删除重复私有计划类型。
 
 ## 4. Runtime 调用链与框架接线
 
 新增 [cache_runtime.py](cache_runtime.py)：
 
 - `CacheRuntime`：初始化、step 生命周期、搬运调用、映射发布、阶段切换和完成事件编排。
-- `CacheLocalExpertProgram`：在既有 D/F/C 执行程序中接入 dispatch 后统计、execution bank 准备和专家计算调用。
-- `CacheExecutionContext`：持有设备模块、compute stream 和 copy stream。
+- 删除旧 `CacheLocalExpertProgram`，统一使用公共 `DecodeLocalExpertProgram` / `ExpertWeightAccess`；我方提供 make_request 统计适配。
+- `CacheExecutionContext`：phase/capturing、线程安全 retain、compute 完成事件、resources_idle 汇合；每个 forward 使用独立上下文，capture 资源保活到 runtime 关闭。
 - `LocalRoutes`：约定路由 adapter 向 cache 提供的本地专家编号和有效 mask。
 
 完整调用方路径：
@@ -79,7 +79,7 @@ forward 开始 → 清空本步计数
 
 阶段判断不依赖 TBO 才提供的 `global_forward_mode`：结合 `is_extend_in_batch` 与全局 token 数推导。在全局 prefill 中，本地 IDLE 或 DECODE rank 都进入 prefill；在有效全局 decode 中，本地 IDLE rank 仍统计 dispatch 后的访问并推进周期。优先使用 `original_global_num_tokens_cpu`，避免把图 padding 当成有效 token；全局空闲时保持当前阶段，不触发无谓回填。
 
-Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache.finish_step(select_hot_set=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `select_hot_set=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
+Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推进，无需读取设备 tensor。`forward_scope` 必须包围一次实际 eager 执行或 graph replay；成功提交后只推进一次，prefill、全局 IDLE、capture/warmup 不推进，失败后沿用 owner 的停止执行约束。Host 周期跨 prefill 保持，设备 LFU 周期随快照恢复，因此 eager 与 graph 交替执行时保持一致。非周期 eager 调用 `cache_updates.emit_step_end(context, adjust=False)`，累计 usage 后直接结束，不排序、不生成热池计划、不提交空搬运、不重建映射。到期但无合格交换时仍按规则衰减。图路径保持默认 `adjust=True` 的固定操作序列，设备门控实际交换；此轮没有宣称已消除图路径的非周期排序开销。
 
 阶段切换路径：
 
@@ -100,6 +100,13 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 
 当前基础调度以明确的 compute→copy→compute 依赖保证正确性，尚未实现跨 wave 的搬运计算重叠。已有 step/capture 接线不等于完整 NPU graph 已验证。
 
+本次新增接口衔接：
+
+- `CachePolicy.finish_step` 提供默认空实现；coordinator 调用周期 LFU 衰减/清理，eager 非周期步跳过排序和热池搬运。
+- residency 返回公共 reservation 和发布票据，记录 F 最终读依赖；未 release 时不能覆盖 bank 或执行热替换。
+- prefill layer-start 委托公共 Program；CPU 测试 pipeline 验证 host 复制、分组 F、单次 D/C 和原 slot 回填，生产流水仍由同事提供。
+- 初始化和恢复保留 exact-slot 路径；删除旧重复执行搬运 helper，更新 NPU 手工脚本接口。
+
 ## 5. 测试与验证结果
 
 ### 5.1 CPU 测试
@@ -112,7 +119,7 @@ Eager 的周期由 runtime 中一个 host 整数跟随完整有效 forward 推�
 | [test_cache_runtime.py](../../../../../test/registered/unit/offloading/test_cache_runtime.py) | 22 项调用链测试：无 TBO 的空闲 rank、全局 prefill、周期跳过、图/eager 交替、延迟复制、实际权重计算、替换后命中、回填、失败处理、零缓存、多 bank，以及真实 ModelRunner 方法体的分支接线。 |
 | [test_cache_npu_test_support.py](../../../../../test/registered/unit/offloading/test_cache_npu_test_support.py) | 2 项 CPU 检查：NPU 脚本的独立参考结果和小模型 bank 计算逻辑。 |
 
-本地合计 **82 项 CPU 测试通过**。Ruff 检查与格式、isort、空白、Python 语法及文档本地链接检查通过。CPU 测试不构成 NPU 搬运或硬件图验证。
+本地合计 **117 项 CPU 测试通过**（双方原有 108 项，新增 `test_cache_integration.py` 9 项）。Ruff 检查与格式、isort、空白、Python 语法及文档本地链接检查通过。CPU 测试不构成 NPU 搬运或硬件图验证。
 
 ### 5.2 NPU 元数据测试
 

@@ -8,7 +8,9 @@ pool passed as bindings, never an implicit allocation made by the transport.
 from dataclasses import dataclass, fields
 from enum import IntEnum
 
-from ..transfer import DeviceCopyPlan
+from ..transfer import DeviceCopyPlan, ImmediateCompletion
+from .config import Phase
+from .execution import ExecutionReservation, SourcePolicy, UpdatePlan
 from .interfaces import ResidencyOps
 from .resources import Allocation, ResourceKind
 
@@ -20,8 +22,7 @@ class CopySource(IntEnum):
 
 
 @dataclass
-class CacheUpdatePlan:
-    copies: DeviceCopyPlan
+class HotPublication:
     slot_keys: object
     publish_enabled: object
 
@@ -48,27 +49,50 @@ class TensorResidencyOps(ResidencyOps):
     ticket. No device-dependent Python branches or host route reads are used.
     """
 
-    def __init__(self, state):
+    def __init__(self, state, hot_bindings, execution_bindings):
         import torch
 
         self.state = state
         device = state.key_to_slot.device
-        self.update = CacheUpdatePlan(
+        self.update = UpdatePlan(
             allocate_copy_plan(state.slot_to_key.numel(), device),
-            torch.full_like(state.slot_to_key, -1),
-            torch.zeros((), dtype=torch.bool, device=device),
+            hot_bindings,
+            state=HotPublication(
+                torch.full_like(state.slot_to_key, -1),
+                torch.zeros((), dtype=torch.bool, device=device),
+            ),
         )
         self.execution = allocate_copy_plan(state.execution_key.numel(), device)
         self.execution_keys = torch.full_like(state.execution_key, -1)
+        self.execution_bindings = execution_bindings
+        self._read_done = ImmediateCompletion()
+        self._active = None
+
+    def _wait_readers(self, context):
+        # Order plan writes as well as weight writes after the last bank reader.
+        if self._active is not None:
+            raise RuntimeError("Release the previous execution reservation first")
+        self._read_done.wait_on(context.compute_stream)
+
+    def _update_reservation(self, context):
+        from dataclasses import replace
+
+        ready = context.record_compute_completion()
+        context.retain(ready)
+        return replace(
+            self.update,
+            copy_dependencies=(ready.completion, self._read_done),
+        )
 
     def prepare_update(self, target_keys, context):
         import torch
 
-        state, plan = self.state, self.update
+        self._wait_readers(context)
+        state, plan = self.state, self.update.state
         plan.publish_enabled.copy_(state.update_enabled)
         count, capacity = state.key_to_slot.numel(), state.slot_to_key.numel()
         if not capacity:
-            return plan
+            return self._update_reservation(context)
         # Target keys are a set, not physical positions. Preserve all survivors.
         membership = torch.zeros(
             count + 1, dtype=torch.int64, device=target_keys.device
@@ -93,24 +117,25 @@ class TensorResidencyOps(ResidencyOps):
         )
         plan.slot_keys.copy_(torch.where(state.update_enabled, proposed, old))
         self._prepare_hot_copies((plan.slot_keys >= 0) & ~keep & state.update_enabled)
-        return plan
+        return self._update_reservation(context)
 
-    def prepare_refill(self, slot_keys):
+    def prepare_refill(self, slot_keys, context):
         """Host lifecycle: exact positions for initial load or snapshot refill."""
-        self.update.slot_keys.copy_(slot_keys)
-        self.update.publish_enabled.fill_(True)
+        self._wait_readers(context)
+        self.update.state.slot_keys.copy_(slot_keys)
+        self.update.state.publish_enabled.fill_(True)
         self._prepare_hot_copies(slot_keys >= 0)
-        return self.update
+        return self._update_reservation(context)
 
     def _prepare_hot_copies(self, valid):
         import torch
 
-        plan = self.update
-        plan.copies.valid.copy_(valid)
-        plan.copies.source_kind.copy_(torch.where(valid, int(CopySource.HOST), 0))
-        plan.copies.source_index.copy_(plan.slot_keys.clamp(min=0))
-        plan.copies.expected_generation.zero_()
-        plan.copies.count.copy_(valid.to(torch.int64).sum())
+        plan = self.update.copy_plan
+        plan.valid.copy_(valid)
+        plan.source_kind.copy_(torch.where(valid, int(CopySource.HOST), 0))
+        plan.source_index.copy_(self.update.state.slot_keys.clamp(min=0))
+        plan.expected_generation.zero_()
+        plan.count.copy_(valid.to(torch.int64).sum())
         self.state.slot_valid.logical_and_(~valid)
 
     def commit_update(self, update_plan, weights_ready, context):
@@ -120,7 +145,7 @@ class TensorResidencyOps(ResidencyOps):
         weights_ready.completion.wait_on(context.compute_stream)
         state = self.state
         with context.device_module.stream(context.compute_stream):
-            keys = update_plan.slot_keys
+            keys = update_plan.state.slot_keys
             count = state.key_to_slot.numel()
             reverse = torch.full(
                 (count + 1,), -1, dtype=torch.int64, device=keys.device
@@ -128,19 +153,20 @@ class TensorResidencyOps(ResidencyOps):
             reverse.scatter_(
                 0,
                 torch.where(keys >= 0, keys, count),
-                update_plan.copies.destination_slot,
+                update_plan.copy_plan.destination_slot,
             )
-            enabled = update_plan.publish_enabled
+            enabled = update_plan.state.publish_enabled
             state.key_to_slot.copy_(
                 torch.where(enabled, reverse[:count], state.key_to_slot)
             )
             state.slot_to_key.copy_(torch.where(enabled, keys, state.slot_to_key))
             state.slot_valid.copy_(torch.where(enabled, keys >= 0, state.slot_valid))
             state.slot_generation.add_(
-                (update_plan.copies.valid & enabled).to(torch.int64)
+                (update_plan.copy_plan.valid & enabled).to(torch.int64)
             )
+            return context.record_compute_completion()
 
-    def resolve_execution(self, local_demand, context):
+    def resolve_execution(self, request, context):
         """local_demand is a full-bank key vector, -1 for unneeded lanes.
 
         The caller derives it from actual dispatch assignments, not wave size.
@@ -148,12 +174,19 @@ class TensorResidencyOps(ResidencyOps):
         """
         import torch
 
+        if request.phase is not Phase.DECODE or context.phase is not Phase.DECODE:
+            raise ValueError("TensorResidencyOps resolves decode device plans only")
+        self._wait_readers(context)
+        local_demand = request.local_demand
         state, plan = self.state, self.execution
         self.execution_keys.copy_(local_demand)
         valid = local_demand >= 0
         keys = local_demand.clamp(min=0)
         slots = state.key_to_slot[keys]
-        if state.slot_to_key.numel():
+        if (
+            state.slot_to_key.numel()
+            and request.source_policy is SourcePolicy.PREFER_RESIDENT
+        ):
             safe = slots.clamp(0, state.slot_to_key.numel() - 1)
             hit = (
                 valid
@@ -173,22 +206,37 @@ class TensorResidencyOps(ResidencyOps):
         plan.source_index.copy_(torch.where(hit, slots, keys))
         plan.count.copy_(valid.to(torch.int64).sum())
         state.execution_valid.zero_()
-        return plan
+        ready = context.record_compute_completion()
+        context.retain(ready)
+        self._active = ExecutionReservation(
+            plan,
+            self.execution_bindings,
+            copy_dependencies=(ready.completion, self._read_done),
+            state=self.execution_keys,
+        )
+        return self._active
 
-    def publish_execution(self, ticket, context):
+    def publish_execution(self, reservation, ticket, context):
         ticket.completion.wait_on(context.compute_stream)
         with context.device_module.stream(context.compute_stream):
-            self.state.execution_key.copy_(self.execution_keys)
-            self.state.execution_valid.copy_(self.execution.valid)
+            self.state.execution_key.copy_(reservation.state)
+            self.state.execution_valid.copy_(reservation.copy_plan.valid)
+            return context.record_compute_completion()
+
+    def finish_execution(self, reservation, read_done, context):
+        if reservation is not self._active:
+            raise ValueError("Foreign execution reservation")
+        self._read_done = read_done.completion
+        self._active = None
 
     def allocations(self):
         tensors = [
-            ("slot_keys", self.update.slot_keys),
-            ("publish_enabled", self.update.publish_enabled),
+            ("slot_keys", self.update.state.slot_keys),
+            ("publish_enabled", self.update.state.publish_enabled),
             ("execution_keys", self.execution_keys),
         ]
         for prefix, plan in (
-            ("hot", self.update.copies),
+            ("hot", self.update.copy_plan),
             ("execution", self.execution),
         ):
             tensors.extend(
