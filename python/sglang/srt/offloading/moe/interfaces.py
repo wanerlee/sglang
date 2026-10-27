@@ -64,7 +64,6 @@ class ExecutionContext(ABC):
     """
 
     phase: Phase
-    invocation_id: int
     capturing: bool
     compute_stream: object
     copy_stream: object

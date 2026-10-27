@@ -2,8 +2,6 @@
 
 import logging
 
-from torch.profiler import record_function
-
 from ..transfer import Completion, TransferTicket
 from .config import Phase
 from .execution import LocalExecution, require_prefill
@@ -197,21 +195,14 @@ class PrefillLocalExpertProgram(LocalExpertProgram):
     def run(self, layer, dispatch_output, wave, context):
         require_prefill(context)
         lease = self.pipeline.acquire(layer, wave, context)
-        # acquire() submits the NEXT load outside this CURRENT-wave span.
-        # Includes readiness/reader events; correlate child GMMs for device time.
-        with record_function(
-            "moe.prefill.compute_submit "
-            f"forward={context.invocation_id} layer={layer} wave={wave.index} "
-            f"experts=[{wave.local_start},{wave.local_end}) bank={wave.bank}"
-        ):
-            return _run_local(
-                self.run_experts,
-                self.pipeline.access,
-                layer,
-                dispatch_output,
-                lease,
-                context,
-            )
+        return _run_local(
+            self.run_experts,
+            self.pipeline.access,
+            layer,
+            dispatch_output,
+            lease,
+            context,
+        )
 
 
 class DecodeLocalExpertProgram(LocalExpertProgram):

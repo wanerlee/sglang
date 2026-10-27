@@ -7,7 +7,6 @@ an accelerator graph or creates another expert-weight allocation.
 
 from contextlib import contextmanager
 from dataclasses import fields
-from itertools import count
 from threading import RLock, get_ident
 
 from ..transfer import Completion, JoinedCompletion, TransferTicket
@@ -15,8 +14,6 @@ from .config import Phase
 from .interfaces import ExecutionContext, ForwardCompletion
 from .resources import Allocation, ResourceKind
 from .state import ResidencyState
-
-_invocation_ids = count()
 
 
 class ManagedExecutionContext(ExecutionContext):
@@ -43,8 +40,6 @@ class ManagedExecutionContext(ExecutionContext):
         if phase is Phase.PREFILL and capturing:
             raise ValueError("Prefill cannot be captured")
         self.phase = phase
-        # Process-local correlation across the prefill worker and compute thread.
-        self.invocation_id = next(_invocation_ids)
         self.capturing = capturing
         self.compute_stream = compute_stream
         self.copy_stream = copy_stream
