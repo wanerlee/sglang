@@ -162,8 +162,9 @@ class MemFabricAddressCatalog:
             tuple(host_sources[name]) for name in component_nbytes
         )
         self.hot_sources = tuple(tuple(hot_sources[name]) for name in component_nbytes)
-        self.host_count, self.hot_count = len(self.host_sources[0]), len(
-            self.hot_sources[0]
+        self.host_count, self.hot_count = (
+            len(self.host_sources[0]),
+            len(self.hot_sources[0]),
         )
         self.name, self._tensors, self._destinations = name, [], {}
         self._sealed = False
@@ -475,15 +476,19 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                 # Bundle components share logical indices and validity. Compute
                 # them once on the copy stream, while keeping native mutable
                 # groups/packed buffers private to each component and batch.
-                source_index = plan.source_index + 1
+                # Table entry zero is the null pointer. Gate indices once for
+                # the entire bundle instead of masking each component's pointers.
+                source_index = torch.where(bindings.mask, plan.source_index + 1, 0)
                 host_indices = source_index.clamp(0, bindings.host_count)
                 hot_indices = source_index.clamp(0, bindings.hot_count)
-                destination_indices = (plan.destination_slot + 1).clamp(
-                    0, bindings.destination_count
+                destination_indices = torch.where(
+                    bindings.mask, plan.destination_slot + 1, 0
                 )
                 from_host = plan.source_kind == int(CopySourceKind.HOST)
                 packed_indices = tuple(
-                    (bindings.mask[begin:end].to(torch.int64).cumsum(0) - 1).clamp_min(0)
+                    (bindings.mask[begin:end].to(torch.int64).cumsum(0) - 1).clamp_min(
+                        0
+                    )
                     for begin, end, *_ in bindings.batches[0]
                 )
                 for tables, batches in zip(bindings.tables, bindings.batches):
@@ -493,17 +498,7 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                         host_ptr = host_table.gather(0, host_indices[begin:end])
                         hot_ptr = hot_table.gather(0, hot_indices[begin:end])
                         selected = bindings.mask[begin:end]
-                        src.copy_(
-                            torch.where(
-                                selected,
-                                torch.where(
-                                    from_host[begin:end],
-                                    host_ptr,
-                                    hot_ptr,
-                                ),
-                                0,
-                            )
-                        )
+                        torch.where(from_host[begin:end], host_ptr, hot_ptr, out=src)
                         groups.copy_(selected)
                         destinations = destination_table.gather(
                             0,
@@ -513,9 +508,7 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                         # Zero additions from inactive entries cannot overwrite an
                         # active destination, including entirely empty masks.
                         dst.zero_()
-                        dst.scatter_add_(
-                            0, packed_index, torch.where(selected, destinations, 0)
-                        )
+                        dst.scatter_add_(0, packed_index, destinations)
                         packed.zero_()
                         status = self.group_pack_copy(
                             src, dst, lengths, scan, groups, packed, bindings.device
