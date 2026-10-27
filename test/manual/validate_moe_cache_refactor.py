@@ -30,6 +30,7 @@ CPU_MODULES = (
     "test_moe_diagnostics",
     "test_moe_framework",
     "test_moe_graph_leases",
+    "test_moe_prefill_profiling",
     "test_moe_warmup_lifetime",
     "test_native_periodic_cache",
     "test_npu_backend",

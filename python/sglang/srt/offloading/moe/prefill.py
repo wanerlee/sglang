@@ -10,6 +10,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from threading import Condition, RLock, Thread
 
+from torch.profiler import record_function
+
 from ..transfer import Completion, ImmediateCompletion, JoinedCompletion, TransferTicket
 from .config import ExpertWave, Phase
 from .execution import ExecutionRequest, SourcePolicy, require_prefill
@@ -314,9 +316,17 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                     wave = ExpertWave(
                         len(session.initial_leases), start, end, config.initial_bank
                     )
-                    lease = self.access.stage(
-                        self._request(session, wave, start), context
-                    )
+                    # These microbatches become wave 0 when seal() freezes K.
+                    # This span measures host submission, not DMA completion.
+                    with record_function(
+                        "moe.prefill.load_submit "
+                        f"forward={context.invocation_id} layer={session.layer_id} "
+                        f"kind=initial wave=0 microbatch={wave.index} "
+                        f"experts=[{start},{end}) bank={wave.bank}"
+                    ):
+                        lease = self.access.stage(
+                            self._request(session, wave, start), context
+                        )
                     # A complete expert bundle was submitted; readiness is separate.
                     with session.condition:
                         session.initial_leases.append(lease)
@@ -406,7 +416,14 @@ class BoundedPrefillWeightPipeline(PrefillWeightPipeline):
                 if previous.read_done is None:
                     raise RuntimeError("Cannot overwrite a bank without its old reader")
                 previous.read_done.completion.wait_on(context.copy_stream)
-            lease = self.access.stage(self._request(session, next_wave, 0), context)
+            with record_function(
+                "moe.prefill.load_submit "
+                f"forward={context.invocation_id} layer={session.layer_id} "
+                f"kind=next current_wave={index} wave={next_wave.index} "
+                f"experts=[{next_wave.local_start},{next_wave.local_end}) "
+                f"bank={next_wave.bank}"
+            ):
+                lease = self.access.stage(self._request(session, next_wave, 0), context)
             session.leases[next_index] = lease
         session.next_wave += 1
         return current
