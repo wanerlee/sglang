@@ -29,14 +29,20 @@ from sglang.srt.offloading.moe.npu import storage as npu_storage
 from sglang.srt.offloading.moe.npu.backend import NpuMoEBackend
 from sglang.srt.offloading.moe.npu.transfer import (
     DeviceMemoryRegion,
+    MemFabricCopyComponent,
     MemFabricDeviceTransferOps,
+    MemFabricTransferBindings,
     _group_pack_copy,
 )
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner
 from sglang.srt.offloading.moe.policy import TensorLFUPolicy
 from sglang.srt.offloading.moe.resources import Allocation, ResourceKind
 from sglang.srt.offloading.moe.storage import HostExpertStore, HostMemoryCapability
-from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
+from sglang.srt.offloading.transfer import (
+    DeviceCopyPlan,
+    ImmediateCompletion,
+    TransferTicket,
+)
 
 
 @dataclass
@@ -647,6 +653,236 @@ class TestMemFabricPublicWrapper(unittest.TestCase):
         ):
             self.assertEqual(_group_pack_copy(*tensors, device), 0)
         native.assert_called_once_with(*(value.data_ptr() for value in tensors), 5)
+
+
+class TestMemFabricDeviceLowering(unittest.TestCase):
+    """Exercise real bindings/lowering with CPU storage and a byte-copy stand-in."""
+
+    def bind(self, *, components=4, capacity=5, host_count=3, hot_count=2):
+        device = SimpleNamespace(type="npu", index=0)
+        bundles = []
+        for component in range(components):
+            width = component + 3
+            host = torch.arange(host_count * width, dtype=torch.uint8).reshape(
+                host_count, width
+            )
+            hot = torch.full((hot_count, width), 100 + component, dtype=torch.uint8)
+            destination = torch.full((4, width), 231, dtype=torch.uint8)
+            bundles.append(
+                MemFabricCopyComponent(
+                    tuple(
+                        HostMemoryCapability(
+                            row.data_ptr(), width, True, row.data_ptr(), host
+                        )
+                        for row in host
+                    ),
+                    tuple(DeviceMemoryRegion.from_tensor(row) for row in hot),
+                    tuple(DeviceMemoryRegion.from_tensor(row) for row in destination),
+                    width,
+                )
+            )
+        tensor = torch.tensor
+
+        def cpu_tensor(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return tensor(*args, **kwargs)
+
+        def validate(value, shape, dtype):
+            self.assertEqual(value.shape, shape)
+            self.assertEqual(value.dtype, dtype)
+            self.assertEqual(value.device.type, "cpu")
+            self.assertTrue(value.is_contiguous())
+
+        # Only emulate NPU allocation/device identity, not address preparation.
+        with (
+            mock.patch.object(torch, "device", return_value=device),
+            mock.patch.object(torch, "tensor", side_effect=cpu_tensor),
+            mock.patch.object(
+                MemFabricTransferBindings, "_validate_tensor", side_effect=validate
+            ),
+        ):
+            binding = MemFabricTransferBindings(
+                bundles,
+                capacity=capacity,
+                hot_generations=torch.arange(hot_count, dtype=torch.int64),
+                error_status=torch.zeros((), dtype=torch.int32),
+                device=device,
+                max_batch_entries=2,
+            )
+        binding._validate_tensor = validate
+        return binding
+
+    def plan(self):
+        # Sparse selections cross batches; unused lanes deliberately have bad IDs.
+        return DeviceCopyPlan(
+            torch.tensor([1, 0, 2, 0, 1]),
+            torch.tensor([2, -999, 1, 999, 0]),
+            torch.tensor([3, -1, 1, 999, 0]),
+            torch.tensor([True, False, True, False, True]),
+            torch.tensor([-1, -1, 1, -1, -1]),
+            torch.tensor(3, dtype=torch.int32),
+            5,
+        )
+
+    def run_copy(self, plan, binding):
+        def native(src, dst, lengths, scan, groups, packed, device):
+            self.assertIs(device, binding.device)
+            self.assertTrue(bool((packed == 0).all()))
+            selected = [i for i in range(int(scan)) if int(groups[i])]
+            self.assertTrue(bool((dst[len(selected) :] == 0).all()))
+            for j, i in enumerate(selected):
+                ctypes.memmove(int(dst[j]), int(src[i]), int(lengths[i]))
+            # Native output must be cleared before the next submission/replay.
+            packed.fill_(17)
+            return 0
+
+        ops = MemFabricDeviceTransferOps(
+            retain=lambda value: None,
+            group_pack_copy=native,
+            record_completion=lambda stream: ImmediateCompletion(),
+            stream_context=lambda stream: nullcontext(),
+        )
+        stream = SimpleNamespace(device=binding.device)
+        with mock.patch.object(torch, "device", return_value=binding.device):
+            return ops.materialize_into(plan, binding, stream)
+
+    def test_mixed_sources_sparse_destinations_and_changed_plan(self):
+        binding, plan = self.bind(), self.plan()
+        addresses = tuple(t.data_ptr() for t in binding._tensors)
+        for _ in range(2):
+            self.run_copy(plan, binding)
+            for component in binding.components:
+                for lane in range(plan.capacity):
+                    if not bool(plan.valid[lane]):
+                        continue
+                    index = int(plan.source_index[lane])
+                    source = (
+                        component.host_sources[index].host_address
+                        if int(plan.source_kind[lane]) == 1
+                        else component.hot_sources[index].address
+                    )
+                    destination = component.destinations[
+                        int(plan.destination_slot[lane])
+                    ].address
+                    self.assertEqual(
+                        ctypes.string_at(destination, component.nbytes),
+                        ctypes.string_at(source, component.nbytes),
+                    )
+                self.assertEqual(
+                    ctypes.string_at(
+                        component.destinations[2].address, component.nbytes
+                    ),
+                    bytes([231]) * component.nbytes,
+                )
+            plan.source_index[0] = 1
+            plan.source_kind[2] = 1
+            plan.source_index[2] = 2
+        self.assertEqual(addresses, tuple(t.data_ptr() for t in binding._tensors))
+        self.assertEqual(int(binding.error_status), 0)
+
+    def test_empty_plan_clears_previously_populated_metadata(self):
+        binding, plan = self.bind(), self.plan()
+        self.run_copy(plan, binding)
+        plan.valid.zero_()
+        plan.count.zero_()
+        plan.source_index.fill_(2**62)
+        plan.destination_slot.fill_(-999)
+        self.run_copy(plan, binding)
+        for batches in binding.batches:
+            for _, _, src, dst, _, _, groups, _ in batches:
+                self.assertTrue(bool((src == 0).all()))
+                self.assertTrue(bool((dst == 0).all()))
+                self.assertTrue(bool((groups == 0).all()))
+        self.assertEqual(int(binding.error_status), 0)
+
+    def test_invalid_plan_suppresses_all_component_writes(self):
+        for fault in (
+            "source",
+            "destination",
+            "generation",
+            "count",
+            "duplicate",
+            "kind",
+            "latched",
+        ):
+            with self.subTest(fault=fault):
+                binding, plan = self.bind(), self.plan()
+                if fault == "source":
+                    plan.source_index[0] = 999
+                elif fault == "destination":
+                    plan.destination_slot[0] = -1
+                elif fault == "generation":
+                    plan.expected_generation[2] = 999
+                elif fault == "count":
+                    plan.count.fill_(4)
+                elif fault == "duplicate":
+                    plan.destination_slot[2] = plan.destination_slot[0]
+                elif fault == "kind":
+                    plan.source_kind[0] = 999
+                else:
+                    binding.error_status.fill_(1)
+                self.run_copy(plan, binding)
+                self.assertNotEqual(int(binding.error_status), 0)
+                for component in binding.components:
+                    for region in component.destinations:
+                        self.assertEqual(
+                            ctypes.string_at(region.address, region.nbytes),
+                            bytes([231]) * region.nbytes,
+                        )
+
+    def test_empty_source_pools_and_zero_capacity(self):
+        for host_count, hot_count in ((0, 2), (3, 0), (0, 0)):
+            with self.subTest(host_count=host_count, hot_count=hot_count):
+                binding = self.bind(host_count=host_count, hot_count=hot_count)
+                plan = self.plan()
+                plan.valid.zero_()
+                plan.count.zero_()
+                if host_count or hot_count:
+                    plan.source_kind[0] = 1 if host_count else 2
+                    plan.source_index[0] = 0
+                    plan.expected_generation[0] = 0
+                    plan.valid[0] = True
+                    plan.count.fill_(1)
+                self.run_copy(plan, binding)
+                self.assertEqual(int(binding.error_status), 0)
+        binding = self.bind(capacity=0)
+        plan = self.plan()
+        empty = DeviceCopyPlan(
+            *(
+                t[:0]
+                for t in (
+                    plan.source_kind,
+                    plan.source_index,
+                    plan.destination_slot,
+                    plan.valid,
+                    plan.expected_generation,
+                )
+            ),
+            torch.tensor(0, dtype=torch.int32),
+            0,
+        )
+        self.run_copy(empty, binding)
+
+    def test_indices_and_scans_are_shared_across_components(self):
+        counts = []
+        original_cumsum = torch.Tensor.cumsum
+        for components in (1, 4):
+            binding, plan = self.bind(components=components), self.plan()
+            scans = []
+
+            def cumsum(tensor, *args, **kwargs):
+                scans.append(tensor.numel())
+                return original_cumsum(tensor, *args, **kwargs)
+
+            with (
+                mock.patch.object(torch, "where", wraps=torch.where) as where,
+                mock.patch.object(torch.Tensor, "cumsum", cumsum),
+            ):
+                self.run_copy(plan, binding)
+            counts.append((where.call_count, scans))
+        # Three shared where calls (fault mask, source and destination indices),
+        # plus one address selection per component/batch. Scans stay per batch.
+        self.assertEqual(counts, [(6, [2, 2, 1]), (15, [2, 2, 1])])
 
 
 class TestNPUDispatchBytePacking(unittest.TestCase):

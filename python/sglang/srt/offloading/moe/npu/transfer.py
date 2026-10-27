@@ -584,44 +584,37 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
         with self.stream_context(stream):
             try:
                 self._mask(plan, bindings)
-                for tables, batches in zip(bindings.tables, bindings.batches):
-                    host_table, hot_table, destination_table = tables
-                    for begin, end, src, dst, lengths, scan, groups, packed in batches:
-                        source_index = plan.source_index[begin:end]
-                        host_ptr = host_table.gather(
-                            0, (source_index + 1).clamp(0, bindings.host_count)
-                        )
-                        hot_ptr = hot_table.gather(
-                            0, (source_index + 1).clamp(0, bindings.hot_count)
-                        )
-                        selected = bindings.mask[begin:end]
-                        src.copy_(
-                            torch.where(
-                                selected,
-                                torch.where(
-                                    plan.source_kind[begin:end]
-                                    == int(CopySourceKind.HOST),
-                                    host_ptr,
-                                    hot_ptr,
-                                ),
-                                0,
-                            )
-                        )
+                # Every weight/scale component uses the same logical copy plan.
+                # Select table indices once; entry zero gates inactive/faulted
+                # lanes before gathering any component's physical addresses.
+                from_host = plan.source_kind == int(CopySourceKind.HOST)
+                source_index = torch.where(bindings.mask, plan.source_index + 1, 0)
+                host_index = source_index.clamp(0, bindings.host_count)
+                hot_index = source_index.clamp(0, bindings.hot_count)
+                destination_index = torch.where(
+                    bindings.mask, plan.destination_slot + 1, 0
+                )
+                for batch_index, first in enumerate(bindings.batches[0]):
+                    begin, end = first[:2]
+                    selected = bindings.mask[begin:end].to(torch.int64)
+                    packed_index = (selected.cumsum(0) - 1).clamp_min(0)
+                    for tables, batches in zip(bindings.tables, bindings.batches):
+                        host_table, hot_table, destination_table = tables
+                        _, _, src, dst, lengths, scan, groups, packed = batches[
+                            batch_index
+                        ]
+                        host_ptr = host_table.gather(0, host_index[begin:end])
+                        hot_ptr = hot_table.gather(0, hot_index[begin:end])
+                        torch.where(from_host[begin:end], host_ptr, hot_ptr, out=src)
                         groups.copy_(selected)
                         destinations = destination_table.gather(
-                            0,
-                            (plan.destination_slot[begin:end] + 1).clamp(
-                                0, bindings.destination_count
-                            ),
+                            0, destination_index[begin:end]
                         )
                         # Native output j corresponds to the j-th selected i.
                         # Zero additions from inactive entries cannot overwrite an
                         # active destination, including entirely empty masks.
-                        packed_index = (groups.cumsum(0) - 1).clamp_min(0)
                         dst.zero_()
-                        dst.scatter_add_(
-                            0, packed_index, torch.where(selected, destinations, 0)
-                        )
+                        dst.scatter_add_(0, packed_index, destinations)
                         packed.zero_()
                         status = self.group_pack_copy(
                             src, dst, lengths, scan, groups, packed, bindings.device

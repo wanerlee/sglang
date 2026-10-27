@@ -18,7 +18,7 @@ git fetch https://github.com/wanerlee/sglang.git codex/moe-prefill-prefetch-prof
 git switch -c codex/moe-prefill-prefetch-profile-20261027 FETCH_HEAD
 ```
 
-若本地已有同名分支，切换并核对远程提交，不要强制重建。切换前记录并保存现有本地兼容补丁；如果 Git 因冲突拒绝切换，先处理补丁迁移，不要 reset/clean。此分支只提交了本次 profiling 标记、对应测试和这份指导；没有夹带本地尚未提交的其他优化。无需额外应用下面提到的独立 patch。
+若本地已有同名分支，切换并核对远程提交，不要强制重建。切换前记录并保存现有本地兼容补丁；如果 Git 因冲突拒绝切换，先处理补丁迁移，不要 reset/clean。此分支包含本次 profiling 标记、对应测试和这份指导；后续还加入了此前的 decode 搬运元数据优化：跨权重/scale 分量复用索引、掩码选择及分批前缀和，保留原来的 host/hot/destination 三张地址表和 MemFabric 接口。该优化不改变这里验证的 prefill ACL 预取流程。无需额外应用下面提到的独立 patch。
 
 确认运行中的源码包含以下内容，而不是仅更新了另一个 checkout：
 

@@ -180,7 +180,9 @@ class TestDecodeWorkspace(unittest.TestCase):
         runtime = NpuBoundMoERuntime(
             device_runtime=device,
             residency=SimpleNamespace(update_enabled=torch.tensor(True)),
-            residency_ops=SimpleNamespace(begin_step=lambda context: None),
+            residency_ops=SimpleNamespace(
+                begin_step=lambda context: None, error_status=error
+            ),
             cache_updates=None,
             snapshot=None,
             reload_weights=None,
