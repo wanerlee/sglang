@@ -1013,7 +1013,11 @@ class TestNPUDispatchBytePacking(unittest.TestCase):
                 source = payload.view(dtype)
                 for count in (0, 3, 8):
                     with self.subTest(workspace=name, dtype=dtype, count=count):
-                        storage = layout._owned[name]
+                        storage = (
+                            layout._input_bytes
+                            if name == "input_bytes"
+                            else layout._owned[name]
+                        )
                         storage.fill_(171)
                         result = layout._gather_bytes(
                             source, indices, torch.tensor(count), name

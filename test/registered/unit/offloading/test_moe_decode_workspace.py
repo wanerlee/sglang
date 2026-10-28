@@ -13,14 +13,13 @@ import torch
 
 from sglang.srt.offloading.moe.config import ExpertWave, Phase, fixed_waves
 from sglang.srt.offloading.moe.npu import experts as native
-from sglang.srt.offloading.moe.runtime import BoundMoERuntime
 from sglang.srt.offloading.moe.programs import (
     DecodeLocalExpertProgram,
     DispatchOnceProgram,
     PrefillDispatchOnceProgram,
     PrefillLocalExpertProgram,
 )
-from sglang.srt.offloading.moe.runtime import ExecutionContext
+from sglang.srt.offloading.moe.runtime import BoundMoERuntime, ExecutionContext
 from sglang.srt.offloading.transfer import ImmediateCompletion, TransferTicket
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -279,7 +278,7 @@ class TestDecodeWorkspace(unittest.TestCase):
                     completion = fixture.context.finish()
                     self.assertTrue(completion.resources_idle.completion.done())
 
-    def test_padding_is_sanitized_in_place_including_empty_and_partial_waves(self):
+    def test_padding_is_discarded_including_empty_and_partial_waves(self):
         cases = [((0, 2), 4, 2), ((2, 2), 4, 2), ((-1, -1), 4, 2), ((4, 0), 5, 2)]
         with (
             patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}),
@@ -291,12 +290,13 @@ class TestDecodeWorkspace(unittest.TestCase):
                     write = fixture.layout.write_wave
 
                     def checked_write(layout, wave, output, context):
-                        # Padding cleanup must reuse the native GMM allocation.
+                        # No output mask or reordered [R,H] temporary is needed.
                         self.assertIs(output, fixture.output_refs[-1]())
-                        self.assertTrue(bool(torch.isfinite(output).all()))
                         count = int(layout.selected.row_count)
-                        self.assertTrue(bool((output[count:] == 0).all()))
+                        self.assertTrue(bool(torch.isfinite(output[:count]).all()))
+                        self.assertTrue(bool(torch.isnan(output[count:]).all()))
                         write(layout, wave, output, context)
+                        self.assertTrue(bool(torch.isfinite(layout.output).all()))
 
                     fixture.layout.write_wave = checked_write
                     result = fixture.runtime.run_layer(3, fixture.input, fixture.routes)
@@ -485,8 +485,8 @@ class TestDecodeWorkspace(unittest.TestCase):
                         fixture = self.fixture(ids=(), phase=Phase.PREFILL)
                         runtime = fixture.runtime
                         runtime._context, runtime._capture = None, None
-                        runtime.device_runtime.stream_scope = (
-                            lambda stream: nullcontext()
+                        runtime.device_runtime.stream_scope = lambda stream: (
+                            nullcontext()
                         )
                         owner = SimpleNamespace(
                             phase=Phase.DECODE,
@@ -764,8 +764,9 @@ class TestPrefillCompactLayout(unittest.TestCase):
 
     def test_normal_counts_must_be_valid_host_metadata(self):
         for counts in ([1, -1], [1, 1.5], [True, 1], [5, 0], torch.tensor([1, 1])):
-            with self.subTest(counts=counts), self.assertRaisesRegex(
-                ValueError, "Prefill dispatch"
+            with (
+                self.subTest(counts=counts),
+                self.assertRaisesRegex(ValueError, "Prefill dispatch"),
             ):
                 self.bind(counts, torch.ones(4, 4, dtype=torch.bfloat16))
 
