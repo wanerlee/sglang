@@ -21,6 +21,9 @@
 
 每 batch 命中率、生命周期日志及无额外设备同步的约束见 [维测日志](OBSERVABILITY.zh-CN.md)。
 
+Decode 中七次 ScatterElements 的用途与耗时分析见
+[ScatterElements 开销分析](DECODE_SCATTER_ANALYSIS.zh-CN.md)。
+
 `NpuMoEBackend` 在模型构造前安装，由 FusedMoE 的统一权重创建入口接管
 host 参数分配；post-load 后装配共享 host master、hot/execution bank、固定 Tensor
 residency、离线 Top-K / 周期跨层 LFU、ACL eager prefill、MemFabric decode 和现有 Ascend EP/FFN。
