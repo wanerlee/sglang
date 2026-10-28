@@ -2,6 +2,9 @@
 
 代码基线：`codex/moe-offload-dev-20261027` / `531e228a`。
 
+第 1–3 节解释优化前的七次 scatter；第 4 节记录已实现的共享 slot 压紧，
+第 5 节提供实机验证命令。
+
 以下文件路径均相对于仓库根目录；行号对应上述代码基线。每处定位同时列出
 类名、函数名和关键语句，后续代码行号变化时可按函数或语句搜索。
 
@@ -176,3 +179,102 @@ Task Type、INT64 输入 shape，以及不同 mask 下的耗时。如果从几�
 绑定期验证；有效 slot 顺序只压紧一次，再为六个 component 查地址，或者融合成
 一个专用地址准备算子。** 当前用通用 scatter-add 实现每份地址列表的压紧，给
 decode 引入了可以进一步压缩的开销；具体收益仍需实机测量。
+
+## 4. 已实现：共享 slot 压紧，保留复制接口和动态校验
+
+当前实现保持 `MemFabricDeviceTransferOps._mask()` 的动态校验不变，
+也保持 `group_pack_copy(src, dst, lengths, scan, groups, packed, device)` 接口不变。
+
+优化后的代码位置（本节行号对应优化后的实现）：
+
+- 文件：`python/sglang/srt/offloading/moe/npu/transfer.py`
+- `MemFabricTransferBindings.__init__()` 第 342–348 行：为每个 batch 预分配
+  `packed_destination_slots`。这些 INT64 张量由 binding 独占，额外有效字节数为
+  `8 × capacity`，通过 `_tensors` 纳入 `allocations()` 记账。
+- `MemFabricDeviceTransferOps._mask()` 第 427–455 行：保留来源、目标、generation、
+  有效条目计数、重复目标和错误状态检查；其中第 452 行仍执行一次校验 scatter。
+- `MemFabricDeviceTransferOps.materialize_into()` 第 493–507 行：每个 batch 只压紧
+  一次 `destination_slot + 1`；零表示地址表的 sentinel，而不是物理 slot 0。
+- 同一函数第 528–533 行：每个 component 按共享 slot 列表 gather 到自己的 `dst`，
+  覆盖完整目标数组及零尾部，替代逐 component 的 `dst.zero_()` 和 `dst.scatter_add_()`。
+
+```text
+动态校验 scatter（保留）
+    ↓
+每个 batch：共享 slot 压紧 scatter（一次）
+    ↓
+六个 component：各自查询源地址、gather 目标地址、调用原有 copy
+    ↓
+完整 bundle 搬运结束后记录完成事件
+```
+
+`src` 和 `groups` 保持原始输入顺序，目标地址按有效输入顺序压紧，继续满足
+原生接口的 `src[i] → dst[j]` 语义。每个 component 的 `groups`、`packed` 等
+可变原生 scratch 仍独占；全空 mask 不通过 CPU 分支跳过调用。
+
+新增测试：`test/registered/unit/offloading/test_memfabric_compaction.py`。
+测试运行真实 `materialize_into()`；仅设备分配、事件及原生 copy 使用 CPU 替身，
+按原生索引约定复制真实字节，并与未压紧的逻辑映射比较。
+
+使用同一测试夹具对比优化前 `5182d4d5` 与当前实现，得到以下 CPU ATen 调用计数：
+
+| 场景 | 优化前 scatter_add_ | 优化后 scatter_add_ | copy 调用 |
+| --- | ---: | ---: | ---: |
+| 32 个专家，全有效 | 7 | 2 | 均为 6 |
+| 32 个专家，稀疏有效 | 7 | 2 | 均为 6 |
+| 32 个专家，全空 | 7 | 2 | 均为 6 |
+| 257 个专家，跨两个 batch | 13 | 3 | 均为 12 |
+
+对六个 component，设固定 batch 数为 B，scatter 调用由 `1 + 6B` 变成 `1 + B`。
+这些是 CPU 执行真实 lowering 时的调用计数和字节正确性结果，
+不是 NPU ScatterElements 的实测数量或耗时，也不代表 TPOT 已改善。
+
+## 5. NPU 实机验证
+
+先在仓库根目录运行 CPU 契约测试（不加载模型）：
+
+```bash
+PYTHONPATH="$PWD/python:$PWD/test/registered/unit/offloading${PYTHONPATH:+:$PYTHONPATH}" \
+  python -m unittest -v \
+  test_memfabric_compaction \
+  test_npu_backend.TestAddressCatalogMetadata
+```
+
+更新代码后重启原服务，沿用原模型、EP/TP、execution_slots 和缓存配置，让 decode
+graph 重新捕获。已经捕获的旧 graph 不会因为磁盘代码更新而自动采用新实现。
+
+以下命令以服务地址 `http://127.0.0.1:8818` 为例；基线与优化版本应使用相同请求、
+预热过程和采样配置。先预热，再分别采集 prefill 与 32 个 decode step：
+
+```bash
+BASE_URL=http://127.0.0.1:8818
+
+curl --fail --silent --show-error "$BASE_URL/generate" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Explain how a compiler works.","sampling_params":{"temperature":0,"max_new_tokens":64,"ignore_eos":true}}' \
+  > /tmp/moe-shared-slot-warmup.json
+
+curl --fail --silent --show-error "$BASE_URL/start_profile" \
+  -H 'Content-Type: application/json' \
+  -d '{"output_dir":"/tmp/moe-shared-slot-profile","num_steps":32,"profile_by_stage":true,"activities":["CPU","GPU"],"record_shapes":true,"with_stack":false}'
+
+curl --fail --silent --show-error "$BASE_URL/generate" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Explain how a compiler works.","sampling_params":{"temperature":0,"max_new_tokens":64,"ignore_eos":true}}' \
+  > /tmp/moe-shared-slot-profile-response.json
+```
+
+当前服务接口使用 `GPU` 活动名称；NPU 后端会将对应 profiler 活动映射为 NPU。
+`profile_by_stage=true` 将 prefill 与 decode 分开；足够长的请求触发 32 个 decode
+step 后自动停止采样。这里采集的是请求执行阶段，不是 `PROFILE_CAPTURE=1` 的建图时间线。
+
+在同一 rank 的 decode 时间线中，用一次复制计划就绪到完整 bundle 就绪的事件依赖
+定位搬运段；对六个 component、单 batch 的 wave，核对：
+
+- 校验 scatter 一次、共享 slot 压紧 scatter 一次，原六次逐 component scatter 消失。
+- 六个 component 的 `OffloadGroupPackCopyOps` 调用保留；具体设备任务数量以 profiler 为准。
+- 目标地址 gather、源地址选择及错误屏蔽正常，输出与基线一致。
+- 同时记录搬运段总时长、实际 copy 时长、计算流等待，以及完整 decode step 时长。
+  普通 step 与缓存维护 step 分开统计，不能按整张 trace 的 scatter 总数直接除以 wave 数。
+
+关闭 profiler 后再比较 TPOT。NPU 实际算子数、graph replay 正确性和性能收益待实机验收。

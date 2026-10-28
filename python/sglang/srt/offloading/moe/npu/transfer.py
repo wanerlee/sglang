@@ -162,8 +162,9 @@ class MemFabricAddressCatalog:
             tuple(host_sources[name]) for name in component_nbytes
         )
         self.hot_sources = tuple(tuple(hot_sources[name]) for name in component_nbytes)
-        self.host_count, self.hot_count = len(self.host_sources[0]), len(
-            self.hot_sources[0]
+        self.host_count, self.hot_count = (
+            len(self.host_sources[0]),
+            len(self.hot_sources[0]),
         )
         self.name, self._tensors, self._destinations = name, [], {}
         self._sealed = False
@@ -338,6 +339,13 @@ class MemFabricTransferBindings:
                     )
                 )
             self.batches.append(tuple(component_batches))
+        # Every component uses the same selected destination slots. Keep one
+        # packed, sentinel-offset slot list per batch, owned by this binding and
+        # accounted for alongside the other capture-stable metadata.
+        self.packed_destination_slots = tuple(
+            tensor([0] * (end - begin), torch.int64)
+            for begin, end, *_ in self.batches[0]
+        )
 
     def _validate_tensor(self, value, shape, dtype):
         if value.shape != shape or value.dtype != dtype or value.device != self.device:
@@ -482,13 +490,26 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                     0, bindings.destination_count
                 )
                 from_host = plan.source_kind == int(CopySourceKind.HOST)
-                packed_indices = tuple(
-                    (bindings.mask[begin:end].to(torch.int64).cumsum(0) - 1).clamp_min(0)
-                    for begin, end, *_ in bindings.batches[0]
-                )
+                for batch, packed_slots in zip(
+                    bindings.batches[0], bindings.packed_destination_slots
+                ):
+                    begin, end, *_ = batch
+                    selected = bindings.mask[begin:end]
+                    packed_index = (selected.to(torch.int64).cumsum(0) - 1).clamp_min(0)
+                    # Zero is the address-table sentinel; real slots are offset
+                    # by one. Compact logical slots once, not pointers once per
+                    # component. Zero additions cannot overwrite an active slot.
+                    packed_slots.zero_()
+                    packed_slots.scatter_add_(
+                        0,
+                        packed_index,
+                        torch.where(selected, destination_indices[begin:end], 0),
+                    )
                 for tables, batches in zip(bindings.tables, bindings.batches):
                     host_table, hot_table, destination_table = tables
-                    for batch, packed_index in zip(batches, packed_indices):
+                    for batch, packed_slots in zip(
+                        batches, bindings.packed_destination_slots
+                    ):
                         begin, end, src, dst, lengths, scan, groups, packed = batch
                         host_ptr = host_table.gather(0, host_indices[begin:end])
                         hot_ptr = hot_table.gather(0, hot_indices[begin:end])
@@ -505,17 +526,11 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                             )
                         )
                         groups.copy_(selected)
-                        destinations = destination_table.gather(
-                            0,
-                            destination_indices[begin:end],
-                        )
                         # Native output j corresponds to the j-th selected i.
-                        # Zero additions from inactive entries cannot overwrite an
-                        # active destination, including entirely empty masks.
-                        dst.zero_()
-                        dst.scatter_add_(
-                            0, packed_index, torch.where(selected, destinations, 0)
-                        )
+                        # Sources/groups stay in input order. Gather overwrites
+                        # the full destination list, including zero-sentinel tail
+                        # entries left by empty or shorter subsequent replays.
+                        torch.gather(destination_table, 0, packed_slots, out=dst)
                         packed.zero_()
                         status = self.group_pack_copy(
                             src, dst, lengths, scan, groups, packed, bindings.device
