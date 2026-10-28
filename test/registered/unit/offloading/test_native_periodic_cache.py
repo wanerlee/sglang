@@ -364,11 +364,20 @@ class TestNativePeriodicConfig(unittest.TestCase):
         values.update(kwargs)
         return NpuOffloadSettings(**values)
 
-    def test_profile_is_required_only_when_caching_is_enabled(self):
-        with self.assertRaisesRegex(ValueError, "offline_stats_path"):
-            self.settings(offline_stats_path=None)
-        with self.assertRaisesRegex(ValueError, "offline_model_id"):
-            self.settings(offline_model_id=None)
+    def test_profile_and_model_label_are_optional(self):
+        self.settings(offline_stats_path=None)
+        self.settings(offline_model_id=None)
+        settings = self.settings(offline_stats_path=None, offline_model_id=None)
+        assembly = Assembly(ratio=0.5, layer_count=2, local_experts=4)
+        self.addCleanup(assembly.close)
+        policy = PeriodicLFUPolicy(settings.policy_config(), assembly.catalog)
+        assembly.policy = policy
+        runtime = assembly.finalize()
+        self.assertEqual(runtime.residency.slot_to_key.tolist(), [0, 1, 4, 5])
+        self.assertTrue(bool(runtime.residency.slot_valid.all()))
+        for tensor in assembly.backend.format.banks[0].tensors.values():
+            self.assertEqual(tensor[:, 0].tolist(), [30, 31, 40, 41])
+        self.assertEqual(int(runtime.cache_updates.policy_state.usage.sum()), 0)
         settings = self.settings(
             cache_ratio=0, offline_stats_path=None, offline_model_id=None
         )

@@ -9,6 +9,7 @@ temporaries/workspace.
 import json
 import math
 from dataclasses import dataclass
+from itertools import islice, zip_longest
 from typing import Optional
 
 from .config import ExpertCatalog
@@ -17,7 +18,7 @@ from .interfaces import CachePolicy
 
 @dataclass(frozen=True)
 class PeriodicLFUConfig:
-    offline_stats_path: Optional[str]
+    offline_stats_path: Optional[str] = None
     update_interval: int = 4
     min_usage: float = 2.0
     replacement_min_gain: float = 1.5
@@ -57,8 +58,8 @@ class PeriodicLFUPolicy(CachePolicy):
     def graph_maintenance_interval(self):
         return self.config.update_interval
 
-    def initial_keys(self, capacity: int, model_id: str) -> tuple[int, ...]:
-        """Host-only offline Top-K; backend loads/publishes these before serving.
+    def initial_keys(self, capacity: int, model_id=None) -> tuple[int, ...]:
+        """Initialize from offline Top-K, or spread slots across layers without it.
 
         Frequencies use global expert IDs. Resident layers and foreign EP experts
         are excluded by the catalog. Online usage is not seeded with this data.
@@ -68,10 +69,19 @@ class PeriodicLFUPolicy(CachePolicy):
         if capacity == 0:
             return ()
         if self.config.offline_stats_path is None:
-            raise ValueError("A nonempty hot cache requires offline_stats_path")
+            ranges, offset = [], 0
+            for layer in self.catalog.offloaded_layers:
+                ranges.append(range(offset, offset + layer.local_experts))
+                offset += layer.local_experts
+            keys = (
+                key for row in zip_longest(*ranges) for key in row if key is not None
+            )
+            return tuple(sorted(islice(keys, capacity)))
         with open(self.config.offline_stats_path, encoding="utf-8") as stream:
             profile = json.load(stream)
-        if not isinstance(profile, dict) or profile.get("model_id") != model_id:
+        if not isinstance(profile, dict):
+            raise ValueError("Offline profile must contain a layers object")
+        if model_id is not None and profile.get("model_id") != model_id:
             raise ValueError("Offline profile model_id does not match the model")
         layers = profile.get("layers")
         if not isinstance(layers, dict):
@@ -139,9 +149,7 @@ class PeriodicLFUPolicy(CachePolicy):
         candidate = torch.argsort(
             torch.where(~resident, usage, -torch.inf), descending=True, stable=True
         )
-        victim = torch.argsort(
-            torch.where(resident, usage, torch.inf), stable=True
-        )
+        victim = torch.argsort(torch.where(resident, usage, torch.inf), stable=True)
         # Descending cold usage minus ascending hot usage is nonincreasing;
         # valid pairs form a prefix, so no second gain-ranking sort is needed.
         candidate = candidate[: self.config.max_swaps]

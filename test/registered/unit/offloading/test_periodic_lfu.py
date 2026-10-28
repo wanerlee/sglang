@@ -309,6 +309,48 @@ class TestPeriodicLFU(unittest.TestCase):
 
 
 class TestOfflineInitialization(unittest.TestCase):
+    def test_without_profile_spreads_initial_slots_without_seeding_usage(self):
+        policy = PeriodicLFUPolicy(PeriodicLFUConfig(), catalog())
+        for capacity, expected in (
+            (0, ()),
+            (1, (0,)),
+            (3, (0, 1, 4)),
+            (4, (0, 1, 4, 5)),
+            (8, tuple(range(8))),
+        ):
+            with self.subTest(capacity=capacity):
+                self.assertEqual(policy.initial_keys(capacity), expected)
+                self.assertEqual(
+                    policy.initial_keys(capacity, "optional-label"), expected
+                )
+        self.assertEqual(int(policy.allocate_state(8, "cpu").usage.sum()), 0)
+        with self.assertRaises(ValueError):
+            policy.initial_keys(9)
+
+    def test_no_profile_initialization_does_not_fix_online_layer_quotas(self):
+        policy = PeriodicLFUPolicy(PeriodicLFUConfig(), catalog())
+        initial = policy.initial_keys(4)
+        state = policy.allocate_state(8, "cpu")
+        state.usage.copy_(torch.tensor([0, 0, 0, 0, 10, 10, 20, 20]))
+        state.update_due.fill_(True)
+        target = torch.empty(4, dtype=torch.int64)
+        policy.select_hot_set(state, mapping(initial), target)
+        self.assertEqual(target.tolist(), [4, 5, 6, 7])
+
+    def test_profile_label_is_optional_but_explicit_file_errors_are_not_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            policy = PeriodicLFUPolicy(PeriodicLFUConfig(str(path)), catalog())
+            with self.assertRaises(FileNotFoundError):
+                policy.initial_keys(4)
+            path.write_text(json.dumps({"layers": {"4": {"7": 100}}}))
+            self.assertEqual(policy.initial_keys(2), (7, 0))
+            with self.assertRaisesRegex(ValueError, "model_id"):
+                policy.initial_keys(2, "explicit-label")
+            path.write_text(json.dumps({"layers": []}))
+            with self.assertRaisesRegex(ValueError, "layers"):
+                policy.initial_keys(2)
+
     def test_rank_filter_global_topk_missing_and_ties(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profile.json"

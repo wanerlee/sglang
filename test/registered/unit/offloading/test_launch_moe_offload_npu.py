@@ -13,6 +13,79 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class TestMoEOffloadProfileConfig(unittest.TestCase):
+    """Run the launcher's actual Python preflight without requiring Bash/NPU."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        script = (
+            Path(__file__).resolve().parents[4] / "scripts/launch_moe_offload_npu.sh"
+        ).read_text()
+        self.code = script.split(" <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        self.config = self.root / "offload.json"
+        self.profile = self.root / "profile.json"
+
+    def run_config(self, **overrides):
+        config = {
+            "cache_ratio": 0.25,
+            "native_extension_directory": str(self.root / "native"),
+            **overrides,
+        }
+        self.config.write_text(json.dumps(config))
+        return subprocess.run(
+            [
+                sys.executable,
+                "-",
+                str(self.config),
+                "0",
+                str(self.root),
+                "info",
+                "info",
+                "0",
+            ],
+            input=self.code,
+            text=True,
+            capture_output=True,
+        )
+
+    def test_nonzero_cache_accepts_absent_or_null_profile(self):
+        for ratio in (0, 0.25, 1):
+            for profile in ({}, {"offline_stats_path": None, "offline_model_id": None}):
+                with self.subTest(ratio=ratio, profile=profile):
+                    result = self.run_config(cache_ratio=ratio, **profile)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(
+                        (self.root / "offload-config.snapshot.json").is_file()
+                    )
+
+    def test_profile_needs_only_layers_and_resolves_relative_path(self):
+        self.profile.write_text(json.dumps({"layers": {"3": {"0": 10}}}))
+        result = self.run_config(offline_stats_path="profile.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads((self.root / "offload-config.snapshot.json").read_text())
+        self.assertEqual(snapshot["offline_stats_path"], str(self.profile.resolve()))
+        self.assertNotIn("offline_model_id", snapshot)
+
+    def test_explicit_missing_or_invalid_profile_fails(self):
+        result = self.run_config(offline_stats_path="profile.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Missing offline expert profile", result.stderr)
+        self.profile.write_text(json.dumps({"layers": []}))
+        result = self.run_config(offline_stats_path="profile.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("layers object", result.stderr)
+
+    def test_explicit_model_label_still_checks_for_mismatch(self):
+        self.profile.write_text(json.dumps({"model_id": "toy", "layers": {}}))
+        for label, success in (("toy", True), ("other", False)):
+            result = self.run_config(
+                offline_stats_path="profile.json", offline_model_id=label
+            )
+            self.assertEqual(result.returncode == 0, success, result.stderr)
+
+
 class TestMoEOffloadLaunchLogging(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

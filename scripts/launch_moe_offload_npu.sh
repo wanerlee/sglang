@@ -38,8 +38,10 @@ request spans; PROFILE_CAPTURE records the NPU warmup/capture timeline instead.
 --dry-run prints the environment, native build and server commands without
 building, loading weights or initializing NPU devices. Budgets in the JSON are
 per rank: the default host reservation is 128 GiB/rank, 512 GiB for four ranks.
-No log directory or config snapshots are created by --dry-run. With cache_ratio>0,
-replace offline_stats_path/offline_model_id in the JSON before a real launch.
+No log directory or config snapshots are created by --dry-run. Offline statistics
+are optional: without offline_stats_path, initial slots are spread across layers.
+With a profile, offline_model_id optionally checks its model label. Online cache
+replacement remains global within each EP rank.
 EOF
 }
 
@@ -249,16 +251,10 @@ if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio
     raise SystemExit("cache_ratio must be a finite number in [0, 1]")
 profile = config.get("offline_stats_path")
 model_id = config.get("offline_model_id")
-if ratio > 0:
-    if (
-        not isinstance(profile, str)
-        or not profile
-        or not isinstance(model_id, str)
-        or not model_id
-    ):
-        raise SystemExit(
-            "cache_ratio>0 requires offline_stats_path and offline_model_id in MOE_OFFLOAD_CONFIG"
-        )
+if profile is not None and (not isinstance(profile, str) or not profile):
+    raise SystemExit("offline_stats_path must be a nonempty path")
+if model_id is not None and (not isinstance(model_id, str) or not model_id):
+    raise SystemExit("offline_model_id must be a nonempty model identifier")
 if isinstance(profile, str) and profile:
     profile = Path(profile)
     profile = profile if profile.is_absolute() else source.parent / profile
@@ -271,10 +267,10 @@ if isinstance(profile, str) and profile:
         )
     if ratio > 0 and not dry_run:
         statistics = json.loads(profile.read_text())
-        if not isinstance(statistics, dict) or statistics.get("model_id") != model_id:
-            raise SystemExit("Offline profile model_id must match offline_model_id")
-        if not isinstance(statistics.get("layers"), dict):
+        if not isinstance(statistics, dict) or not isinstance(statistics.get("layers"), dict):
             raise SystemExit("Offline profile must contain a layers object")
+        if model_id is not None and statistics.get("model_id") != model_id:
+            raise SystemExit("Offline profile model_id must match offline_model_id")
 config["batch_log_interval"] = interval
 config["batch_log_capacity"] = capacity
 print(

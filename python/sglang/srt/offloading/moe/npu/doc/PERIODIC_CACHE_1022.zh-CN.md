@@ -11,6 +11,7 @@
 原生 JSON 启动入口使用 `PeriodicLFUPolicy`，替换此前每步全局 LFU 的默认策略：
 
 - 离线频率在本 rank 全部可卸载专家中选择 Top-K。resident 层和外 rank 专家排除在外。
+- 未提供离线文件时，初始名额逐层轮流分配，按各层 local expert ID 顺序选取；这只影响初始化，在线仍跨层替换。
 - 首次权重通过原生 `ExpertWeightAccess.apply_update` 和 MemFabric 路径装入，完整 bundle
   完成且共享错误状态健康后才结束初始化；初始化不执行虚拟 decode，不注入在线 usage。
 - 在线按 post-dispatch 有效 token-expert assignment 累计，命中和 miss 都计入热度。
@@ -40,8 +41,10 @@
 }
 ```
 
-`offline_stats_path` 的相对路径以 offload JSON 所在目录解析。非零 `cache_ratio`
-要求提供路径与 model ID；`cache_ratio=0` 不需要 profile，也不隐式填充缓存。
+`offline_stats_path` 和 `offline_model_id` 均可省略或设为 null，包括非零 `cache_ratio`。
+未提供文件时使用上面的逐层初始化；提供文件时保留跨层离线 Top-K。
+相对路径以 offload JSON 所在目录解析。显式指定但不存在或格式错误的文件仍报错。
+`cache_ratio=0` 不读取 profile，也不隐式填充缓存。
 
 profile 的专家编号为 **global expert ID**，格式如下。示例数字仅说明格式，不是推荐热度。
 
@@ -55,10 +58,11 @@ profile 的专家编号为 **global expert ID**，格式如下。示例数字仅
 }
 ```
 
-`model_id` 必须与配置匹配；缺失频率按零处理，同频率按 canonical key 排序。
+显式配置 `offline_model_id` 时，文件内的 `model_id` 必须与之匹配；未配置时不检查标签。
+缺失频率按零处理，同频率按 canonical key 排序。
 线上 usage 独立从零开始。离线数据决定初始驻留集合，在线策略可以重新分配各层配额；
-部署时仍应提供覆盖实际模型的统计。
-已有 `examples/v4.json` 中的 `/path/to/...` 必须替换为真实 profile。
+可以提供实际模型的统计改善初始驻留集合。
+已有 `examples/v4.json` 中的 `/path/to/...` 应替换为真实 profile，或删除两个离线配置字段。
 
 ## 命中统计与后端边界
 

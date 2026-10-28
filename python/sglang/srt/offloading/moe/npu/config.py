@@ -83,13 +83,6 @@ class NpuOffloadSettings:
             not isinstance(self.offline_model_id, str) or not self.offline_model_id
         ):
             raise ValueError("offline_model_id must be a nonempty model identifier")
-        if self.cache_ratio > 0 and (
-            self.offline_stats_path is None or self.offline_model_id is None
-        ):
-            raise ValueError(
-                "Periodic MoE cache requires offline_stats_path and offline_model_id; "
-                "cache_ratio=0 can run without an offline profile"
-            )
         if self.native_extension_directory is not None and (
             not isinstance(self.native_extension_directory, str)
             or not self.native_extension_directory
