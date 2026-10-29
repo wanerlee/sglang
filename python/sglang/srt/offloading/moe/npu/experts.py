@@ -629,7 +629,13 @@ def build_npu_layer_programs(
     def make_request(layer_id, wave_input, wave, context):
         return ExecutionRequest(layer_id, wave_input.local_demand, wave, Phase.DECODE)
 
-    decode_local = DecodeLocalExpertProgram(access, make_request, runner)
+    decode_local = DecodeLocalExpertProgram(
+        access,
+        make_request,
+        runner,
+        layer_demand=lambda layout: layout.counts,
+        compute_scope=lambda context: _compute_scope(context, device),
+    )
     prefill_local = PrefillLocalExpertProgram(pipeline, runner)
     return NPULayerPrograms(
         PrefillDispatchOnceProgram(

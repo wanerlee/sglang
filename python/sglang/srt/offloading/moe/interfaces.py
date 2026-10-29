@@ -102,6 +102,14 @@ class CachePolicy(ABC):
 class ResidencyOps(ABC):
     """Device lowering; maps, counters and plans have fixed addresses/capacity."""
 
+    def prepare_decode_layer(self, layer_id, local_demand, context):
+        """Explicitly prepare one invocation's full local expert source plan."""
+        raise NotImplementedError("Layer decode preparation is not implemented")
+
+    def finish_decode_layer(self, layer_plan, context):
+        """Close the preparation scope, including after partial submission."""
+        raise NotImplementedError("Layer decode preparation is not implemented")
+
     @abstractmethod
     def resolve_execution(self, local_demand, context):
         """Return MaterializationPlan; misses do not imply hot admission.
@@ -149,6 +157,16 @@ class WholeMoEProgram(ABC):
 
 
 class LocalExpertProgram(ABC):
+    def prepare_layer(self, layer, layout, context):
+        """Optional invocation preparation after dispatch/layout binding."""
+        return None
+
+    def finish_layer(self, prepared, context):
+        """Close optional preparation without synchronizing device work."""
+
+    def run_prepared(self, layer, dispatch_output, wave, context, prepared):
+        raise NotImplementedError("Prepared local execution is not implemented")
+
     @abstractmethod
     def run(self, layer, dispatch_output, wave, context):
         """Prepare fixed bank bindings, wait for readiness, run F, record readers."""

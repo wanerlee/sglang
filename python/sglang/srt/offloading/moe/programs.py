@@ -1,6 +1,8 @@
 """DFC schedules independent of weight transport and accelerator layouts."""
 
 import logging
+from contextlib import nullcontext
+from dataclasses import replace
 
 from ..transfer import Completion, TransferTicket
 from .config import Phase
@@ -65,6 +67,25 @@ class DispatchOnceProgram(WholeMoEProgram):
         )
         dispatched = self.dispatcher.dispatch(hidden_states, routing, context)
         layout = self.layout_adapter.bind(dispatched, context)
+        prepare = getattr(self.local_program, "prepare_layer", None)
+        prepared = prepare(layer, layout, context) if prepare is not None else None
+        try:
+            self._run_waves(layer, dispatched, layout, context, prepared)
+        finally:
+            if prepared is not None:
+                self.local_program.finish_layer(prepared, context)
+        logger.debug(
+            "MoE offload combine.submit: phase=%s capture=%s layer=%s",
+            context.phase.value,
+            context.capturing,
+            layer,
+        )
+        combined = self.dispatcher.combine(
+            self.layout_adapter.combine_input(layout, context), context
+        )
+        return self.dispatcher.finish(combined, context)
+
+    def _run_waves(self, layer, dispatched, layout, context, prepared):
         # Unrolled at capture, including empty waves. Dynamic rows stay on device.
         for wave in self._wave_schedule(layer, dispatched, layout, context):
             logger.debug(
@@ -80,21 +101,16 @@ class DispatchOnceProgram(WholeMoEProgram):
             )
             with context.temporary_scope():
                 wave_input = self.layout_adapter.select_wave(layout, wave, context)
-                local = self.local_program.run(layer, wave_input, wave, context)
+                if prepared is None:
+                    local = self.local_program.run(layer, wave_input, wave, context)
+                else:
+                    local = self.local_program.run_prepared(
+                        layer, wave_input, wave, context, prepared
+                    )
                 self.layout_adapter.write_wave(layout, wave, local, context)
                 # Do not keep the previous wave's output in loop locals while
                 # materializing/running the next wave over the same workspaces.
                 del local, wave_input
-        logger.debug(
-            "MoE offload combine.submit: phase=%s capture=%s layer=%s",
-            context.phase.value,
-            context.capturing,
-            layer,
-        )
-        combined = self.dispatcher.combine(
-            self.layout_adapter.combine_input(layout, context), context
-        )
-        return self.dispatcher.finish(combined, context)
 
 
 class PrefillDispatchOnceProgram(DispatchOnceProgram):
@@ -192,15 +208,46 @@ class DecodeLocalExpertProgram(LocalExpertProgram):
     The runner retains resources before any submission, including on exceptions.
     """
 
-    def __init__(self, access, make_request, run_experts):
+    def __init__(
+        self,
+        access,
+        make_request,
+        run_experts,
+        *,
+        layer_demand=None,
+        compute_scope=None,
+    ):
         self.access = access
         self.make_request = make_request
         self.run_experts = run_experts
+        self.layer_demand = layer_demand
+        self.compute_scope = compute_scope or (lambda context: nullcontext())
+
+    def prepare_layer(self, layer, layout, context):
+        if self.layer_demand is None:
+            return None
+        with self.compute_scope(context):
+            return self.access.prepare_decode_layer(
+                layer, self.layer_demand(layout), context
+            )
+
+    def finish_layer(self, prepared, context):
+        self.access.finish_decode_layer(prepared, context)
+
+    def run_prepared(self, layer, dispatch_output, wave, context, prepared):
+        with self.compute_scope(context):
+            return self._run(layer, dispatch_output, wave, context, prepared)
 
     def run(self, layer, dispatch_output, wave, context):
+        with self.compute_scope(context):
+            return self._run(layer, dispatch_output, wave, context, None)
+
+    def _run(self, layer, dispatch_output, wave, context, prepared):
         if context.phase is not Phase.DECODE:
             raise RuntimeError("Decode local program requires decode mode")
         request = self.make_request(layer, dispatch_output, wave, context)
+        if prepared is not None:
+            request = replace(request, layer_plan=prepared)
         if request.wave != wave:
             raise ValueError("Decode must load only the current wave")
         lease = self.access.stage(request, context)

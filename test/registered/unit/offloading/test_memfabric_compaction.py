@@ -161,7 +161,12 @@ class TransferHarness:
             for row in rows
         )
 
-    def new_binding(self):
+    def new_binding(self, *, fixed_destination_slots=None):
+        fixed = (
+            {}
+            if fixed_destination_slots is None
+            else {"fixed_destination_slots": fixed_destination_slots}
+        )
         return self.module.MemFabricTransferBindings(
             self.catalog,
             self.destination_regions,
@@ -169,6 +174,7 @@ class TransferHarness:
             hot_generations=self.generations,
             error_status=self.error,
             max_batch_entries=self.max_batch_entries,
+            **fixed,
         )
 
     def plan(self, valid=None):
@@ -198,7 +204,7 @@ class TransferHarness:
             capacity=self.capacity,
         )
 
-    def expected(self, plan, *, suppressed=False):
+    def expected(self, plan, *, suppressed=False, destination_slots=None):
         expected = {name: rows.clone() for name, rows in self.destination.items()}
         if suppressed:
             return expected
@@ -211,8 +217,13 @@ class TransferHarness:
                 if int(plan.source_kind[lane]) == int(CopySourceKind.HOST)
                 else self.hot
             )
+            destination = (
+                int(plan.destination_slot[lane])
+                if destination_slots is None
+                else destination_slots[lane]
+            )
             for name in expected:
-                expected[name][int(plan.destination_slot[lane])].copy_(
+                expected[name][destination].copy_(
                     source[name][int(plan.source_index[lane])]
                 )
         return expected

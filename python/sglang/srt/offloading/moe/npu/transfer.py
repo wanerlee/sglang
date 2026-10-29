@@ -270,6 +270,12 @@ class MemFabricTransferBindings:
     error_status is the runtime's shared scalar int32 fault flag. Residency
     publication and FFN validity must be gated by it; only a drained/reset runtime
     may clear it. hot_generations is canonical slot-generation state.
+
+    fixed_destination_slots opts into a binding-owned destination layout. It is
+    a host tuple certified once before capture; entry i always writes its bound
+    slot, regardless of the contents of plan.destination_slot. The plan field
+    retains its shape/dtype contract but cannot redirect fixed decode copies.
+    Dynamic bindings, including hot-set updates, keep per-submission validation.
     """
 
     def __init__(
@@ -282,6 +288,7 @@ class MemFabricTransferBindings:
         error_status,
         max_batch_entries=256,
         name=None,
+        fixed_destination_slots=None,
     ):
         import torch
 
@@ -303,6 +310,18 @@ class MemFabricTransferBindings:
         self.tables, self.hot_targets_alias, self.destination_count = (
             address_catalog.bind(destinations)
         )
+        if fixed_destination_slots is not None:
+            if not isinstance(fixed_destination_slots, tuple):
+                raise ValueError("Fixed destination slots must be a host tuple")
+            if len(fixed_destination_slots) != capacity or any(
+                type(slot) is not int or not 0 <= slot < self.destination_count
+                for slot in fixed_destination_slots
+            ):
+                raise ValueError(
+                    "Fixed destination slots must match capacity and range"
+                )
+            if len(set(fixed_destination_slots)) != capacity:
+                raise ValueError("Fixed destination slots must be unique")
         self.hot_generations, self.error_status = hot_generations, error_status
         self._validate_tensor(hot_generations, (self.hot_count,), torch.int64)
         self._validate_tensor(error_status, (), torch.int32)
@@ -313,8 +332,17 @@ class MemFabricTransferBindings:
             self._tensors.append(value)
             return value
 
-        self.destination_writes = tensor(
-            [0] * (self.destination_count + 1), torch.int64
+        # Never borrow the mutable plan tensor for the fixed-layout fast path.
+        # This storage is private to the binding and is not given to native code.
+        self._fixed_destination_indices = (
+            None
+            if fixed_destination_slots is None
+            else tensor([slot + 1 for slot in fixed_destination_slots], torch.int64)
+        )
+        self.destination_writes = (
+            tensor([0] * (self.destination_count + 1), torch.int64)
+            if fixed_destination_slots is None
+            else None
         )
         self.mask = tensor([False] * capacity, torch.bool)
         self.batches = []
@@ -371,7 +399,7 @@ class MemFabricTransferBindings:
         self._validate_tensor(plan.count, (), torch.int32)
 
     def allocations(self):
-        """Only mutable scratch: the arena counts the shared catalog once."""
+        """Binding-owned metadata; the arena counts the shared catalog once."""
         return tensor_allocations(
             self.name + ".metadata.",
             ((str(i), value) for i, value in enumerate(self._tensors)),
@@ -433,9 +461,6 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
             (host & (plan.source_index < bindings.host_count))
             | (hot & (plan.source_index < bindings.hot_count))
         )
-        destination_in_range = (plan.destination_slot >= 0) & (
-            plan.destination_slot < bindings.destination_count
-        )
         if bindings.hot_count:
             generation = bindings.hot_generations.gather(
                 0, plan.source_index.clamp(0, bindings.hot_count - 1)
@@ -443,14 +468,24 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
             source_in_range &= (~hot) | (generation == plan.expected_generation)
         if bindings.hot_targets_alias:
             source_in_range &= ~hot
-        invalid = (plan.valid & ~(source_in_range & destination_in_range)).any()
+        destination_in_range = None
+        if getattr(bindings, "_fixed_destination_indices", None) is None:
+            destination_in_range = (plan.destination_slot >= 0) & (
+                plan.destination_slot < bindings.destination_count
+            )
+            invalid = (plan.valid & ~(source_in_range & destination_in_range)).any()
+        else:
+            invalid = (plan.valid & ~source_in_range).any()
         invalid |= plan.count != plan.valid.sum(dtype=torch.int32)
-        # Destination slot duplication is unsafe even when split into bounded
-        # calls: publication cannot assign two expert identities to one slot.
-        bindings.destination_writes.zero_()
-        indices = torch.where(destination_in_range, plan.destination_slot + 1, 0)
-        bindings.destination_writes.scatter_add_(0, indices, plan.valid.to(torch.int64))
-        invalid |= (bindings.destination_writes[1:] > 1).any()
+        if destination_in_range is not None:
+            # Dynamic destinations may duplicate slots even across native batches.
+            # Fixed bindings certify this layout once and never read plan targets.
+            bindings.destination_writes.zero_()
+            indices = torch.where(destination_in_range, plan.destination_slot + 1, 0)
+            bindings.destination_writes.scatter_add_(
+                0, indices, plan.valid.to(torch.int64)
+            )
+            invalid |= (bindings.destination_writes[1:] > 1).any()
         bindings.error_status.bitwise_or_(invalid.to(torch.int32))
         bindings.mask.copy_(plan.valid & (bindings.error_status == 0))
 
@@ -486,9 +521,11 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                 source_index = plan.source_index + 1
                 host_indices = source_index.clamp(0, bindings.host_count)
                 hot_indices = source_index.clamp(0, bindings.hot_count)
-                destination_indices = (plan.destination_slot + 1).clamp(
-                    0, bindings.destination_count
-                )
+                destination_indices = bindings._fixed_destination_indices
+                if destination_indices is None:
+                    destination_indices = (plan.destination_slot + 1).clamp(
+                        0, bindings.destination_count
+                    )
                 from_host = plan.source_kind == int(CopySourceKind.HOST)
                 for batch, packed_slots in zip(
                     bindings.batches[0], bindings.packed_destination_slots

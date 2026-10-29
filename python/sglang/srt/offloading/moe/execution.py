@@ -25,6 +25,8 @@ class ExecutionRequest:
     local_demand: Any
     wave: ExpertWave
     phase: Phase
+    # Explicit per-layer decode preparation; None preserves standalone planners.
+    layer_plan: Any = None
 
     def __post_init__(self):
         if self.layer_id < 0 or not isinstance(self.phase, Phase):
@@ -78,6 +80,12 @@ class ExpertWeightAccess:
         self.host_ops = host_ops
         self.device_ops = device_ops
         self._token = object()
+
+    def prepare_decode_layer(self, layer_id, local_demand, context):
+        return self.residency_ops.prepare_decode_layer(layer_id, local_demand, context)
+
+    def finish_decode_layer(self, layer_plan, context):
+        self.residency_ops.finish_decode_layer(layer_plan, context)
 
     def stage(self, request, context):
         if request.phase is not context.phase:

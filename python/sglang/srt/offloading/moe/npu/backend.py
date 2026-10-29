@@ -19,8 +19,8 @@ from ..diagnostics import BatchDiagnostics
 from ..execution import (
     CacheUpdateCoordinator,
     ExecutionRequest,
-    MaterializationPlan,
     ExpertWeightAccess,
+    MaterializationPlan,
 )
 from ..interfaces import MoEBackend
 from ..models import DeepSeekV4Adapter
@@ -192,7 +192,7 @@ class NpuMoEBackend(MoEBackend):
         self._unbound_resources.append(address_catalog)
         bindings = []
 
-        def bind(bank, capacity, name, valid=None):
+        def bind(bank, capacity, name, valid=None, *, fixed_destination_slots=None):
             result = MemFabricTransferBindings(
                 address_catalog,
                 bank.component_regions,
@@ -200,6 +200,7 @@ class NpuMoEBackend(MoEBackend):
                 hot_generations=state.slot_generation,
                 error_status=error,
                 name=name,
+                fixed_destination_slots=fixed_destination_slots,
             )
             if valid is not None:
                 result.expert_bank = NPUExpertBank(bank.quant_info(), valid, error)
@@ -219,6 +220,9 @@ class NpuMoEBackend(MoEBackend):
                     count,
                     f"decode.{spec.layer_id}.{wave.index}",
                     state.execution_valid[:count],
+                    # This view starts at slot zero; copy destinations must match
+                    # the exact expert order consumed by this native FFN bank.
+                    fixed_destination_slots=tuple(range(count)),
                 )
                 bound_waves.append(
                     BoundExecutionWave(spec.layer_id, wave, 0, transfer_binding)

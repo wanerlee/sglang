@@ -2,8 +2,8 @@
 
 代码基线：`codex/moe-offload-dev-20261027` / `531e228a`。
 
-第 1–3 节解释优化前的七次 scatter；第 4 节记录已实现的共享 slot 压紧，
-第 5 节提供实机验证命令。
+第 1–3 节解释优化前的七次 scatter；第 4 节记录 `61bec1e8` 的共享 slot 压紧，
+第 5 节提供实机验证命令；第 6 节记录当前 P0-1、P0-2 和输出回填回滚。
 
 以下文件路径均相对于仓库根目录；行号对应上述代码基线。每处定位同时列出
 类名、函数名和关键语句，后续代码行号变化时可按函数或语句搜索。
@@ -182,8 +182,9 @@ decode 引入了可以进一步压缩的开销；具体收益仍需实机测量�
 
 ## 4. 已实现：共享 slot 压紧，保留复制接口和动态校验
 
-当前实现保持 `MemFabricDeviceTransferOps._mask()` 的动态校验不变，
+本节记录的 `61bec1e8` 保持 `MemFabricDeviceTransferOps._mask()` 的动态校验不变，
 也保持 `group_pack_copy(src, dst, lengths, scan, groups, packed, device)` 接口不变。
+当前 decode 又通过第 6 节的固定目标 binding 去掉了运行时目标校验；通用路径不变。
 
 优化后的代码位置（本节行号对应优化后的实现）：
 
@@ -237,6 +238,8 @@ decode 引入了可以进一步压缩的开销；具体收益仍需实机测量�
 PYTHONPATH="$PWD/python:$PWD/test/registered/unit/offloading${PYTHONPATH:+:$PYTHONPATH}" \
   python -m unittest -v \
   test_memfabric_compaction \
+  test_fixed_decode_transfer \
+  test_moe_decode_layer_plan \
   test_npu_backend.TestAddressCatalogMetadata
 ```
 
@@ -271,10 +274,81 @@ step 后自动停止采样。这里采集的是请求执行阶段，不是 `PROF
 在同一 rank 的 decode 时间线中，用一次复制计划就绪到完整 bundle 就绪的事件依赖
 定位搬运段；对六个 component、单 batch 的 wave，核对：
 
-- 校验 scatter 一次、共享 slot 压紧 scatter 一次，原六次逐 component scatter 消失。
+- 当前固定 decode：目标校验 scatter 消失，只剩共享 slot 压紧 scatter 一次。
+  `61bec1e8` 基线仍有校验和共享压紧各一次；hot.update 的动态校验继续保留。
+- 命中/source 查询在 dispatch/layout.bind 后按层执行一次；各 wave 读取对应切片。
 - 六个 component 的 `OffloadGroupPackCopyOps` 调用保留；具体设备任务数量以 profiler 为准。
 - 目标地址 gather、源地址选择及错误屏蔽正常，输出与基线一致。
 - 同时记录搬运段总时长、实际 copy 时长、计算流等待，以及完整 decode step 时长。
   普通 step 与缓存维护 step 分开统计，不能按整张 trace 的 scatter 总数直接除以 wave 数。
 
 关闭 profiler 后再比较 TPOT。NPU 实际算子数、graph replay 正确性和性能收益待实机验收。
+
+## 6. 当前实现：P0-1、P0-2 与输出回填回滚
+
+已通过 `1fb14334` 回滚 `fdab5c61` 的输出 `index_copy_` 改动，恢复原有输出
+MaskedFill / IndexSelect / Where 路径。用户实测没有收益，因此此次只推进命中计划
+与固定目标校验，保留 `61bec1e8` 的共享 slot 压紧。
+
+### P0-1：每次调用一层时，只生成一次整层来源计划
+
+例如一层有 96 个本地专家，每个 wave 容纳 32 个专家。原先三个 wave 各自查询
+key_to_slot、slot_valid、slot_to_key、slot_generation，再选择 Host/hot 来源。
+现在 dispatch 得到本层全部 counts 后，一次处理 96 个专家；三个 wave 分别使用
+`[0:32]`、`[32:64]`、`[64:96]` 的固定视图。命中查询的数据总量没有减少，
+减少的是重复的算子提交与依赖链；有 hot slots 时，这四种查表的调用总数从
+`4 × wave 数` 降到每层 4 次。这里仅统计命中计划查表，不包含激活整理的 IndexSelect。
+
+代码位置（本节对应 P0 修改后的源码，路径均相对仓库根目录）：
+
+- `python/sglang/srt/offloading/moe/programs.py`：`DispatchOnceProgram.run()`
+  第 67–76 行，在 dispatch/layout.bind 后 prepare，通过 finally 关闭本次计划；
+  `_run_waves()` 第 101–110 行让各 wave 显式使用 prepared plan。
+- `python/sglang/srt/offloading/moe/npu/experts.py`：`build_npu_layer_programs()`
+  第 632–639 行启用本层 counts adapter，并指定 compute stream scope。
+- `python/sglang/srt/offloading/moe/residency.py`：`_bind_wave()` 第 222–240 行
+  创建来源与 generation 的持久切片；`_allocate_layer_sources()` 第 243 行
+  预分配整层元数据；`prepare_decode_layer()` 第 344 行生成本次计划；
+  `_prepare_sources()` 第 471 行执行统一查表和访问计数。
+- 同文件 `resolve_execution()` 第 437–469 行，每 wave 仍刷新最新错误屏蔽、
+  valid/kind/count、execution_valid，并记录当前计算前沿；`publish_execution()`
+  第 537 行仍等待完整复制完成，再检查错误并发布有效权重。
+
+计划每次层调用都会刷新，graph replay 也重新执行捕获的 tensor 操作，不跨 step
+缓存旧命中结果。临时元数据的物理存储在绑定时分配并计入资源预算，切片不重复记账。
+当前层关闭前不能更新 hot set；前一 wave 的 reader 等待和复制依赖没有移到层首。
+
+成功执行时，整层访问次数与原逐 wave 累加一致。失败路径的时序有变化：后续 wave
+的非法映射可能在层首更早被发现；cache stats 也在层首记录路由需求，因此不能把
+失败调用中的命中数解读为“已经成功搬运或执行的专家数”。错误后的复制与输出仍受屏蔽。
+
+### P0-2：由 decode binding 持有固定目标，初始化时证明合法
+
+decode 的每个 wave 都绑定 `execution.view(0, count)`，目标 slot 固定为
+`(0, 1, ..., count - 1)`。绑定时检查长度、整数类型、范围和唯一性，之后实际复制
+使用 binding 独立持有的 slot 索引。它不是简单关闭检查：即使 plan 的目标内容
+后来被改成重复或越界，固定路径也不能被重定向；plan 字段仍需满足 shape/dtype/device 契约。
+
+- `python/sglang/srt/offloading/moe/npu/backend.py`：`NpuMoEBackend.finalize()`
+  内第 217–225 行，将固定 slot 顺序与 FFN bank/validity 的顺序绑定。
+- `python/sglang/srt/offloading/moe/npu/transfer.py`：
+  `MemFabricTransferBindings.__init__()` 第 313–345 行验证并保存固定目标；
+  `MemFabricDeviceTransferOps._mask()` 第 471–490 行只让动态 binding 执行目标
+  范围/重复检查；`materialize_into()` 第 524–529 行使用固定索引。
+- 同文件第 540 行的共享 slot 压紧 scatter 仍保留。六份 component 仍需各自
+  gather 地址和 copy；来源范围、generation、count、共享错误状态检查也保留。
+  `hot.update` 不使用固定目标，继续保留运行时目标校验。
+
+对六份 component、单 batch 的 decode wave，CPU 真实 lowering 的 scatter_add_
+调用数由共享压紧版本的 2 次降为 1 次；跨 B 个 batch 时由 `1 + B` 降为 `B`。
+这不是 NPU kernel 数或耗时承诺。
+
+新增回归测试位于 `test/registered/unit/offloading/test_moe_decode_layer_plan.py`
+和 `test/registered/unit/offloading/test_fixed_decode_transfer.py`，覆盖计划差分、
+动态输入的 CPU 算子 trace 重放、重复层调用、晚期错误、generation 复核、固定目标
+篡改、跨 batch 压紧和字节复制正确性。CPU trace 不替代真实 NPU graph replay。
+
+本次本地验证：15 个 offloading CPU 测试模块与 launcher 的 4 项 Python preflight，
+共 214 项通过，未跳过；另外依赖 POSIX shebang 的 Bash 启动测试不在本次 Windows
+执行范围内。ruff、isort 和 git diff 空白检查通过。回归中修正了旧测试的跨层 LFU
+预期、统计开关与 fake replay 协议，未改变对应生产策略。
