@@ -113,8 +113,6 @@ class NPUWaveInput:
     row_count: torch.Tensor
     offset: torch.Tensor
     wave: object
-    # Only a consumer that gates every output row may accept unwritten padding.
-    defer_output_mask: bool = False
 
 
 @dataclass(frozen=True)
@@ -289,19 +287,15 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raise ValueError("Layout requires the canonical device error scalar")
         self.error_status = error_status
         self._owned = {}
-        # The second half packs FFN input, then receives discarded output rows
-        # after all FFN readers have joined. Report the physical allocation once.
-        output_and_input = self._allocate(
-            "output_and_input", (2 * max_dispatch_rows, hidden_size), torch.bfloat16
-        )
-        self._input_bytes = (
-            output_and_input[max_dispatch_rows:].view(torch.uint8).reshape(-1)
+        self._allocate(
+            "input_bytes", (max_dispatch_rows * hidden_size * 2,), torch.uint8
         )
         # Covers E8M0 MXFP8 scales and FP32 per-token/group scales.
         scale_bytes_per_row = max(4, (hidden_size + 31) // 32 * 4)
         self._allocate(
             "scale_bytes", (max_dispatch_rows * scale_bytes_per_row,), torch.uint8
         )
+        self._allocate("output", (max_dispatch_rows, hidden_size), torch.bfloat16)
         self._allocate("counts", (local_experts,), torch.int64)
         self._allocate("offsets", (local_experts + 1,), torch.int64)
         rows = self._allocate("rows", (max_dispatch_rows,), torch.int64)
@@ -367,7 +361,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             offsets = self._owned["offsets"]
             offsets[0].zero_()
             torch.cumsum(counts, 0, out=offsets[1:])
-            output = self._owned["output_and_input"][: x.shape[0]]
+            output = self._owned["output"][: x.shape[0]]
             if x.dtype == torch.float16:
                 output = output.view(torch.float16)
             output.zero_()
@@ -390,7 +384,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raise ValueError("NPU activation/scale packing requires contiguous storage")
         byte_rows = source.view(torch.uint8).reshape(rows, -1)
         nbytes = byte_rows.numel()
-        storage = self._input_bytes if name == "input_bytes" else self._owned[name]
+        storage = self._owned[name]
         if nbytes > storage.numel():
             raise ValueError("Activation scale workspace capacity exceeded")
         out = storage[:nbytes].view(byte_rows.shape)
@@ -446,7 +440,6 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 count,
                 offset,
                 wave,
-                defer_output_mask=context.phase is Phase.DECODE,
             )
             layout.selected = result
             context.retain(result)
@@ -467,30 +460,16 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             if layout.prefill_offsets is not None:
                 target.copy_(local_output)
             elif layout.output.shape[0]:
-                if local_output.dtype != target.dtype:
-                    raise ValueError("Native FFN output must match the combine dtype")
-                storage = self._owned["output_and_input"].view(target.dtype)
-                # The local program has joined every FFN reader before write_wave.
-                # No one needs packed input now, so use it as an output sink.
-                # Give each discarded row its own index: repeated destinations
-                # would make index_copy_ nondeterministic, including empty waves.
-                good_rows = (layout.row_ids < selected.row_count) & (
-                    self.error_status == 0
+                inverse = (layout.row_ids - selected.offset).clamp(
+                    0, layout.output.shape[0] - 1
                 )
-                destinations = torch.where(
-                    good_rows,
-                    layout.row_ids + selected.offset,
-                    layout.row_ids + self.max_rows,
+                values = torch.index_select(local_output, 0, inverse)
+                belongs = (layout.row_ids >= selected.offset) & (
+                    layout.row_ids < selected.offset + selected.row_count
                 )
-                # Native GMM returns fresh storage. Preserve correctness for a
-                # runner that aliases its input or the layout's visible output.
-                if (
-                    local_output.untyped_storage().data_ptr()
-                    == storage.untyped_storage().data_ptr()
-                ):
-                    local_output = local_output.clone()
-                    context.retain(local_output)
-                storage.index_copy_(0, destinations, local_output)
+                torch.where(
+                    belongs.unsqueeze(1), values, layout.output, out=layout.output
+                )
             layout.selected = None
 
     def combine_input(self, layout, context):
@@ -582,13 +561,12 @@ class NPUExpertRunner:
             context.retain(runner_input)
             output = self.core.run(runner_input, quant, {}).hidden_states
             context.retain(output)
-            if not getattr(dispatched, "defer_output_mask", False):
-                # Prefill and standalone callers still receive sanitized output.
-                # Decode writeback instead routes padding/failures to a sink,
-                # without sanitizing NaN padding or allocating a reordered result.
-                row_ids = torch.arange(output.shape[0], device=output.device)
-                good_rows = (row_ids < dispatched.row_count) & healthy
-                output.masked_fill_(~good_rows.unsqueeze(1), 0)
+            # Unwritten GMM padding may contain NaN; multiply-by-zero is unsafe.
+            row_ids = torch.arange(output.shape[0], device=output.device)
+            good_rows = (row_ids < dispatched.row_count) & healthy
+            # Own the GMM result: clear padding in place rather than allocating
+            # and retaining a second [receive_capacity, hidden] output per wave.
+            output.masked_fill_(~good_rows.unsqueeze(1), 0)
             return LocalExecution(output, self._reader_ticket(context))
 
 
