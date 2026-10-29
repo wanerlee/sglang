@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Eight dual-die Ascend A3 cards (16 ranks), W8A8, no offload or speculation.
 # Starts the server in the foreground; send benchmark requests separately.
+# Graph capture is disabled by default for the prefill baseline.
 set -eo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -8,11 +9,14 @@ SGLANG_ROOT=${SGLANG_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 MODEL_PATH=${MODEL_PATH:-/home/weights/DeepSeek-V4-Flash-0731-w8a8}
 WORLD_SIZE=16
+ATTN_DP_SIZE=${ATTN_DP_SIZE:-2}
+DECODE_GRAPH_BACKEND=${DECODE_GRAPH_BACKEND:-disabled}
 SERVER_PORT=${SERVER_PORT:-30000}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.6}
 CONTEXT_LENGTH=${CONTEXT_LENGTH:-256000}
-MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-131072}
-CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-131072}
+MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-16384}
+# This fork divides the configured chunk by ATTN_DP_SIZE: 16384 / 2 = 8192.
+CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-16384}
 ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 
 SERVER_CMD=(
@@ -22,16 +26,18 @@ SERVER_CMD=(
     --device npu --attention-backend dsv4 --page-size 128 --trust-remote-code
     --load-format safetensors --quantization modelslim --kv-cache-dtype bfloat16
     --tp-size "$WORLD_SIZE" --ep-size "$WORLD_SIZE"
-    --dp-size "$WORLD_SIZE" --enable-dp-attention
+    --dp-size 1 --attn-dp-size "$ATTN_DP_SIZE"
     --moe-a2a-backend deepep --deepep-mode auto --enable-dp-lm-head
     --mem-fraction-static "$MEM_FRACTION_STATIC"
     --prefill-max-requests 1 --max-running-requests 1
     --max-prefill-tokens "$MAX_PREFILL_TOKENS"
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" --context-length "$CONTEXT_LENGTH"
-    --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled
-    --cuda-graph-bs-decode 1 --cuda-graph-max-bs-decode 1
+    --cuda-graph-backend-decode "$DECODE_GRAPH_BACKEND" --cuda-graph-backend-prefill disabled
     --watchdog-timeout 9000 --log-level info
 )
+if [[ "$DECODE_GRAPH_BACKEND" != disabled ]]; then
+    SERVER_CMD+=(--cuda-graph-bs-decode 1 --cuda-graph-max-bs-decode 1)
+fi
 
 printf 'Server: '; printf '%q ' "${SERVER_CMD[@]}"; printf '\n'
 if [[ "${1:-}" == --dry-run ]]; then exit 0; fi
