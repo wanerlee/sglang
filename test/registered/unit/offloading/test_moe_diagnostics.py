@@ -8,13 +8,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from test_npu_backend import Assembly
+
 from sglang.srt.offloading.moe.cache_metadata import CacheRouteStats
 from sglang.srt.offloading.moe.config import Phase
 from sglang.srt.offloading.moe.diagnostics import BatchDiagnostics
 from sglang.srt.offloading.moe.execution import ExecutionRequest
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner
 from sglang.test.ci.ci_register import register_cpu_ci
-from test_npu_backend import Assembly
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -221,6 +222,9 @@ class TestBatchDiagnostics(unittest.TestCase):
         results = []
         for enabled in (False, True):
             assembly = Assembly(ratio=0.5, layer_count=1, local_experts=4)
+            # Keep route counters in both capture programs; only the diagnostics
+            # sink differs. Disabled batch logging omits these counters entirely.
+            assembly.backend.settings.batch_log_interval = 1
             runtime = assembly.finalize()
             if enabled:
                 runtime.diagnostics = BatchDiagnostics(

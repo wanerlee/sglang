@@ -34,24 +34,16 @@ def mapping(keys, count=8):
 
 
 def reference(usage, resident, cat, cfg):
-    """Independent host oracle, never used by the production policy."""
-    pairs = []
-    for layer in cat.offloaded_layers:
-        keys = [cat.key(layer.layer_id, i) for i in range(layer.local_experts)]
-        hot = sorted((e for e in keys if e in resident), key=lambda e: (usage[e], e))
-        cold = sorted(
-            (e for e in keys if e not in resident), key=lambda e: (-usage[e], e)
-        )
-        for candidate, victim in zip(cold, hot):
-            gap = usage[candidate] - usage[victim]
-            if usage[candidate] >= cfg.min_usage and gap >= cfg.replacement_min_gain:
-                pairs.append((gap, layer.layer_id, candidate, victim))
+    """Independent host oracle for the rank-wide pool, without layer quotas."""
+    keys = range(cat.num_experts)
+    hot = sorted(resident, key=lambda e: (usage[e], e))
+    cold = sorted((e for e in keys if e not in resident), key=lambda e: (-usage[e], e))
     target = set(resident)
-    for _, _, candidate, victim in sorted(
-        pairs, key=lambda p: (-p[0], p[1], p[2], p[3])
-    )[: cfg.max_swaps]:
-        target.remove(victim)
-        target.add(candidate)
+    for candidate, victim in list(zip(cold, hot))[: cfg.max_swaps]:
+        gap = usage[candidate] - usage[victim]
+        if usage[candidate] >= cfg.min_usage and gap >= cfg.replacement_min_gain:
+            target.remove(victim)
+            target.add(candidate)
     return sorted(target)
 
 
@@ -98,24 +90,32 @@ class TestPeriodicLFU(unittest.TestCase):
             self.assertEqual(due.data_ptr(), address)
         torch.testing.assert_close(state.usage, torch.full((8,), 1.4))
 
-    def test_document_example_and_tie_at_global_limit(self):
+    def test_rank_wide_pairing_and_tie_at_global_limit(self):
         usage = [2, 8, 5, 3, 1, 7, 2, 4]
         resident = [0, 2, 4, 7]
         self.assertEqual(self.select(self.make_policy(), usage, resident), [1, 2, 5, 7])
         self.assertEqual(
-            self.select(self.make_policy(max_swaps=1), usage, resident), [1, 2, 4, 7]
+            self.select(self.make_policy(max_swaps=1), usage, resident), [0, 1, 2, 7]
+        )
+        # Equal-usage candidates and victims are ordered by canonical key across
+        # layers: candidate 1 replaces victim 0 before candidate 5 or victim 2.
+        self.assertEqual(
+            self.select(
+                self.make_policy(max_swaps=1), [0, 8, 0, 0, 0, 8, 0, 0], resident
+            ),
+            [1, 2, 4, 7],
         )
 
-    def test_layer_quotas_do_not_move_to_a_hotter_layer(self):
-        # Global pairing would evict keys 0 and 2; layer-local pairing cannot.
+    def test_hot_slots_move_across_layers_including_zero_resident_layers(self):
+        # The hotter second layer evicts both colder residents in the first.
         usage = [2, 1, 3, 1, 10, 20, 19, 11]
         self.assertEqual(
-            self.select(self.make_policy(), usage, [0, 2, 4, 7]), [0, 2, 5, 6]
+            self.select(self.make_policy(), usage, [0, 2, 4, 7]), [4, 5, 6, 7]
         )
-        # A layer without residents cannot admit even extremely hot experts.
+        # No per-layer reservation prevents a layer with zero residents entering.
         self.assertEqual(
             self.select(self.make_policy(), [100] * 4 + [0] * 4, [4, 5, 6, 7]),
-            [4, 5, 6, 7],
+            [0, 1, 2, 3],
         )
 
     def test_inclusive_additive_threshold_and_minimum_usage(self):
@@ -146,7 +146,7 @@ class TestPeriodicLFU(unittest.TestCase):
             self.assertEqual(state.update_due.item(), step == 4)
             policy.select_hot_set(state, slots, target)
             self.assertEqual(
-                target.tolist(), [1, 2, 5, 7] if step == 4 else [0, 2, 4, 7]
+                target.tolist(), [1, 4, 5, 7] if step == 4 else [0, 2, 4, 7]
             )
             policy.finish_step(state)
         torch.testing.assert_close(state.usage, counts.float() * 4 * 0.7)
@@ -222,7 +222,9 @@ class TestPeriodicLFU(unittest.TestCase):
         result = self.select(self.make_policy(cat), usage, resident)
         self.assertEqual(len(set(result) - set(resident)), 96)
         self.assertTrue(set(range(180, 240)).issubset(result))
-        self.assertEqual(sum(e < 120 for e in result), 60)
+        # The 96 victims are the lowest canonical keys among equally cold hot
+        # experts. All 60 higher-gain candidates precede the other layer's 36.
+        self.assertEqual(result, list(range(60, 96)) + list(range(156, 240)))
 
     def test_zero_full_empty_and_no_swap_rounds(self):
         for count, resident in ((8, []), (8, list(range(8))), (0, [])):
@@ -410,13 +412,13 @@ class TestTensorReplay(unittest.TestCase):
         for i in range(4):
             result = traced(*args[:4], enabled, *args[5:])
             self.assertEqual(
-                result[3].tolist(), [1, 2, 5, 7] if i == 3 else [0, 2, 4, 7]
+                result[3].tolist(), [1, 4, 5, 7] if i == 3 else [0, 2, 4, 7]
             )
             self.assertEqual(bool(result[4]), i == 3)
             self.assertFalse(bool(result[2]))
         torch.testing.assert_close(state.usage, counts.float() * 4 * 0.7)
         # Subsequent replay sees changed resident keys and changed route counts.
-        args[5].copy_(mapping([1, 2, 5, 7]))
+        args[5].copy_(mapping([1, 4, 5, 7]))
         counts.copy_(torch.tensor([20, 0, 0, 0, 20, 0, 0, 0]))
         for _ in range(4):
             result = traced(*args[:4], enabled, *args[5:])

@@ -503,7 +503,9 @@ class TestIntegration(unittest.TestCase):
                 )
                 policy.select_hot_set(state, slots, target)
                 policy.finish_step(state)
-            self.assertEqual(target.tolist(), [1, 2, 5, 7])
+            # Cross-layer LFU replaces tied cold incumbents globally by canonical
+            # key order; it does not reserve one eviction within each layer.
+            self.assertEqual(target.tolist(), [1, 4, 5, 7])
             return original_finalize(layers, cat, cfg, policy)
 
         backend.finalize = finalize

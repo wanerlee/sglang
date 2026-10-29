@@ -21,9 +21,9 @@ from sglang.srt.offloading.moe.npu.config import (
     NpuOffloadSettings,
     create_npu_offloader,
 )
-from sglang.srt.offloading.moe.runtime import BoundMoERuntime
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner
 from sglang.srt.offloading.moe.periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy
+from sglang.srt.offloading.moe.runtime import BoundMoERuntime
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -92,14 +92,17 @@ class TestNativePeriodicCache(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exactly once"):
             runtime.initialize_hot_cache([0, 2, 4, 7])
 
-    def test_four_native_steps_replace_within_layers_and_decay_once(self):
+    def test_four_native_steps_replace_across_layers_and_decay_once(self):
+        self.assembly.backend.settings.batch_log_interval = 1
         runtime = self.assembly.finalize()
         demand = {3: [0, 5, 0, 0], 4: [0, 0, 7, 0]}
         for _ in range(3):
             self.run_step(runtime, demand)
             self.assertEqual(runtime.residency.slot_to_key.tolist(), [0, 2, 4, 7])
         self.run_step(runtime, demand)
-        self.assertEqual(set(runtime.residency.slot_to_key.tolist()), {1, 2, 6, 7})
+        # Both victims have zero usage; the rank-wide tie break evicts keys 0
+        # and 2, even though both originally belonged to the same layer.
+        self.assertEqual(set(runtime.residency.slot_to_key.tolist()), {1, 4, 6, 7})
         self.assertEqual(int(runtime.cache_updates.policy_state.step_mod), 0)
         torch.testing.assert_close(
             runtime.cache_updates.policy_state.usage,
@@ -112,6 +115,8 @@ class TestNativePeriodicCache(unittest.TestCase):
         self.assertEqual(int(runtime.cache_stats.misses), 0)
 
     def test_assignment_statistics_count_repeated_routes_and_clear_per_batch(self):
+        # Disabled batch logging intentionally omits route-statistics kernels.
+        self.assembly.backend.settings.batch_log_interval = 1
         runtime = self.assembly.finalize()
         self.run_step(runtime, {3: [2, 3, 0, 0], 4: [0, 0, 5, 7]})
         stats = runtime.cache_stats
@@ -148,6 +153,7 @@ class TestNativePeriodicCache(unittest.TestCase):
             with runtime.forward_scope(owner, batch):
                 # Stand in for the already captured step nodes, without rerunning
                 # model hooks or marking a second eager step in forward_scope.
+                runtime.claim_decode_graph()
                 runtime.ops.begin_step(runtime.context)
                 runtime.cache_updates.emit_step_end(runtime.context)
             self.assertEqual(
@@ -315,6 +321,7 @@ class TestNativePeriodicCache(unittest.TestCase):
                         self.assertEqual(tensor[:, 0].tolist(), [30, 32, 40, 43])
                     # Stand in for replay's recorded nodes. The serving scope
                     # must not add a second policy step on exit.
+                    runtime.claim_decode_graph()
                     runtime.ops.begin_step(runtime.context)
                     runtime.cache_updates.emit_step_end(runtime.context)
                 self.assertEqual(
@@ -332,6 +339,9 @@ class TestNativePeriodicCache(unittest.TestCase):
                 with runtime.forward_scope(owner, batch):
                     with self.assertRaisesRegex(RuntimeError, "captured full graph"):
                         runtime._require_emission()
+                    # After checking the eager guard, stand in for the graph
+                    # replay required to complete a successful serving scope.
+                    runtime.claim_decode_graph()
         finally:
             owner.close()
 
