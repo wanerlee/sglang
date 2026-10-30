@@ -13,24 +13,9 @@ from ..transfer import (
     DeviceCopyPlan,
     HostCopyPlan,
     ImmediateCompletion,
-    JoinedCompletion,
     TransferTicket,
 )
-from .config import ExpertWave, Phase
-
-
-@dataclass(frozen=True)
-class ExecutionRequest:
-    layer_id: int
-    local_demand: Any
-    wave: ExpertWave
-    phase: Phase
-    # Explicit per-layer decode preparation; None preserves standalone planners.
-    layer_plan: Any = None
-
-    def __post_init__(self):
-        if self.layer_id < 0 or not isinstance(self.phase, Phase):
-            raise ValueError("An execution request needs a layer and supported phase")
+from .config import Phase
 
 
 @dataclass(frozen=True)
@@ -56,7 +41,6 @@ class WeightLease:
     manager_token: Any
     context_token: Any
     read_done: Any = None
-    transferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,12 +65,6 @@ class ExpertWeightAccess:
         self.device_ops = device_ops
         self._token = object()
 
-    def prepare_decode_layer(self, layer_id, local_demand, context):
-        return self.residency_ops.prepare_decode_layer(layer_id, local_demand, context)
-
-    def finish_decode_layer(self, layer_plan, context):
-        self.residency_ops.finish_decode_layer(layer_plan, context)
-
     def stage(self, request, context):
         if request.phase is not context.phase:
             raise ValueError("Execution request phase does not match context")
@@ -108,46 +86,6 @@ class ExpertWeightAccess:
         )
         context.retain(lease)
         return lease
-
-    def combine_prefill(self, leases, bindings, context, *, ready=None):
-        """Join submitted microbatches into the sealed large FFN group, without copy.
-
-        Bindings must be a validated view of those reservations. The pipeline
-        validates contiguous expert coverage/format; this helper transfers usage
-        rights and joins completion. Child leases cannot be consumed separately.
-        An optional ready ticket must fence every child copy/publication; only
-        an explicitly ordered backend may replace the individual dependencies.
-        """
-        require_prefill(context)
-        leases = tuple(leases)
-        if not leases or len({id(lease) for lease in leases}) != len(leases):
-            raise ValueError("A prefill group needs distinct nonempty leases")
-        for lease in leases:
-            self._check_lease(lease)
-            if lease.context_token is not context.invocation_id:
-                raise ValueError("Cannot combine leases from different invocations")
-        if ready is not None and not isinstance(ready, TransferTicket):
-            raise TypeError("Prefill group readiness must be a TransferTicket")
-        ticket = TransferTicket(
-            (
-                ready.completion
-                if ready is not None
-                else JoinedCompletion(lease.ticket.completion for lease in leases)
-            ),
-            (*leases, ready) if ready is not None else leases,
-        )
-        grouped = WeightLease(
-            tuple(r for lease in leases for r in lease.reservations),
-            bindings,
-            ticket,
-            self._token,
-            context.invocation_id,
-        )
-        context.retain(grouped)
-        context.retain_completion(ticket)
-        for lease in leases:
-            lease.transferred = True
-        return grouped
 
     def wait_ready(self, lease, compute_stream, *, context):
         self._check_lease(lease)
@@ -185,8 +123,6 @@ class ExpertWeightAccess:
     def _check_lease(self, lease):
         if lease.manager_token is not self._token:
             raise ValueError("Foreign weight lease")
-        if lease.transferred:
-            raise RuntimeError("Weight lease was transferred into a prefill group")
         if lease.read_done is not None:
             raise RuntimeError("Weight lease already has a final reader")
 

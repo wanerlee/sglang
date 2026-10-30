@@ -1,5 +1,7 @@
 # Decode 中 ScatterElements 的用途与耗时分析
 
+> 历史设计记录：本文中的 wave 调度、分组配置及相关接口已在分层分支删除。当前执行方式和配置迁移见[分层实现说明](../../../../../../../scripts/moe_layer/README.md)。缓存策略设计仍供参考。
+
 代码基线：`codex/moe-offload-dev-20261027` / `531e228a`。
 
 第 1–3 节解释优化前的七次 scatter；第 4 节记录 `61bec1e8` 的共享 slot 压紧，

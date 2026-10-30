@@ -40,9 +40,6 @@ class NpuOffloadSettings:
     workspace_limit_bytes: int
     metadata_limit_bytes: int
     max_dispatch_rows: int
-    prefill_group_size: int = 8
-    prefill_microbatch_size: int = 1
-    prefill_max_inflight: int = 1
     native_extension_directory: str | None = None
     offline_stats_path: str | None = None
     offline_model_id: str | None = None
@@ -54,16 +51,15 @@ class NpuOffloadSettings:
     batch_log_interval: int = 1
     batch_log_capacity: int = 64
     version: int = 1
-    prefill_mode: str = "wave"
-    decode_mode: str = "wave"
+    prefill_mode: str = "layer"
+    decode_mode: str = "layer"
     layer_profile: bool = False
 
     def __post_init__(self):
-        if self.prefill_mode not in ("wave", "layer") or self.decode_mode not in (
-            "wave",
-            "layer",
-        ):
-            raise ValueError("prefill_mode/decode_mode must be wave or layer")
+        if self.prefill_mode != "layer" or self.decode_mode != "layer":
+            raise ValueError(
+                "Wave execution was removed; prefill_mode/decode_mode must be layer"
+            )
         if type(self.layer_profile) is not bool:
             raise ValueError("layer_profile must be boolean")
         if type(self.version) is not int or self.version != 1:
@@ -74,9 +70,6 @@ class NpuOffloadSettings:
             "workspace_limit_bytes",
             "metadata_limit_bytes",
             "max_dispatch_rows",
-            "prefill_group_size",
-            "prefill_microbatch_size",
-            "prefill_max_inflight",
             "batch_log_capacity",
         ):
             value = getattr(self, name)
@@ -98,16 +91,6 @@ class NpuOffloadSettings:
             or not self.native_extension_directory
         ):
             raise ValueError("native_extension_directory must be a nonempty path")
-        if (
-            self.prefill_mode == "wave"
-            and self.prefill_microbatch_size > self.prefill_group_size
-        ):
-            raise ValueError("Prefill microbatch cannot exceed its FFN group")
-        if (
-            self.prefill_mode == "wave"
-            and self.prefill_group_size > self.execution_slots
-        ):
-            raise ValueError("Execution bank cannot hold the prefill FFN group")
 
     @classmethod
     def from_file(cls, path):

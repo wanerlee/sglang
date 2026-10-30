@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ExecutionContext:
     """Thread-safe keepalives and fresh completion events for one submission.
 
-    Stop/join host workers before finish(). The runtime failure path must drain
+    The runtime failure path must drain
     every device stream, including partially submitted native calls.
     On a failed drain the context deliberately keeps all resources alive.
     Capture contexts remain pinned by their graph bucket, not by replay tickets.
@@ -56,16 +56,13 @@ class ExecutionContext:
         self._frontiers = {}
         self._completion_streams = {}
         self._disposed = False
-        self._workers = 0
         self._closed = False
         self._completion = None
 
     def retain(self, resource):
         with self._lock:
             if self._closed:
-                raise RuntimeError(
-                    "Invocation already closed; join workers before finish"
-                )
+                raise RuntimeError("Invocation already closed")
             if (
                 not isinstance(resource, (TransferTicket, Completion))
                 and self._temporary_resources
@@ -130,21 +127,9 @@ class ExecutionContext:
             if self._completion_streams.get(id(item)) != id(stream):
                 item.wait_on(stream)
 
-    def worker_started(self):
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Cannot start workers after invocation seal")
-            self._workers += 1
-
-    def worker_finished(self):
-        with self._lock:
-            if self._workers <= 0:
-                raise RuntimeError("Unbalanced worker completion")
-            self._workers -= 1
-
     @contextmanager
     def temporary_scope(self):
-        """Release submission-thread wave/layer temporaries in prefill and decode.
+        """Release submission-thread layer temporaries in prefill and decode.
 
         Only use after joining off-stream readers onto compute_stream. Ordinary
         tensor allocation/free then follows the same allocator rules as resident
@@ -189,8 +174,6 @@ class ExecutionContext:
                 raise RuntimeError("Invocation already finished")
             if self._temporary_resources:
                 raise RuntimeError("Close temporary scopes before finishing invocation")
-            if self._workers:
-                raise RuntimeError("Stop and join workers before finishing invocation")
             # Replay requires fresh events. When neither milestone was supplied,
             # both describe the same compute frontier and share one record.
             output_ready = output_ready or self.record_compute_completion()
@@ -241,12 +224,10 @@ class ExecutionContext:
             self._dispose()
 
     def dispose_after_drain(self, *, graph_destroyed=False):
-        """Internal teardown path after workers stop and every stream drains."""
+        """Internal teardown path after submissions stop and every stream drains."""
         with self._lock:
             if self._disposed:
                 return
-            if self._workers:
-                raise RuntimeError("Join workers before releasing resources")
             if self.capturing and not graph_destroyed:
                 raise RuntimeError(
                     "Destroy the captured graph before releasing resources"
@@ -666,11 +647,7 @@ class BoundMoERuntime:
         if context.phase is Phase.PREFILL:
             if context.capturing:
                 raise RuntimeError("Prefill layer-start cannot run during capture")
-            # Shared A/B storage cannot overwrite the previous layer's reader.
             program = self.layer_programs[layer_id].prefill
-            if not getattr(program, "manages_layer_dependencies", False):
-                frontier = context.record_compute_completion()
-                frontier.completion.wait_on(context.copy_stream)
             program.layer_start(layer_id, context)
 
     def run_layer(self, layer_id, hidden_states, routing, *, pre_quant_input=None):

@@ -13,7 +13,7 @@ from test_npu_backend import Assembly
 from sglang.srt.offloading.moe.cache_metadata import CacheRouteStats
 from sglang.srt.offloading.moe.config import Phase
 from sglang.srt.offloading.moe.diagnostics import BatchDiagnostics
-from sglang.srt.offloading.moe.execution import ExecutionRequest
+from sglang.srt.offloading.moe.layer_execution import LayerExecutionRequest
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -242,21 +242,17 @@ class TestBatchDiagnostics(unittest.TestCase):
                 # Stand in for the exact same captured nodes in both runs.
                 runtime.ops.begin_step(context)
                 spec = assembly.catalog.offloaded_layers[0]
-                for wave in runtime.layer_programs[spec.layer_id].decode_waves:
-                    access = runtime.cache_updates.access
-                    lease = access.stage(
-                        ExecutionRequest(
-                            spec.layer_id,
-                            torch.tensor([2, 3, 0, 0]),
-                            wave,
-                            Phase.DECODE,
-                        ),
-                        context,
-                    )
-                    access.wait_ready(lease, context.compute_stream, context=context)
-                    access.release_after(
-                        lease, context.record_compute_completion(), context
-                    )
+                access = runtime.cache_updates.access
+                lease = access.stage(
+                    LayerExecutionRequest(
+                        spec.layer_id, torch.tensor([2, 3, 0, 0]), Phase.DECODE
+                    ),
+                    context,
+                )
+                access.wait_ready(lease, context.compute_stream, context=context)
+                access.release_after(
+                    lease, context.record_compute_completion(), context
+                )
                 runtime.cache_updates.emit_step_end(context)
             keys = runtime.residency.slot_to_key.clone()
             frequency = runtime.cache_updates.policy_state.frequency.clone()

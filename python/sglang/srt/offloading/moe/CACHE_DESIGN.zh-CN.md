@@ -1,5 +1,7 @@
 # MoE Cache 与框架适配实现总结
 
+> 历史设计记录：本文中的 wave 调度、分组配置及相关接口已在分层分支删除。当前执行方式和配置迁移见[分层实现说明](../../../../../scripts/moe_layer/README.md)。缓存策略设计仍供参考。
+
 > 历史设计：当前 API 与后续简化见[精简记录](doc/SIMPLIFICATION_20261025.zh-CN.md)和[缓存契约](doc/CACHE_IMPLEMENTATION.zh-CN.md)。
 
 > **历史设计快照**：正文保留当时方案与接口，其中重复缓存栈、phase controller、旧策略 API

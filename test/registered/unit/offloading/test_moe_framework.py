@@ -15,7 +15,6 @@ from sglang.srt.offloading.moe.config import (
     ExpertLayerSpec,
     MoEOffloadConfig,
     Phase,
-    fixed_waves,
 )
 from sglang.srt.offloading.moe.interfaces import (
     ForwardCompletion,
@@ -26,7 +25,6 @@ from sglang.srt.offloading.moe.offloader import DeepSeekV4Adapter, MoEOffloaderV
 from sglang.srt.offloading.moe.owner import MoEOffloadOwner, OwnerState
 from sglang.srt.offloading.moe.periodic_lfu import PeriodicLFUConfig, PeriodicLFUPolicy
 from sglang.srt.offloading.moe.policy import TensorLFUPolicy
-from sglang.srt.offloading.moe.programs import DispatchOnceProgram
 from sglang.srt.offloading.moe.resources import (
     Allocation,
     AllocationLedger,
@@ -593,54 +591,6 @@ class TestIntegration(unittest.TestCase):
         facade.close()
         self.assertIsNone(facade._runtime)
         self.assertEqual(backend.runtime.actions, ["close"])
-
-    def test_dispatch_once_order_and_single_common_tail(self):
-        calls = []
-
-        class Dispatch:
-            def dispatch(self, hidden, routing, context):
-                calls.append("D")
-                return object()
-
-            def combine(self, local, context):
-                calls.append("C")
-                return local
-
-            def finish(self, result, context):
-                calls.append("tail")
-                return result
-
-        class Layout:
-            def bind(self, dispatched, context):
-                return []
-
-            def select_wave(self, layout, wave, context):
-                return wave.index
-
-            def write_wave(self, layout, wave, output, context):
-                layout.append(output)
-
-            def combine_input(self, layout, context):
-                return sum(layout)
-
-        class Local:
-            def run(self, layer, dispatched, wave, context):
-                calls.append(("F", wave.index))
-                return dispatched + 1
-
-        waves = fixed_waves(5, 2, bank_count=2)
-        self.assertEqual(
-            [(w.local_start, w.local_end, w.bank) for w in waves],
-            [(0, 2, 0), (2, 4, 1), (4, 5, 0)],
-        )
-        program = DispatchOnceProgram(
-            waves, Dispatch(), Local(), Layout(), local_experts=5
-        )
-        context = SimpleNamespace(
-            phase=Phase.DECODE, capturing=True, temporary_scope=nullcontext
-        )
-        self.assertEqual(program.run(3, None, None, context), 6)
-        self.assertEqual(calls, ["D", ("F", 0), ("F", 1), ("F", 2), "C", "tail"])
 
 
 if __name__ == "__main__":

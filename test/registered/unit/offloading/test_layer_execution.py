@@ -10,12 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import test_native_periodic_cache as periodic_tests
 import torch
-from test_moe_decode_layer_plan import Context, Fence, TensorTrace, fixture, load_hot
+from moe_test_utils import Context, Fence, TensorTrace, load_hot
 from test_npu_backend import Assembly
 
-from sglang.srt.offloading.moe.config import Phase
+from sglang.srt.offloading.moe.config import ExpertCatalog, ExpertLayerSpec, Phase
 from sglang.srt.offloading.moe.layer_execution import (
     BoundExecutionLayer,
     LayerExecutionRequest,
@@ -35,17 +34,34 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestLayerPlanner(unittest.TestCase):
+    def test_bindings_reject_overlapping_banks_offsets_and_duplicate_layers(self):
+        catalog = ExpertCatalog(
+            (ExpertLayerSpec(3, 4, 1, 0), ExpertLayerSpec(4, 4, 1, 0))
+        )
+        state = ResidencyState.allocate(8, 2, 6, "cpu")
+        for records in (
+            (BoundExecutionLayer(3, 0, 0, None), BoundExecutionLayer(4, 1, 2, None)),
+            (BoundExecutionLayer(3, 0, 0, None), BoundExecutionLayer(4, 0, 2, None)),
+            (BoundExecutionLayer(3, 0, 0, None), BoundExecutionLayer(3, 0, 0, None)),
+        ):
+            with self.subTest(records=records), self.assertRaises(ValueError):
+                TensorResidencyOps(
+                    state, catalog, execution_layers=records, update_bindings=None
+                )
+
     def test_recorded_layer_plan_reads_changed_demand_and_hot_mapping(self):
-        old, _, _, _ = fixture(experts=4, width=4, hot=2)
-        state = old.state
-        binding = old.update_bindings
+        catalog = ExpertCatalog((ExpertLayerSpec(3, 4, 1, 0),))
+        state = ResidencyState.allocate(4, 2, 4, "cpu")
+        binding = SimpleNamespace(
+            error_status=torch.zeros((), dtype=torch.int32),
+            hot_generations=state.slot_generation,
+        )
         ops = TensorResidencyOps(
             state,
-            old.catalog,
-            execution_waves=(),
+            catalog,
             update_bindings=binding,
             execution_layers=(BoundExecutionLayer(3, 0, 0, binding),),
-            error_status=old.error_status,
+            error_status=binding.error_status,
         )
         load_hot(state, [0, 1])
         demand = torch.tensor([1, 0, 2, 0])
@@ -90,66 +106,32 @@ class TestLayerPlanner(unittest.TestCase):
             )
         self.assertFalse(any("_local_scalar_dense" in str(f) for f, *_ in trace.calls))
 
-    def test_layer_matches_partitioned_sources_counts_and_generation(self):
-        for hot in (0, 3):
-            for counts in ([0] * 7, [1, 0, 3, 0, 1, 5, 2], [1] * 7):
-                old, _, waves, old_ctx = fixture(experts=7, width=3, hot=hot)
-                state = ResidencyState.allocate(7, hot, 7, "cpu")
-                error = torch.zeros((), dtype=torch.int32)
-                binding = SimpleNamespace(
-                    error_status=error, hot_generations=state.slot_generation
-                )
-                new = TensorResidencyOps(
-                    state,
-                    old.catalog,
-                    execution_waves=(),
-                    update_bindings=binding,
-                    execution_layers=(BoundExecutionLayer(3, 0, 0, binding),),
-                    error_status=error,
-                )
-                keys = [0, 3, 6] if hot else []
-                load_hot(old.state, keys)
-                load_hot(state, keys)
-                old.begin_step(old_ctx)
-                ctx = Context()
-                new.begin_step(ctx)
-                demand = torch.tensor(counts)
-                from sglang.srt.offloading.moe.execution import ExecutionRequest
+    def test_shipped_configs_use_layers_and_removed_wave_knobs_fail(self):
+        root = Path(__file__).resolve().parents[4]
+        for relative in (
+            "scripts/moe_offload_a3.json",
+            "python/sglang/srt/offloading/moe/npu/examples/v4.json",
+        ):
+            settings = NpuOffloadSettings.from_file(root / relative)
+            self.assertEqual(
+                (settings.prefill_mode, settings.decode_mode), ("layer", "layer")
+            )
+        import tempfile
 
-                plans = []
-                for wave in waves:
-                    p = old.resolve_execution(
-                        ExecutionRequest(3, demand, wave, Phase.DECODE), old_ctx
-                    )
-                    plans.append(p.copy_plan)
-                    old.publish_execution(p, old_ctx.copied(), old_ctx)
-                    old.finish_execution(
-                        p, old_ctx.record_compute_completion(), old_ctx
-                    )
-                result = new.resolve_execution(
-                    LayerExecutionRequest(3, demand, Phase.DECODE), ctx
-                )
-                for name in (
-                    "source_kind",
-                    "source_index",
-                    "valid",
-                    "expected_generation",
-                ):
-                    torch.testing.assert_close(
-                        getattr(result.copy_plan, name),
-                        torch.cat([getattr(p, name) for p in plans]),
-                    )
-                torch.testing.assert_close(
-                    state.step_access_count, old.state.step_access_count
-                )
-                self.assertFalse(state.execution_valid.any())
-                with self.assertRaises(RuntimeError):
-                    new.prepare_update(torch.full((hot,), -1), ctx)
-                new.publish_execution(result, ctx.copied(), ctx)
-                torch.testing.assert_close(state.execution_valid, demand > 0)
-                new.finish_execution(result, ctx.record_compute_completion(), ctx)
-                self.assertEqual(new._waves, {})
-                self.assertEqual(new._active_execution, {})
+        with tempfile.TemporaryDirectory() as folder:
+            data = json.loads((root / "scripts/moe_offload_a3.json").read_text())
+            data["prefill_group_size"] = 8
+            path = Path(folder) / "old.json"
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(
+                ValueError, "Unknown MoE offload settings.*prefill_group_size"
+            ):
+                NpuOffloadSettings.from_file(path)
+            del data["prefill_group_size"]
+            data["decode_mode"] = "wave"
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "Wave execution was removed"):
+                NpuOffloadSettings.from_file(path)
 
     def test_stale_cache_mapping_suppresses_whole_layer(self):
         a = Assembly(local_experts=4, slots=4, layer_count=2)
@@ -195,18 +177,6 @@ class TestLayerPlanner(unittest.TestCase):
         self.assertEqual(NpuOffloadSettings(**base).prefill_mode, "layer")
         with self.assertRaises(ValueError):
             NpuOffloadSettings(**dict(base, decode_mode="invalid"))
-
-    def test_example_changes_only_execution_modes_and_profile(self):
-        root = Path(__file__).resolve().parents[4]
-        baseline = json.loads((root / "scripts/moe_offload_a3.json").read_text())
-        path = root / "scripts/moe_offload_a3_layer.json"
-        updated = json.loads(path.read_text())
-        for key, value in dict(
-            prefill_mode="layer", decode_mode="layer", layer_profile=True
-        ).items():
-            self.assertEqual(updated.pop(key), value)
-        self.assertEqual(updated, baseline)
-        self.assertEqual(NpuOffloadSettings.from_file(path).decode_mode, "layer")
 
 
 class TestLayerPrefetch(unittest.TestCase):
@@ -354,7 +324,7 @@ class TestLayerLayout(unittest.TestCase):
                 )
                 ctx = Context()
                 ctx.phase, ctx.capturing = phase, phase is Phase.DECODE
-                d = experts.NPUDispatch(raw, ctx.copied(), 256, object())
+                d = experts.NPUDispatch(raw, 256, object())
                 with patch.object(
                     experts, "_compute_scope", return_value=nullcontext()
                 ):
@@ -416,9 +386,7 @@ class TestLayerAssembly(unittest.TestCase):
                     num_recv_tokens_per_expert=counts,
                     masked_m=torch.tensor(counts),
                 )
-                return experts.NPUDispatch(
-                    raw, context.record_compute_completion(), width, object()
-                )
+                return experts.NPUDispatch(raw, width, object())
 
             def combine(self, layout, context):
                 calls.append("combine")
@@ -504,44 +472,8 @@ class TestLayerAssembly(unittest.TestCase):
             torch.testing.assert_close(t, saved[n])
         torch.testing.assert_close(runtime.residency.key_to_slot, mapping)
         self.assertEqual(runtime._decode_step_mod, 2)
-        self.assertEqual(runtime.ops._waves, {})
         self.assertEqual(len(a.backend.format.banks), 2)  # No extra weight allocations.
         owner.close()
-
-
-class TestLayerPeriodicCache(periodic_tests.TestNativePeriodicCache):
-    """Run the existing periodic-cache/phase contracts with layer decode."""
-
-    def setUp(self):
-        super().setUp()
-        self.assembly.backend.settings.decode_mode = "layer"
-
-    def run_step(self, runtime, demand, *, enabled=True):
-        context = runtime._new_context(Phase.DECODE, capturing=True)
-        runtime._context = context
-        runtime.residency.update_enabled.fill_(enabled)
-        runtime.ops.begin_step(context)
-        try:
-            access = runtime.cache_updates.access
-            for spec in self.assembly.catalog.offloaded_layers:
-                lease = access.stage(
-                    LayerExecutionRequest(
-                        spec.layer_id,
-                        torch.tensor(demand.get(spec.layer_id, [0] * 4)),
-                        Phase.DECODE,
-                    ),
-                    context,
-                )
-                access.wait_ready(lease, context.compute_stream, context=context)
-                access.release_after(
-                    lease, context.record_compute_completion(), context
-                )
-            tail = runtime.cache_updates.emit_step_end(context)
-            result = context.finish(residency_ready=tail)
-            result.resources_idle.completion.synchronize()
-            context.dispose_completed(graph_destroyed=True)
-        finally:
-            runtime._context = None
 
 
 if __name__ == "__main__":

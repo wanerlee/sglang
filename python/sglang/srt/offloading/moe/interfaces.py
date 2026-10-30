@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .runtime import BoundMoERuntime
 
-from ..transfer import Completion, TransferTicket
+from ..transfer import TransferTicket
 
 
 @dataclass(frozen=True)
@@ -102,19 +102,11 @@ class CachePolicy(ABC):
 class ResidencyOps(ABC):
     """Device lowering; maps, counters and plans have fixed addresses/capacity."""
 
-    def prepare_decode_layer(self, layer_id, local_demand, context):
-        """Explicitly prepare one invocation's full local expert source plan."""
-        raise NotImplementedError("Layer decode preparation is not implemented")
-
-    def finish_decode_layer(self, layer_plan, context):
-        """Close the preparation scope, including after partial submission."""
-        raise NotImplementedError("Layer decode preparation is not implemented")
-
     @abstractmethod
     def resolve_execution(self, local_demand, context):
         """Return MaterializationPlan; misses do not imply hot admission.
 
-        Accept ExecutionRequest; include plan-ready, old target readers and source
+        Accept LayerExecutionRequest; include plan-ready, old target readers and source
         readiness in copy_dependencies. Decode plan readiness also covers the
         preceding compute frontier: even different banks must not prefetch F.
         Keep source readers pinned through copy.
@@ -156,22 +148,6 @@ class WholeMoEProgram(ABC):
         """Full routed-expert execution; shared experts stay outside this program."""
 
 
-class LocalExpertProgram(ABC):
-    def prepare_layer(self, layer, layout, context):
-        """Optional invocation preparation after dispatch/layout binding."""
-        return None
-
-    def finish_layer(self, prepared, context):
-        """Close optional preparation without synchronizing device work."""
-
-    def run_prepared(self, layer, dispatch_output, wave, context, prepared):
-        raise NotImplementedError("Prepared local execution is not implemented")
-
-    @abstractmethod
-    def run(self, layer, dispatch_output, wave, context):
-        """Prepare fixed bank bindings, wait for readiness, run F, record readers."""
-
-
 class MoEDispatcher(ABC):
     """Common D/C boundary; preserve EP identity and original routing weights.
 
@@ -183,16 +159,6 @@ class MoEDispatcher(ABC):
     @abstractmethod
     def dispatch(self, hidden_states, routing, context):
         pass
-
-    def dispatch_completion(self, dispatched, context) -> Completion:
-        """Cover actual receive readiness, including communication streams.
-
-        Required by prefill feedback. Python dispatch returning is not completion.
-        Static schedules retain compatibility without implementing this method.
-        """
-        raise NotImplementedError(
-            "Dispatch completion is required for prefill feedback"
-        )
 
     @abstractmethod
     def combine(self, local_output, context):
@@ -224,24 +190,16 @@ class DispatchLayoutAdapter(ABC):
         """
 
     @abstractmethod
-    def select_wave(self, layout, wave, context):
-        """Return LocalExpertProgram input for [local_start, local_end).
-
-        Preserve scales, counts and inverse row mapping; bank lanes are local to
-        F and must not change EP IDs. Support empty waves and the partial tail.
-        """
+    def select_layer(self, layout, context):
+        """Return the full expert-grouped input, masking fixed decode padding."""
 
     @abstractmethod
-    def write_wave(self, layout, wave, local_output, context):
-        """Place F output at its original receive rows, without top-k weighting.
-
-        Establish dependencies before reusing per-wave input/output scratch.
-        This assembles the full combine input; it is not token accumulation.
-        """
+    def write_layer(self, layout, local_output, context):
+        """Place full-layer F output in the original receive layout."""
 
     @abstractmethod
     def combine_input(self, layout, context):
-        """Join all wave writes; return full output with original D metadata.
+        """Finish the full-layer output; return full output with original D metadata.
 
         Preserve the backend's weighting convention without applying weights a
         second time. Keep layout storage live until combine finishes reading it.

@@ -279,7 +279,7 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
             [
                 sys.executable,
                 "-c",
-                "import json, logging, logging.config, sys; logging.config.dictConfig(json.load(open(sys.argv[1]))); logging.getLogger('sglang.srt.offloading.moe.programs').debug('moe debug visible'); logging.getLogger('unrelated').debug('unrelated debug hidden')",
+                "import json, logging, logging.config, sys; logging.config.dictConfig(json.load(open(sys.argv[1]))); logging.getLogger('sglang.srt.offloading.moe.layer_programs').debug('moe debug visible'); logging.getLogger('unrelated').debug('unrelated debug hidden')",
                 config,
             ],
             capture_output=True,
@@ -392,14 +392,17 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
                     json.dumps({"model_type": "deepseek_v4", "n_routed_experts": width})
                 )
                 code, output = self.run_script(
-                    WORLD_SIZE=str(width), ATTN_DP_SIZE=str(width),
+                    WORLD_SIZE=str(width),
+                    ATTN_DP_SIZE=str(width),
                     ASCEND_RT_VISIBLE_DEVICES="",
                 )
                 self.assertEqual(code, 0, output)
                 arguments = self.server_result()["args"]
                 for flag, value in (
-                    ("--tp-size", str(width)), ("--ep-size", str(width)),
-                    ("--attn-dp-size", str(width)), ("--dp-size", "1"),
+                    ("--tp-size", str(width)),
+                    ("--ep-size", str(width)),
+                    ("--attn-dp-size", str(width)),
+                    ("--dp-size", "1"),
                     ("--moe-dp-size", "1"),
                 ):
                     self.assertEqual(arguments[arguments.index(flag) + 1], value)
@@ -411,7 +414,9 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
 
     def test_partial_attention_dp_dry_run_does_not_create_logs(self):
         code, output = self.run_script(
-            "--dry-run", WORLD_SIZE="16", ATTN_DP_SIZE="4",
+            "--dry-run",
+            WORLD_SIZE="16",
+            ATTN_DP_SIZE="4",
             ASCEND_RT_VISIBLE_DEVICES="",
         )
         self.assertEqual(code, 0, output)
@@ -422,8 +427,11 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
 
     def test_graph_buckets_cover_attention_tp_when_concurrency_is_smaller(self):
         code, output = self.run_script(
-            "--dry-run", WORLD_SIZE="16", ATTN_DP_SIZE="1",
-            ASCEND_RT_VISIBLE_DEVICES="", MAX_RUNNING_REQUESTS="8",
+            "--dry-run",
+            WORLD_SIZE="16",
+            ATTN_DP_SIZE="1",
+            ASCEND_RT_VISIBLE_DEVICES="",
+            MAX_RUNNING_REQUESTS="8",
         )
         self.assertEqual(code, 0, output)
         self.assertIn("--cuda-graph-bs-decode 1 2 4 8 16", output)
@@ -435,13 +443,16 @@ os.execv(REAL_PYTHON, [REAL_PYTHON] + sys.argv[1:])
         for width, dp in (("16", "3"), ("8", "16"), ("8", "0"), ("8", "-1")):
             with self.subTest(width=width, dp=dp):
                 code, output = self.run_script(
-                    "--dry-run", WORLD_SIZE=width, ATTN_DP_SIZE=dp,
+                    "--dry-run",
+                    WORLD_SIZE=width,
+                    ATTN_DP_SIZE=dp,
                     ASCEND_RT_VISIBLE_DEVICES="",
                 )
                 self.assertNotEqual(code, 0)
                 self.assertIn("ATTN_DP_SIZE", output)
         self.assertFalse(self.build_marker.exists())
         self.assertFalse(self.server_output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

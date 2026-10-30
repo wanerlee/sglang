@@ -4,42 +4,33 @@
 `ce4b5c8970cdbcd9fa5d49649c5894a5cee707fa`，开发分支为
 `codex/moe-layer-execution`。未合入 BS1 专用实验分支。
 
-本版本增加独立的整层执行路径。原有 wave 路径仍是默认值，便于回归和对照。
+本分支仅保留整层执行路径。原 wave 调度器、分组拼接和相关 UT 已清理。
 CPU 测试覆盖调度、权重来源、缓存策略、阶段切换与失败处理；尚未验证真实 NPU
 上的算子精度、graph capture/replay、性能和显存峰值。
 
 ## 开启方式
 
-在**当前实际使用的 offload JSON** 中增加以下字段，保留原来的缓存参数、
-offline profile、内存预算和并行配置：
+本分支默认 prefill/decode 均为 `layer`。`prefill_mode` 和 `decode_mode`
+可省略，显式填写时只能为 `layer`；填写 `wave` 会报错。
 
-```json
-{
-  "prefill_mode": "layer",
-  "decode_mode": "layer",
-  "layer_profile": true
-}
-```
+从旧配置迁移时删除 `prefill_group_size`、`prefill_microbatch_size`、
+`prefill_max_inflight`，保留实际使用的缓存参数、offline profile 和内存预算。
+采集时可增加 `"layer_profile": true`，开启 CPU 提交范围标记；计时基准可关闭。
 
-上面只是需要增加的字段，不能作为完整配置文件。`prefill_mode` 和 `decode_mode`
-分别可设为 `layer` 或 `wave`，可逐项 A/B。`layer_profile` 开启 CPU 提交范围标记；
-计时基准可关闭，采集 trace 时开启。
-
-仓库示例 `scripts/moe_offload_a3_layer.json` 与 `scripts/moe_offload_a3.json`
-仅相差这三个字段。它保留示例的 50% Hot 容量、初始化 profile、周期 LFU 参数，
-不代表你的线上配置。使用现有启动脚本时将 `MOE_OFFLOAD_CONFIG` 指向新 JSON；
-使用 `launch_unified.sh` 时更换 `--moe-offload-config` 的路径即可。
+仓库配置仍使用 `scripts/moe_offload_a3.json`，重复的 `_layer.json` 已删除。
+现有启动脚本通过 `MOE_OFFLOAD_CONFIG` 指向该 JSON；使用 `launch_unified.sh`
+时相应修改 `--moe-offload-config` 路径。示例的缓存容量和初始化 profile 不代表线上配置。
 
 例如在已验证可启动的 16 die 环境，沿用其环境变量和模型路径：
 
 ```bash
-MOE_OFFLOAD_CONFIG="$PWD/scripts/moe_offload_a3_layer.json" \
+MOE_OFFLOAD_CONFIG="$PWD/scripts/moe_offload_a3.json" \
 WORLD_SIZE=16 ATTN_DP_SIZE=2 \
 bash scripts/launch_moe_offload_npu.sh --dry-run
 ```
 
 核对后去掉 `--dry-run`。仍需设置 `MODEL_PATH`，并沿用已经验证的
-`MEM_FRACTION_STATIC`、chunk、context 等值。没有新增启动参数或修改原脚本默认值。
+`MEM_FRACTION_STATIC`、chunk、context 等值。配置默认使用整层执行。
 保留 `--disable-overlap-schedule`、`--disable-shared-experts-fusion`；
 prefill graph 仍关闭，decode 仍走原有 graph 后端。不能据此认定 eager decode 已受支持。
 
@@ -103,7 +94,7 @@ Prefill 沿用原有 Hot 借用机制：先快照，切回 decode 时恢复原�
 ## NPU 验证要读什么
 
 1. 先在同一代码提交、模型、TP/EP/attention DP、实际 `toks`、缓存配置和采集窗口下，
-   对比 `wave/wave`、`layer/wave`、`layer/layer`。保存启动日志和显存峰值。
+   对比当前分层版本与原提交 `8b5455f95d` 的 `wave/wave`。保存启动日志和显存峰值。
 2. 做连续两次 prefill → decode、空接收 rank、不同 decode batch、至少跨越两个 LFU
    更新周期的正确性检查。核对输出/logits 误差、graph replay 与 cache hit/eviction 计数。
    CPU 替身测试不代表量化 GMM 改变分组后一定达到同样的数值误差。

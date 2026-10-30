@@ -16,11 +16,10 @@ import torch
 from sglang.srt.offloading.moe.config import (
     ExpertCatalog,
     ExpertLayerSpec,
-    ExpertWave,
     MoEOffloadConfig,
     Phase,
 )
-from sglang.srt.offloading.moe.execution import ExecutionRequest
+from sglang.srt.offloading.moe.layer_execution import LayerExecutionRequest
 from sglang.srt.offloading.moe.npu import backend as npu_backend
 from sglang.srt.offloading.moe.npu import experts as npu_experts
 from sglang.srt.offloading.moe.npu import native_acl
@@ -251,7 +250,8 @@ class DeviceOps:
 class Assembly:
     """Native seams are scoped; all metadata/ownership code is the real code."""
 
-    def __init__(self, ratio=0.5, slots=4, group=2, layer_count=3, local_experts=5):
+    def __init__(self, ratio=0.5, slots=None, layer_count=3, local_experts=5):
+        slots = 2 * local_experts if slots is None else slots
         self.events, self.bindings, self.builds = [], [], []
         self.catalog = ExpertCatalog(
             tuple(
@@ -265,12 +265,9 @@ class Assembly:
         self.policy = TensorLFUPolicy()
         backend = self.backend = NpuMoEBackend.__new__(NpuMoEBackend)
         backend.settings = SimpleNamespace(
-            prefill_mode="wave",
-            decode_mode="wave",
+            prefill_mode="layer",
+            decode_mode="layer",
             layer_profile=False,
-            prefill_group_size=group,
-            prefill_microbatch_size=1,
-            prefill_max_inflight=2,
             max_dispatch_rows=32,
             batch_log_interval=0,
             batch_log_capacity=64,
@@ -455,14 +452,14 @@ class NpuBackendAssemblyTests(unittest.TestCase):
                     int(15 * ratio) * Format.expert_nbytes,
                 )
                 self.assertEqual(
-                    usage[ResourceKind.EXECUTION_WEIGHTS], 4 * Format.expert_nbytes
+                    usage[ResourceKind.EXECUTION_WEIGHTS], 10 * Format.expert_nbytes
                 )
                 self.assertEqual(usage[ResourceKind.WORKSPACE], 32)
                 self.assertEqual(len(assembly.backend.format.banks), 2)
-                self.assertEqual(len(assembly.bindings), 7)  # tail + 2 waves per layer
                 self.assertEqual(
-                    [x.capacity for x in assembly.bindings[1:]], [4, 1] * 3
-                )
+                    len(assembly.bindings), 4
+                )  # cache update + one layer binding each
+                self.assertEqual([x.capacity for x in assembly.bindings[1:]], [5] * 3)
                 self.assertTrue(
                     all(
                         result.layout is assembly.builds[0][1].layout
@@ -492,60 +489,14 @@ class NpuBackendAssemblyTests(unittest.TestCase):
         for _, program, _ in assembly.builds:
             self.assertIs(program.residency, runtime.ops)
 
-    def test_prefill_bank_offsets_copy_correct_layer_and_combine_adjacent_views(self):
-        for ratio in (0.0, 0.5):
-            with self.subTest(ratio=ratio):
-                assembly = self.assemble(ratio=ratio)
-                runtime = assembly.finalize()
-                context = runtime._new_context(Phase.PREFILL)
-                runtime._context = context
-                self.assertEqual(len(runtime.pipelines), 1)
-                pipeline = runtime.pipelines[0]
-                access = pipeline.access
-                leases = []
-                for expert in range(2):
-                    wave = ExpertWave(expert, expert, expert + 1, 0)
-                    request = pipeline.make_request(4, wave, expert, context)
-                    lease = access.stage(request, context)
-                    leases.append(lease)
-                    for tensor in lease.bindings.bank.tensors.values():
-                        self.assertTrue(torch.all(tensor == 40 + expert))
-                whole = ExpertWave(0, 0, 2, 0)
-                combined = pipeline.combine_bindings(4, whole, leases, context)
-                self.assertEqual(combined.bank.capacity, 2)
-                for tensor in combined.bank.tensors.values():
-                    self.assertEqual(tensor[:, 0].tolist(), [40, 41])
-                with self.assertRaisesRegex(ValueError, "adjacent"):
-                    pipeline.combine_bindings(4, whole, list(reversed(leases)), context)
-                a = combined.bank
-                b = pipeline.make_request(
-                    4, ExpertWave(1, 2, 4, 1), 0, context
-                ).local_demand.binding.bank
-                for name in Format.component_nbytes:
-                    a_ranges = {
-                        (region.address, region.nbytes)
-                        for region in a.component_regions[name]
-                    }
-                    b_ranges = {
-                        (region.address, region.nbytes)
-                        for region in b.component_regions[name]
-                    }
-                    self.assertTrue(a_ranges.isdisjoint(b_ranges))
-                for lease in leases:
-                    access.release_after(
-                        lease, context.record_compute_completion(), context
-                    )
-
     def test_prefill_reuses_physical_plans_but_not_reservation_state(self):
         assembly = self.assemble()
         runtime = assembly.finalize()
         pipeline = runtime.pipelines[0]
         context = runtime._new_context(Phase.PREFILL)
         runtime._context = context
-        wave = ExpertWave(0, 0, 2, 0)
-        request = pipeline.make_request(3, wave, 0, context)
-        repeated = pipeline.make_request(3, wave, 0, context)
-        self.assertIs(request.local_demand.binding, repeated.local_demand.binding)
+        request = pipeline.make_request(3, 0, context)
+        repeated = pipeline.make_request(3, 0, context)
         first = pipeline.access.stage(request, context)
         pipeline.access.release_after(
             first, context.record_compute_completion(), context
@@ -560,12 +511,10 @@ class NpuBackendAssemblyTests(unittest.TestCase):
             second, context.record_compute_completion(), context
         )
         # Physical bank views are shared across layers, host source plans are not.
-        third = pipeline.access.stage(
-            pipeline.make_request(4, wave, 0, context), context
-        )
+        third = pipeline.access.stage(pipeline.make_request(5, 0, context), context)
         self.assertIsNot(assembly.host.plans[0], assembly.host.plans[2])
         for tensor in third.bindings.bank.tensors.values():
-            self.assertEqual(tensor[:, 0].tolist(), [40, 41])
+            self.assertEqual(tensor[:, 0].tolist(), [50, 51, 52, 53, 54])
         pipeline.access.release_after(
             third, context.record_compute_completion(), context
         )
@@ -583,9 +532,8 @@ class NpuBackendAssemblyTests(unittest.TestCase):
         before = {name: tensor.data_ptr() for name, tensor in hot.tensors.items()}
         for tensor in hot.tensors.values():
             self.assertEqual(tensor[:, 0].tolist(), [30, 40, 54])
-        wave = assembly.builds[0][1].decode_waves[0]
         lease = access.stage(
-            ExecutionRequest(3, torch.tensor([2, 0, 0, 1, 0]), wave, Phase.DECODE),
+            LayerExecutionRequest(3, torch.tensor([2, 0, 0, 1, 0]), Phase.DECODE),
             context,
         )
         for tensor in execution.tensors.values():
@@ -640,8 +588,8 @@ class NpuBackendAssemblyTests(unittest.TestCase):
         self.assertEqual(assembly.backend.format.banks, [])
 
     def test_insufficient_prefill_storage_rejects_then_cleanup_is_safe(self):
-        assembly = self.assemble(ratio=0.0, slots=3, group=2)
-        with self.assertRaisesRegex(ValueError, "Prefill requires"):
+        assembly = self.assemble(ratio=0.0, slots=5)
+        with self.assertRaisesRegex(ValueError, "second bank"):
             assembly.finalize()
         assembly.backend.close_unbound()
         self.assertEqual(assembly.events[-1], "pool.close")
@@ -982,71 +930,6 @@ class TestAclHostTransfer(unittest.TestCase):
             )
         self.assertEqual(self.module.submit.call_count, 0)
         self.assertEqual(self.retained, [])
-
-
-class TestNPUDispatchBytePacking(unittest.TestCase):
-    def layout(self):
-        return npu_experts.NPUDispatchLayout(
-            2, 256, 8, "cpu", torch.zeros((), dtype=torch.int32)
-        )
-
-    def test_padding_fill_accepts_npu_dtypes_and_reuses_workspace(self):
-        layout = self.layout()
-        source = torch.arange(256, dtype=torch.int64).to(torch.uint8).reshape(8, 32)
-        indices = torch.tensor([7, 0, 6, 1, 5, 2, 4, 3])
-        original_fill = torch.Tensor.masked_fill_
-
-        def npu_fill(tensor, mask, value):
-            if tensor.dtype == torch.uint8:
-                raise RuntimeError("selfRef not implemented for DT_UINT8")
-            return original_fill(tensor, mask, value)
-
-        with mock.patch.object(torch.Tensor, "masked_fill_", npu_fill):
-            result = layout._gather_bytes(
-                source, indices, torch.tensor(3), "scale_bytes"
-            )
-
-        expected = source.index_select(0, indices)
-        expected[3:].zero_()
-        self.assertTrue(torch.equal(result, expected))
-        self.assertEqual(result.data_ptr(), layout._owned["scale_bytes"].data_ptr())
-
-    def test_activation_and_scale_payload_bits_and_padding(self):
-        layout = self.layout()
-        indices = torch.tensor([7, 0, 6, 1, 5, 2, 4, 3])
-        dtypes = [
-            torch.uint8,
-            torch.int8,
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]
-        if hasattr(torch, "float8_e8m0fnu"):
-            dtypes.append(torch.float8_e8m0fnu)
-        for name, width in (("input_bytes", 256), ("scale_bytes", 32)):
-            payload = (
-                torch.arange(8 * width).reshape(8, width) * 17
-                + torch.arange(8).unsqueeze(1) * 31
-            ).to(torch.uint8)
-            for dtype in dtypes:
-                source = payload.view(dtype)
-                for count in (0, 3, 8):
-                    with self.subTest(workspace=name, dtype=dtype, count=count):
-                        storage = layout._owned[name]
-                        storage.fill_(171)
-                        result = layout._gather_bytes(
-                            source, indices, torch.tensor(count), name
-                        )
-                        expected = payload.index_select(0, indices)
-                        expected[count:].zero_()
-                        self.assertEqual(result.dtype, dtype)
-                        self.assertEqual(result.shape, source.shape)
-                        self.assertEqual(result.data_ptr(), storage.data_ptr())
-                        self.assertTrue(torch.equal(result.view(torch.uint8), expected))
-                        self.assertTrue(torch.equal(source.view(torch.uint8), payload))
-                        self.assertTrue(bool((storage[payload.numel() :] == 171).all()))
 
 
 if __name__ == "__main__":

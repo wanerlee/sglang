@@ -149,7 +149,7 @@ class TestFixedDecodeTransfer(unittest.TestCase):
 
 class TestFixedDecodeBackendBinding(unittest.TestCase):
     def test_only_decode_uses_fixed_slots_matching_the_native_bank_order(self):
-        assembly = Assembly(slots=4, local_experts=5)
+        assembly = Assembly(slots=5, local_experts=5)
         try:
             assembly.finalize()
             decode = [

@@ -1,5 +1,7 @@
 # MoE offload Python 实现精简记录
 
+> 历史设计记录：本文中的 wave 调度、分组配置及相关接口已在分层分支删除。当前执行方式和配置迁移见[分层实现说明](../../../../../../scripts/moe_layer/README.md)。缓存策略设计仍供参考。
+
 日期：2026-10-25。分支：`codex/moe-offload-refactor`。
 实施起点：`de1dd2a2e57220132ac948a91b75e04b51e68bca`。
 PR 行数基线：`8e7601ae4a48c1127afd1bcdccf0a0ad61dbf043`。

@@ -28,7 +28,7 @@ class CacheRouteStats:
     def record_counts(self, counts, hit, enabled):
         """Count native post-dispatch demand without expanding it into routes.
 
-        Each disjoint wave contributes once. Counts include repeated assignments;
+        Each layer contributes once. Counts include repeated assignments;
         masks and the fixed-address enabled flag exclude padding and capture.
         """
         import torch

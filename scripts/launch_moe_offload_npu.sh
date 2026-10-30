@@ -28,7 +28,7 @@ Overrides:
   ENABLE_TRACE=0 OTLP_TRACES_ENDPOINT=localhost:4317 OTLP_SERVICE_NAME
   PROFILE_CAPTURE=0 (NPU graph capture profiling; explicit opt-in)
 
-Set MOE_LOG_LEVEL=debug for MoE layer/wave/copy submission logs. Each batch's
+Set MOE_LOG_LEVEL=debug for MoE layer/copy submission logs. Each batch's
 assignment hit rate is already enabled by the offload JSON (batch_log_interval=1).
 Logs, the config snapshot and the generated logging config are saved in LOG_DIR.
 An existing SGLANG_LOGGING_CONFIG_PATH takes precedence over the generated config.

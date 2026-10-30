@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, fields
-from functools import lru_cache
+from dataclasses import fields
 from types import SimpleNamespace
 
 from ...transfer import (
@@ -14,11 +13,10 @@ from ...transfer import (
     HostCopyRegion,
 )
 from ..cache_metadata import CacheRouteStats
-from ..config import Phase, fixed_waves
+from ..config import Phase
 from ..diagnostics import BatchDiagnostics
 from ..execution import (
     CacheUpdateCoordinator,
-    ExecutionRequest,
     ExpertWeightAccess,
     MaterializationPlan,
 )
@@ -30,8 +28,7 @@ from ..layer_execution import (
 )
 from ..layer_prefetch import LayerPrefetchPipeline
 from ..models import DeepSeekV4Adapter
-from ..prefill import BoundedPrefillWeightPipeline, PrefillPipelineConfig
-from ..residency import BoundExecutionWave, TensorResidencyOps
+from ..residency import TensorResidencyOps
 from ..resources import ResourceKind, tensor_allocations
 from ..runtime import BoundMoERuntime, DecodeStateSnapshot
 from ..state import ResidencyState
@@ -45,11 +42,6 @@ from .transfer import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _PrefillTarget:
-    binding: object
 
 
 class NpuMoEBackend(MoEBackend):
@@ -70,14 +62,9 @@ class NpuMoEBackend(MoEBackend):
                 "The native execution arena requires uniform local expert counts"
             )
         local_experts = self.model_plan.offloaded_layers[0].local_experts
-        if settings.decode_mode == "layer" and config.execution_slots < local_experts:
-            raise ValueError(
-                f"Layer decode requires execution_slots >= {local_experts}"
-            )
-        if settings.prefill_mode == "layer":
-            whole_layer_bank_layout(
-                local_experts, config.hot_slots(self.model_plan), config.execution_slots
-            )
+        whole_layer_bank_layout(
+            local_experts, config.hot_slots(self.model_plan), config.execution_slots
+        )
         self.format = self.host_pool = self.device_runtime = None
         self.layers = {}
         self.runtime = None
@@ -177,6 +164,9 @@ class NpuMoEBackend(MoEBackend):
         for storage in self.layers.values():
             storage.require_sealed()
         k = config.hot_slots(catalog)
+        banks = whole_layer_bank_layout(
+            catalog.offloaded_layers[0].local_experts, k, config.execution_slots
+        )
         initial_keys = policy.initial_keys(
             k, getattr(self.settings, "offline_model_id", None)
         )
@@ -223,168 +213,77 @@ class NpuMoEBackend(MoEBackend):
             return result
 
         update = bind(hot, k, "hot.update")
-        bound_waves, bound_layers, waves_by_layer = [], [], {}
+        bound_layers = []
         for spec in catalog.offloaded_layers:
-            if self.settings.decode_mode == "layer":
-                count = spec.local_experts
-                if config.execution_slots < count:
-                    raise ValueError(
-                        f"Layer decode requires execution_slots >= {count}"
-                    )
-                transfer_binding = bind(
-                    execution.view(0, count),
-                    count,
-                    f"decode.layer.{spec.layer_id}",
-                    state.execution_valid[:count],
-                    fixed_destination_slots=tuple(range(count)),
-                )
-                bound_layers.append(
-                    BoundExecutionLayer(spec.layer_id, 0, 0, transfer_binding)
-                )
-                waves_by_layer[spec.layer_id] = ()
-                continue
-            waves = fixed_waves(spec.local_experts, config.execution_slots)
-            waves_by_layer[spec.layer_id] = waves
-            for wave in waves:
-                count = wave.local_end - wave.local_start
-                bank = execution.view(0, count)
-                transfer_binding = bind(
-                    bank,
-                    count,
-                    f"decode.{spec.layer_id}.{wave.index}",
-                    state.execution_valid[:count],
-                    # This view starts at slot zero; copy destinations must match
-                    # the exact expert order consumed by this native FFN bank.
-                    fixed_destination_slots=tuple(range(count)),
-                )
-                bound_waves.append(
-                    BoundExecutionWave(spec.layer_id, wave, 0, transfer_binding)
-                )
-
-        # Prefill borrows the hot pool when available. For ratio=0, partition the
-        # explicitly budgeted execution allocation into non-overlapping A/B.
-        group = min(
-            self.settings.prefill_group_size, catalog.offloaded_layers[0].local_experts
-        )
-        if self.settings.prefill_mode == "layer":
-            banks = whole_layer_bank_layout(
-                catalog.offloaded_layers[0].local_experts, k, config.execution_slots
+            count = spec.local_experts
+            transfer_binding = bind(
+                execution.view(0, count),
+                count,
+                f"decode.layer.{spec.layer_id}",
+                state.execution_valid[:count],
+                fixed_destination_slots=tuple(range(count)),
             )
-            pools = {"hot": hot, "execution": execution}
-            a, b = (pools[pool].view(offset, count) for pool, offset, count in banks)
-        elif k >= group:
-            a = hot.view(0, min(k, catalog.offloaded_layers[0].local_experts))
-            b = execution.view(0, group)
-        elif config.execution_slots >= 2 * group:
-            a = execution.view(0, config.execution_slots - group)
-            b = execution.view(config.execution_slots - group, group)
-        else:
-            raise ValueError(
-                "Prefill requires a hot A bank or execution_slots >= 2 * prefill_group_size"
+            bound_layers.append(
+                BoundExecutionLayer(spec.layer_id, 0, 0, transfer_binding)
             )
+        pools = {"hot": hot, "execution": execution}
+        a, b = (pools[pool].view(offset, count) for pool, offset, count in banks)
         prefill_banks = {0: a, 1: b}
         prefill_valid = {
             index: torch.ones(bank.capacity, dtype=torch.bool, device=self.device)
             for index, bank in prefill_banks.items()
         }
 
-        @lru_cache(maxsize=256)
-        def prefill_binding(bank_id, offset, count):
-            bank = prefill_banks[bank_id].view(offset, count)
-            return SimpleNamespace(
+        prefill_bindings = {
+            index: SimpleNamespace(
                 bank=bank,
-                bank_id=bank_id,
-                offset=offset,
-                count=count,
+                bank_id=index,
                 error_status=error,
                 hot_generations=state.slot_generation,
                 expert_bank=NPUExpertBank(
-                    bank.quant_info(),
-                    prefill_valid[bank_id][offset : offset + count],
-                    error,
+                    bank.quant_info(), prefill_valid[index], error
                 ),
             )
-
-        def make_request(layer_id, wave, bank_offset, context):
-            count = wave.local_end - wave.local_start
-            binding = prefill_binding(wave.bank, bank_offset, count)
-            return ExecutionRequest(
-                layer_id,
-                _PrefillTarget(binding),
-                wave,
-                Phase.PREFILL,
+            for index, bank in prefill_banks.items()
+        }
+        layer_plans = {}
+        for index, spec in enumerate(catalog.offloaded_layers):
+            bank_id = index % 2
+            binding = prefill_bindings[bank_id]
+            bank, storage = binding.bank, self.layers[spec.layer_id]
+            regions = tuple(
+                HostCopyRegion(
+                    storage.component_capabilities[name][expert],
+                    bank.component_regions[name][expert],
+                    0,
+                    0,
+                    self.format.layouts[name].nbytes,
+                )
+                for name in component_names
+                for expert in range(spec.local_experts)
             )
-
-        @lru_cache(maxsize=1024)
-        def prefill_plan(layer_id, start, end, bank_id, offset):
-            # Registered host masters and arena addresses stay fixed until drain.
-            # Cache only physical descriptors; residency creates a fresh mutable
-            # reservation and completion/reader state for every invocation.
-            binding = prefill_binding(bank_id, offset, end - start)
-            bank = binding.bank
-            storage = self.layers[layer_id]
-            regions = []
-            for name in component_names:
-                for lane, expert in enumerate(range(start, end)):
-                    source = storage.component_capabilities[name][expert]
-                    destination = bank.component_regions[name][lane]
-                    nbytes = self.format.layouts[name].nbytes
-                    regions.append(
-                        HostCopyRegion(
-                            source,
-                            destination,
-                            0,
-                            0,
-                            nbytes,
-                        )
-                    )
-            return MaterializationPlan(
-                HostCopyPlan(tuple(regions), (storage, bank)), binding
+            layer_plans[(spec.layer_id, bank_id)] = MaterializationPlan(
+                HostCopyPlan(regions, (storage, bank)), binding
             )
 
         def prepare_prefill(request, context):
-            if isinstance(request, LayerExecutionRequest):
-                return layer_plans[(request.layer_id, request.bank_id)]
-            target = request.local_demand
-            if not isinstance(target, _PrefillTarget):
-                raise TypeError("Prefill requires a bounded physical bank target")
-            return prefill_plan(
-                request.layer_id,
-                request.wave.local_start,
-                request.wave.local_end,
-                target.binding.bank_id,
-                target.binding.offset,
-            )
-
-        def combine_bindings(layer_id, wave, leases, context):
-            offset = 0
-            for lease in leases:
-                binding = lease.bindings
-                if binding.bank_id != wave.bank or binding.offset != offset:
-                    raise ValueError(
-                        "Initial expert microbatches must occupy adjacent A slots"
-                    )
-                offset += binding.count
-            if offset != wave.local_end - wave.local_start:
-                raise ValueError("Incomplete first prefill group")
-            return prefill_binding(wave.bank, 0, offset)
+            return layer_plans[(request.layer_id, request.bank_id)]
 
         cache_stats = CacheRouteStats.allocate(self.device)
         ops = TensorResidencyOps(
             state,
             catalog,
-            execution_waves=bound_waves,
             execution_layers=bound_layers,
             update_bindings=update,
             error_status=error,
             prepare_prefill=prepare_prefill,
             # LFU uses step_access_count independently. Disabled batch logging
-            # must also omit its per-wave reductions from the decode graph.
+            # must also omit its per-layer reductions from the decode graph.
             cache_stats=cache_stats if self.settings.batch_log_interval else None,
         )
 
-        # Native operations retain into the current context, including worker
-        # submissions. Capture heads install a new context before any program.
+        # Native operations retain into the current invocation. Capture heads
+        # install a new context before any program.
         def retain(resource):
             self.runtime.context.retain(resource)
 
@@ -433,44 +332,19 @@ class NpuMoEBackend(MoEBackend):
             )
 
         profile_scope = profile if self.settings.layer_profile else None
-        layer_plans = {}
-        if self.settings.prefill_mode == "layer":
-            for index, spec in enumerate(catalog.offloaded_layers):
-                plan = prefill_plan(spec.layer_id, 0, spec.local_experts, index % 2, 0)
-                layer_plans[(spec.layer_id, index % 2)] = plan
-                host_ops.prepare(plan.copy_plan, self.device)
-            pipeline = LayerPrefetchPipeline(
-                access,
-                [s.layer_id for s in catalog.offloaded_layers],
-                make_request=lambda layer, bank, ctx: LayerExecutionRequest(
-                    layer, None, Phase.PREFILL, bank
-                ),
-                record_copy_completion=lambda ctx: self.device_runtime.record(
-                    ctx.copy_stream
-                ),
-                profile=profile_scope,
-            )
-        else:
-            pipeline = BoundedPrefillWeightPipeline(
-                access,
-                PrefillPipelineConfig(
-                    local_experts=catalog.offloaded_layers[0].local_experts,
-                    initial_capacity=a.capacity,
-                    group_size=group,
-                    secondary_capacity=b.capacity,
-                    microbatch_size=self.settings.prefill_microbatch_size,
-                    max_inflight=self.settings.prefill_max_inflight,
-                ),
-                make_request=make_request,
-                combine_bindings=combine_bindings,
-                worker_scope=lambda ctx: self.device_runtime.stream_scope(
-                    ctx.copy_stream
-                ),
-                record_copy_completion=lambda ctx: self.device_runtime.record(
-                    ctx.copy_stream
-                ),
-                ordered_copy_stream=True,
-            )
+        for plan in layer_plans.values():
+            host_ops.prepare(plan.copy_plan, self.device)
+        pipeline = LayerPrefetchPipeline(
+            access,
+            [s.layer_id for s in catalog.offloaded_layers],
+            make_request=lambda layer, bank, ctx: LayerExecutionRequest(
+                layer, None, Phase.PREFILL, bank
+            ),
+            record_copy_completion=lambda ctx: self.device_runtime.record(
+                ctx.copy_stream
+            ),
+            profile=profile_scope,
+        )
         pipelines = (pipeline,)
         shared_layout = None
         for module, spec in layers:
@@ -478,13 +352,10 @@ class NpuMoEBackend(MoEBackend):
                 self.model_adapter.expert_module(module),
                 access=access,
                 residency=ops,
-                decode_waves=waves_by_layer[spec.layer_id],
                 pipeline=pipeline,
                 max_dispatch_rows=self.settings.max_dispatch_rows,
                 device=self.device,
                 shared_layout=shared_layout,
-                prefill_mode=self.settings.prefill_mode,
-                decode_mode=self.settings.decode_mode,
                 profile=profile_scope,
             )
             if shared_layout is None:
@@ -555,7 +426,7 @@ class NpuMoEBackend(MoEBackend):
         logger.info(
             "MoE offload runtime bound: rank=%s device=%s layers=%s experts=%s "
             "hot_slots=%s execution_slots=%s expert_bytes=%s "
-            "prefill_A=%s prefill_B=%s group=%s batch_log_interval=%s",
+            "prefill_A=%s prefill_B=%s batch_log_interval=%s",
             config.ep_rank,
             self.device,
             len(layers),
@@ -565,15 +436,14 @@ class NpuMoEBackend(MoEBackend):
             self.format.expert_nbytes,
             a.capacity,
             b.capacity,
-            group,
             getattr(self.settings, "batch_log_interval", 1) if diagnostics else 0,
         )
 
         def release():
-            # close_after_drain has joined the worker and drained device reads.
+            # close_after_drain has stopped submissions and drained device reads.
             host_ops.clear_cache()
-            prefill_plan.cache_clear()
-            prefill_binding.cache_clear()
+            layer_plans.clear()
+            prefill_bindings.clear()
             self._release()
 
         self.runtime = BoundMoERuntime(

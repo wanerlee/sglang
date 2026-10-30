@@ -2,9 +2,8 @@
 
 The NPU DeepEP receive buffer is a *flat*, expert-grouped allocation. Its device
 counts delimit the meaningful prefix; CUDA's [expert, capacity, hidden] layout
-is deliberately not accepted. Decode waves keep fixed activation capacity and
-device offsets; eager NORMAL prefill uses the dispatcher's host counts to slice
-each wave's actual rows. Native GMM/activation temporaries still belong to the
+is deliberately not accepted. Decode keeps fixed activation capacity; eager NORMAL prefill uses the
+dispatcher's host counts to slice the full layer's actual rows. Native GMM/activation temporaries still belong to the
 runtime's workspace budget.
 """
 
@@ -18,14 +17,8 @@ import torch
 
 from ...transfer import EventCompletion, JoinedCompletion, TransferTicket
 from ..config import Phase
-from ..execution import ExecutionRequest, LocalExecution
+from ..execution import LocalExecution
 from ..interfaces import DispatchLayoutAdapter, MoEDispatcher
-from ..programs import (
-    DecodeLocalExpertProgram,
-    DispatchOnceProgram,
-    PrefillDispatchOnceProgram,
-    PrefillLocalExpertProgram,
-)
 from ..resources import ResourceKind, tensor_allocations
 from .config import validate_native_environment
 
@@ -87,7 +80,6 @@ class NPUExpertBank:
 @dataclass(frozen=True)
 class NPUDispatch:
     raw: object
-    ready: TransferTicket
     original_hidden_width: int
     handle: object
     valid_token_count: object = None
@@ -102,17 +94,6 @@ class _Layout:
     row_ids: torch.Tensor
     selected: object = None
     prefill_offsets: tuple[int, ...] | None = None
-
-
-@dataclass(frozen=True)
-class NPUWaveInput:
-    hidden_states: torch.Tensor
-    hidden_states_scale: object
-    expert_tokens: torch.Tensor
-    local_demand: torch.Tensor
-    row_count: torch.Tensor
-    offset: torch.Tensor
-    wave: object
 
 
 @dataclass(frozen=True)
@@ -206,13 +187,9 @@ class NPUOffloadDispatcher(MoEDispatcher):
             handle = getattr(implementation, "handle", raw)
             # combine clears implementation.handle; retain the *value* now.
             context.retain(handle)
-            ready = context.record_compute_completion()
-            result = NPUDispatch(raw, ready, hidden_states.shape[-1], handle, count)
+            result = NPUDispatch(raw, hidden_states.shape[-1], handle, count)
             context.retain(result)
             return result
-
-    def dispatch_completion(self, dispatched, context):
-        return dispatched.ready.completion
 
     @staticmethod
     def _combine_input(raw, hidden_states):
@@ -444,107 +421,11 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             target.copy_(output)
             layout.selected = None
 
-    def _gather_bytes(self, source, indices, count, name):
-        rows = source.shape[0]
-        if rows == 0:
-            return source
-        if not source.is_contiguous():
-            raise ValueError("NPU activation/scale packing requires contiguous storage")
-        byte_rows = source.view(torch.uint8).reshape(rows, -1)
-        nbytes = byte_rows.numel()
-        storage = self._owned[name]
-        if nbytes > storage.numel():
-            raise ValueError("Activation scale workspace capacity exceeded")
-        out = storage[:nbytes].view(byte_rows.shape)
-        torch.index_select(byte_rows, 0, indices, out=out)
-        # ACLNN masked_fill_ supports INT8, not UINT8. Alias the same byte storage.
-        out.view(torch.int8).masked_fill_(
-            (self._owned["rows"][:rows] >= count).unsqueeze(1), 0
-        )
-        return out.view(source.dtype).view(source.shape)
-
-    def select_wave(self, layout, wave, context):
-        if layout.selected is not None:
-            raise RuntimeError("Write the current wave before reusing input workspace")
-        if not 0 <= wave.local_start < wave.local_end <= self.local_experts:
-            raise ValueError("Wave is outside local expert ownership")
-        with _compute_scope(context, self.device):
-            raw = layout.dispatched.raw
-            offset = layout.offsets[wave.local_start]
-            count = layout.offsets[wave.local_end] - offset
-            if layout.prefill_offsets is not None:
-                start = layout.prefill_offsets[wave.local_start]
-                end = layout.prefill_offsets[wave.local_end]
-                x = raw.hidden_states[start:end]
-            else:
-                indices = (layout.row_ids + offset).clamp(
-                    max=max(0, layout.output.shape[0] - 1)
-                )
-                x = self._gather_bytes(raw.hidden_states, indices, count, "input_bytes")
-            scale = raw.hidden_states_scale
-            if scale is not None:
-                rows = raw.hidden_states.shape[0]
-                if rows == 0:
-                    if scale.numel():
-                        raise ValueError(
-                            "Empty dispatch must have empty activation scales"
-                        )
-                else:
-                    if scale.numel() % rows:
-                        raise ValueError("NPU scales must have a fixed per-row shape")
-                    if layout.prefill_offsets is not None:
-                        if not scale.is_contiguous():
-                            raise ValueError("NPU activation scales must be contiguous")
-                        scale = scale.view(rows, -1)[start:end]
-                    else:
-                        scale = self._gather_bytes(
-                            scale.reshape(rows, -1), indices, count, "scale_bytes"
-                        )
-            result = NPUWaveInput(
-                x,
-                scale,
-                layout.counts[wave.local_start : wave.local_end],
-                layout.counts,
-                count,
-                offset,
-                wave,
-            )
-            layout.selected = result
-            context.retain(result)
-            return result
-
-    def write_wave(self, layout, wave, local_output, context):
-        selected = layout.selected
-        if selected is None or selected.wave != wave:
-            raise RuntimeError("Wave write must match its selected receive rows")
-        target = layout.output
-        if layout.prefill_offsets is not None:
-            start = layout.prefill_offsets[wave.local_start]
-            end = layout.prefill_offsets[wave.local_end]
-            target = target[start:end]
-        if local_output.shape != target.shape:
-            raise ValueError("Native FFN must preserve the selected receive shape")
-        with _compute_scope(context, self.device):
-            if layout.prefill_offsets is not None:
-                target.copy_(local_output)
-            elif layout.output.shape[0]:
-                inverse = (layout.row_ids - selected.offset).clamp(
-                    0, layout.output.shape[0] - 1
-                )
-                values = torch.index_select(local_output, 0, inverse)
-                belongs = (layout.row_ids >= selected.offset) & (
-                    layout.row_ids < selected.offset + selected.row_count
-                )
-                torch.where(
-                    belongs.unsqueeze(1), values, layout.output, out=layout.output
-                )
-            layout.selected = None
-
     def combine_input(self, layout, context):
         if layout.selected is not None:
-            raise RuntimeError("Cannot combine an unfinished FFN wave")
-        # A latched failure suppresses earlier waves too; never publish a partial
-        # routed result when a later bank failed validation.
+            raise RuntimeError("Cannot combine an unfinished FFN layer")
+        # A latched failure suppresses the complete output too; never publish a partial
+        # routed result when bank validation fails.
         with _compute_scope(context, self.device):
             layout.output.masked_fill_(self.error_status != 0, 0)
         return layout
@@ -595,7 +476,7 @@ class NPUExpertRunner:
             raise ValueError("FFN and transfer must share canonical error_status")
         width = dispatched.expert_tokens.numel()
         if width != bank.execution_valid.numel():
-            raise ValueError("FFN wave must match its bound expert view")
+            raise ValueError("FFN layer must match its bound expert view")
         quant = bank.quant_info
         # Retain *before* submission, including partial native failures.
         context.retain((self, bank, quant, dispatched, bindings, self.reader_streams))
@@ -605,7 +486,7 @@ class NPUExpertRunner:
                 and not context.capturing
                 and dispatched.hidden_states.shape[0] == 0
             ):
-                # Empty eager waves still retire their weight lease and readers,
+                # Empty eager layers still retire their weight lease and readers,
                 # but do not call native quantization/GMM with a zero-row input.
                 dtype = (
                     torch.float16
@@ -633,7 +514,7 @@ class NPUExpertRunner:
             row_ids = torch.arange(output.shape[0], device=output.device)
             good_rows = (row_ids < dispatched.row_count) & healthy
             # Own the GMM result: clear padding in place rather than allocating
-            # and retaining a second [receive_capacity, hidden] output per wave.
+            # and retaining a second [receive_capacity, hidden] output per layer.
             output.masked_fill_(~good_rows.unsqueeze(1), 0)
             return LocalExecution(output, self._reader_ticket(context))
 
@@ -655,13 +536,10 @@ def build_npu_layer_programs(
     *,
     access,
     residency,
-    decode_waves,
     pipeline,
     max_dispatch_rows,
     device=None,
     shared_layout=None,
-    prefill_mode="wave",
-    decode_mode="wave",
     profile=None,
 ):
     """Bind a real FusedMoE's native dispatcher and Ascend FFN to offload access.
@@ -697,52 +575,23 @@ def build_npu_layer_programs(
             raise ValueError("Shared dispatch workspace has incompatible bindings")
     runner = NPUExpertRunner(experts)
 
-    def make_request(layer_id, wave_input, wave, context):
-        return ExecutionRequest(layer_id, wave_input.local_demand, wave, Phase.DECODE)
-
-    decode_local = DecodeLocalExpertProgram(
-        access,
-        make_request,
-        runner,
-        layer_demand=lambda layout: layout.counts,
-        compute_scope=lambda context: _compute_scope(context, device),
-    )
     from ..layer_programs import LayerExpertProgram
 
-    if prefill_mode == "layer":
-        prefill = LayerExpertProgram(
-            dispatcher,
-            layout,
-            runner,
-            access,
-            compute_scope=lambda ctx: _compute_scope(ctx, device),
-            pipeline=pipeline,
-            profile=profile,
-        )
-    else:
-        prefill_local = PrefillLocalExpertProgram(pipeline, runner)
-        prefill = PrefillDispatchOnceProgram(
-            dispatcher,
-            prefill_local,
-            layout,
-            local_experts=experts.num_local_experts,
-            pipeline=pipeline,
-        )
-    if decode_mode == "layer":
-        decode = LayerExpertProgram(
-            dispatcher,
-            layout,
-            runner,
-            access,
-            compute_scope=lambda ctx: _compute_scope(ctx, device),
-            profile=profile,
-        )
-    else:
-        decode = DispatchOnceProgram(
-            decode_waves,
-            dispatcher,
-            decode_local,
-            layout,
-            local_experts=experts.num_local_experts,
-        )
+    prefill = LayerExpertProgram(
+        dispatcher,
+        layout,
+        runner,
+        access,
+        compute_scope=lambda ctx: _compute_scope(ctx, device),
+        pipeline=pipeline,
+        profile=profile,
+    )
+    decode = LayerExpertProgram(
+        dispatcher,
+        layout,
+        runner,
+        access,
+        compute_scope=lambda ctx: _compute_scope(ctx, device),
+        profile=profile,
+    )
     return NPULayerPrograms(prefill, decode, layout)

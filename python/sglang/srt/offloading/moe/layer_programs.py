@@ -4,10 +4,11 @@ from contextlib import nullcontext
 
 from .config import Phase
 from .execution import LocalExecution, require_prefill
+from .interfaces import WholeMoEProgram
 from .layer_execution import LayerExecutionRequest
 
 
-class LayerExpertProgram:
+class LayerExpertProgram(WholeMoEProgram):
     def __init__(
         self,
         dispatcher,
@@ -22,7 +23,6 @@ class LayerExpertProgram:
         self.dispatcher, self.layout, self.runner = dispatcher, layout, runner
         self.access, self.compute_scope = access, compute_scope
         self.pipeline, self.profile = pipeline, profile
-        self.manages_layer_dependencies = pipeline is not None
 
     def _scope(self, name, layer, bank, context):
         return (

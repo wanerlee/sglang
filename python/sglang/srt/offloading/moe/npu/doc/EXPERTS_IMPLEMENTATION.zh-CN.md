@@ -1,5 +1,7 @@
 # 原生 NPU EP / FFN 接入
 
+> 历史设计记录：本文中的 wave 调度、分组配置及相关接口已在分层分支删除。当前执行方式和配置迁移见[分层实现说明](../../../../../../../scripts/moe_layer/README.md)。缓存策略设计仍供参考。
+
 `../experts.py` 将已有 `DispatchOnceProgram` / `PrefillDispatchOnceProgram`
 连接到仓库内的 DeepEP dispatcher 与 `AscendRunnerCore`。模型的 shared expert、
 routed scaling 仍由外层 DeepSeek MLP 执行；返回值包含原 `FusedMoE.forward_impl`

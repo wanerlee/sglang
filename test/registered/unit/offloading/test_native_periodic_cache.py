@@ -16,7 +16,7 @@ import torch
 from test_npu_backend import Assembly
 
 from sglang.srt.offloading.moe.config import Phase
-from sglang.srt.offloading.moe.execution import ExecutionRequest
+from sglang.srt.offloading.moe.layer_execution import LayerExecutionRequest
 from sglang.srt.offloading.moe.npu.config import (
     NpuOffloadSettings,
     create_npu_offloader,
@@ -60,15 +60,14 @@ class TestNativePeriodicCache(unittest.TestCase):
             access = runtime.cache_updates.access
             for spec in self.assembly.catalog.offloaded_layers:
                 counts = torch.tensor(demand.get(spec.layer_id, [0] * 4))
-                for wave in runtime.layer_programs[spec.layer_id].decode_waves:
-                    lease = access.stage(
-                        ExecutionRequest(spec.layer_id, counts, wave, Phase.DECODE),
-                        context,
-                    )
-                    access.wait_ready(lease, context.compute_stream, context=context)
-                    access.release_after(
-                        lease, context.record_compute_completion(), context
-                    )
+                lease = access.stage(
+                    LayerExecutionRequest(spec.layer_id, counts, Phase.DECODE),
+                    context,
+                )
+                access.wait_ready(lease, context.compute_stream, context=context)
+                access.release_after(
+                    lease, context.record_compute_completion(), context
+                )
             tail = runtime.cache_updates.emit_step_end(context)
             result = context.finish(residency_ready=tail)
             # These are eager CPU emissions of the capture program, with no

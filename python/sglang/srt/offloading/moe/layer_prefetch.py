@@ -17,8 +17,6 @@ class _Session:
 class LayerPrefetchPipeline:
     # The pipeline installs a forward-entry dependency and per-bank reader
     # dependencies. A global layer-entry copy barrier would defeat lookahead.
-    manages_layer_dependencies = True
-
     def __init__(
         self, access, layer_ids, *, make_request, record_copy_completion, profile=None
     ):

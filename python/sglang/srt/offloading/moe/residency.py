@@ -7,31 +7,16 @@ The runtime must execute these operations on ``context.compute_stream``, seriali
 forwards and call ``begin_step`` once at the beginning of the complete graph.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
 from ..transfer import CopySourceKind, DeviceCopyPlan, HostCopyPlan, TransferTicket
-from .config import ExpertWave, Phase
+from .config import Phase
 from .execution import MaterializationPlan, require_prefill
 from .interfaces import ResidencyOps
 from .layer_execution import BoundExecutionLayer, LayerExecutionRequest
 from .resources import tensor_allocations
-
-
-@dataclass(frozen=True)
-class BoundExecutionWave:
-    """Static wave-to-bank binding; multiple waves may reuse an execution range.
-
-    ``bindings`` is the transport/FFN's caller-owned bank binding. Its shared
-    error_status must be the same scalar passed to TensorResidencyOps. Consumers
-    must honor state.execution_valid (and the sticky device error status).
-    """
-
-    layer_id: int
-    wave: ExpertWave
-    execution_start: int
-    bindings: object
 
 
 @dataclass
@@ -44,28 +29,16 @@ class _Reservation:
     retired: bool = False
 
 
-@dataclass
-class _LayerDecodePlan:
-    owner: object
-    invocation_id: object
-    layer_id: int
-    demand: object
-    buffers: object
-    used_waves: set = field(default_factory=set)
-    closed: bool = False
-
-
 class TensorResidencyOps(ResidencyOps):
     """Canonical hit/miss plans and transactional, survivor-preserving hot updates.
 
     local_demand is a rank-local int32/int64 vector of post-dispatch token-expert
-    counts, one entry per local expert. Prepared decode contributes all counts
-    once per layer invocation; standalone requests contribute their wave slice.
+    counts, one entry per local expert, contributed once per layer invocation.
     Temporary execution never admits experts into the hot pool.
 
     prepare_prefill(request, context), when supplied, returns an eager
     MaterializationPlan with a HostCopyPlan and protected bank bindings. It owns
-    dynamic A/B/a offsets and old-reader dependencies. Prefill never changes the
+    full-layer bank bindings and old-reader dependencies. Prefill never changes the
     decode residency metadata or statistics.
     """
 
@@ -74,7 +47,6 @@ class TensorResidencyOps(ResidencyOps):
         state,
         catalog,
         *,
-        execution_waves,
         update_bindings,
         error_status=None,
         prepare_prefill=None,
@@ -90,7 +62,6 @@ class TensorResidencyOps(ResidencyOps):
         self._readers = {}
         self._active_execution = {}
         self._pending_update = None
-        self._active_layer_plan = None
         self.device = state.key_to_slot.device
         self.num_experts = catalog.num_experts
         self.hot_slots = state.slot_to_key.numel()
@@ -115,7 +86,6 @@ class TensorResidencyOps(ResidencyOps):
         self._slot_sentinel = self._tensor(
             "constant.slot_sentinel", (), fill=self.hot_slots
         )
-        self._waves = {}
         self._banks = {}
         self._layers = {layer.layer_id: layer for layer in catalog.offloaded_layers}
         self._layer_sources = {
@@ -123,8 +93,6 @@ class TensorResidencyOps(ResidencyOps):
             for layer in catalog.offloaded_layers
         }
         self._check_bindings(update_bindings)
-        for bound in execution_waves:
-            self._bind_wave(bound)
         self._execution_layers = {}
         for bound in execution_layers:
             self._bind_layer(bound)
@@ -187,69 +155,6 @@ class TensorResidencyOps(ResidencyOps):
             capacity,
         )
 
-    def _bind_wave(self, bound):
-        if not isinstance(bound, BoundExecutionWave):
-            raise TypeError("execution_waves requires BoundExecutionWave records")
-        layer = self._layers.get(bound.layer_id)
-        wave = bound.wave
-        if (
-            layer is None
-            or not isinstance(wave, ExpertWave)
-            or not 0 <= wave.local_start < wave.local_end <= layer.local_experts
-            or wave.bank < 0
-            or wave.index < 0
-        ):
-            raise ValueError("Invalid bound execution wave")
-        size = wave.local_end - wave.local_start
-        if not 0 <= bound.execution_start <= self.execution_slots - size:
-            raise ValueError("Execution wave exceeds its explicitly allocated bank")
-        old_bank = self._banks.get(wave.bank)
-        if old_bank is not None and old_bank[0] != bound.execution_start:
-            raise ValueError("One execution bank must keep its physical offset")
-        self._banks[wave.bank] = (
-            bound.execution_start,
-            max(size, old_bank[1] if old_bank else 0),
-        )
-        key = (bound.layer_id, wave)
-        if key in self._waves:
-            raise ValueError("Duplicate execution wave binding")
-        self._check_bindings(bound.bindings)
-        prefix = f"wave.{bound.layer_id}.{wave.index}.{wave.bank}"
-        buf = {
-            "bound": bound,
-            "bank_id": wave.bank,
-            "layer": layer,
-            "plan": self._plan(prefix, size),
-        }
-        for name in ("keys", "slots", "safe_slots", "slot_keys", "counts", "frequency"):
-            buf[name] = self._tensor(prefix + "." + name, (size,))
-        for name in ("needed", "hit", "flag", "flag2", "published_valid"):
-            buf[name] = self._tensor(prefix + "." + name, (size,), torch.bool)
-        first = self.catalog.key(bound.layer_id, wave.local_start)
-        torch.arange(first, first + size, out=buf["keys"])
-        torch.arange(
-            bound.execution_start,
-            bound.execution_start + size,
-            out=buf["plan"].destination_slot,
-        )
-        # Persistent views, not new physical allocations. Only valid/kind/count
-        # need per-wave refresh after a previous wave could have latched an error.
-        source = self._layer_sources[bound.layer_id]
-        start, end = wave.local_start, wave.local_end
-        plan = buf["plan"]
-        buf["layer_needed"] = source["needed"][start:end]
-        buf["layer_kind"] = source["plan"].source_kind[start:end]
-        buf["prepared_plan"] = DeviceCopyPlan(
-            plan.source_kind,
-            source["plan"].source_index[start:end],
-            plan.destination_slot,
-            plan.valid,
-            source["plan"].expected_generation[start:end],
-            plan.count,
-            size,
-        )
-        self._waves[key] = buf
-
     def _bind_layer(self, bound):
         if not isinstance(bound, BoundExecutionLayer):
             raise TypeError("execution_layers requires BoundExecutionLayer records")
@@ -259,9 +164,7 @@ class TensorResidencyOps(ResidencyOps):
         size = layer.local_experts
         if not 0 <= bound.execution_start <= self.execution_slots - size:
             raise ValueError("Execution bank cannot hold the complete local layer")
-        if bound.layer_id in self._execution_layers or any(
-            key[0] == bound.layer_id for key in self._waves
-        ):
+        if bound.layer_id in self._execution_layers:
             raise ValueError("Bind each layer to exactly one execution schedule")
         old = self._banks.get(bound.bank_id)
         if old is not None and old[0] != bound.execution_start:
@@ -360,11 +263,7 @@ class TensorResidencyOps(ResidencyOps):
             return
         if context.phase is not Phase.DECODE:
             raise ValueError("Unsupported phase")
-        if (
-            self._active_execution
-            or self._pending_update is not None
-            or self._active_layer_plan is not None
-        ):
+        if self._active_execution or self._pending_update is not None:
             raise RuntimeError("Retire the previous step's reservations first")
         context.retain(self)
         self.state.step_access_count.zero_()
@@ -384,53 +283,9 @@ class TensorResidencyOps(ResidencyOps):
                 "Post-dispatch demand must contain one count per local expert"
             )
 
-    def prepare_decode_layer(self, layer_id, local_demand, context):
-        """Emit full-layer lookup once for this explicit invocation scope.
-
-        Fixed tensors are overwritten on the compute stream on every call and
-        graph replay. Host tokens prove submission ownership, never cache a
-        device result across invocations. The surrounding runtime serializes
-        forwards and keeps hot-set updates outside this scope.
-        """
-        if context.phase is not Phase.DECODE:
-            raise ValueError("Layer preparation requires decode mode")
-        if self._active_layer_plan is not None or self._active_execution:
-            raise RuntimeError(
-                "Finish the previous layer or execution reservation first"
-            )
-        if self._pending_update is not None:
-            raise RuntimeError("Finish the pending hot update before preparing a layer")
-        buf = self._layer_sources.get(layer_id)
-        if buf is None:
-            raise ValueError("Bind the decode layer before capture")
-        self._validate_demand(local_demand, buf["layer"])
-        context.retain((self, local_demand, buf))
-        self._prepare_sources(buf, local_demand, layer_id, 0)
-        prepared = _LayerDecodePlan(
-            self._token, context.invocation_id, layer_id, local_demand, buf
-        )
-        context.retain(prepared)
-        self._active_layer_plan = prepared
-        return prepared
-
-    def _check_layer_plan(self, prepared, context):
-        if (
-            not isinstance(prepared, _LayerDecodePlan)
-            or prepared.owner is not self._token
-            or prepared.invocation_id is not context.invocation_id
-            or prepared.closed
-            or self._active_layer_plan is not prepared
-        ):
-            raise ValueError("Foreign, closed or stale decode layer plan")
-
-    def finish_decode_layer(self, prepared, context):
-        self._check_layer_plan(prepared, context)
-        # Also close after partial submissions. Active bank reservations and
-        # retained tickets continue to guard failure cleanup; this is no wait.
-        prepared.closed = True
-        self._active_layer_plan = None
-
     def resolve_execution(self, request, context):
+        if not isinstance(request, LayerExecutionRequest):
+            raise TypeError("Expected a whole-layer execution request")
         if request.phase is not context.phase:
             raise ValueError("Execution request phase does not match context")
         context.retain((self, request))
@@ -460,65 +315,10 @@ class TensorResidencyOps(ResidencyOps):
             )
         if request.phase is not Phase.DECODE:
             raise ValueError("Decode requires device planning")
-        if isinstance(request, LayerExecutionRequest):
-            return self._resolve_layer_execution(request, context)
-        buf = self._waves.get((request.layer_id, request.wave))
-        if buf is None:
-            raise ValueError("Bind every decode wave before capture")
-        demand = request.local_demand
-        self._validate_demand(demand, buf["layer"])
-        prepared = request.layer_plan
-        if prepared is not None:
-            self._check_layer_plan(prepared, context)
-            if prepared.layer_id != request.layer_id or prepared.demand is not demand:
-                raise ValueError("Decode request does not match its prepared layer")
-            if request.wave in prepared.used_waves:
-                raise RuntimeError(
-                    "Prepared wave already consumed in this layer invocation"
-                )
-        elif self._active_layer_plan is not None:
-            raise RuntimeError("An active layer requires its explicit prepared plan")
-        bound, plan = buf["bound"], buf["plan"]
-        if bound.wave.bank in self._active_execution:
-            raise RuntimeError("Retire the previous execution bank reservation first")
-        reader = self._readers.get(bound.wave.bank)
-        if reader is not None:
-            reader.completion.wait_on(context.compute_stream)
-        start, end = request.wave.local_start, request.wave.local_end
-        if prepared is None:
-            self._prepare_sources(buf, demand[start:end], request.layer_id, start)
-        else:
-            prepared.used_waves.add(request.wave)
-            plan = buf["prepared_plan"]
-            # A copy/FFN in an earlier wave may have latched a new error since
-            # full-layer preparation. Never reuse its earlier healthy mask.
-            torch.eq(self.error_status, 0, out=self._healthy)
-            torch.logical_and(buf["layer_needed"], self._healthy, out=plan.valid)
-            torch.where(plan.valid, buf["layer_kind"], self._zero, out=plan.source_kind)
-            torch.sum(plan.valid, dim=0, dtype=torch.int32, out=plan.count)
-        self.state.execution_valid[
-            bound.execution_start : bound.execution_start + plan.capacity
-        ].zero_()
-        # This frontier includes current input packing and the prior wave. It
-        # must remain per wave; layer preparation does not authorize prefetch.
-        ready = context.record_compute_completion()
-        context.retain(ready)
-        token = _Reservation(self._token, context.invocation_id, buf)
-        self._active_execution[bound.wave.bank] = token
-        return MaterializationPlan(
-            plan,
-            bound.bindings,
-            (ready.completion,),
-            (self, buf, ready, prepared),
-            token,
-        )
+        return self._resolve_layer_execution(request, context)
 
     def _resolve_layer_execution(self, request, context):
-        if (
-            self._active_layer_plan is not None
-            or self._active_execution
-            or self._pending_update
-        ):
+        if self._active_execution or self._pending_update:
             raise RuntimeError("Retire prior readers/plans before executing a layer")
         buf = self._execution_layers.get(request.layer_id)
         if buf is None or buf["bank_id"] != request.bank_id:
@@ -613,8 +413,8 @@ class TensorResidencyOps(ResidencyOps):
             raise TypeError("Publication requires a complete bundle ticket")
         context.retain((reservation, weights_ready))
         if token.prefill:
-            # The worker publishes only host-static bindings. Waiting on compute
-            # here would serialize Attention/Router behind the prefetch. The
+            # Publish only host-static bindings. Waiting on compute here would
+            # serialize Attention/Router behind the prefetch. The
             # local program joins this ticket immediately before its FFN.
             token.published = True
             ticket = TransferTicket(
@@ -657,8 +457,6 @@ class TensorResidencyOps(ResidencyOps):
         buf["inverse"].sub_(1)
 
     def prepare_update(self, target_keys, context, *, update_enabled=None):
-        if self._active_layer_plan is not None:
-            raise RuntimeError("Finish the decode layer before changing the hot set")
         if context.phase is not Phase.DECODE:
             raise RuntimeError("Hot updates are decode-only")
         self._validate_tensor(

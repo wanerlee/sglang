@@ -1,5 +1,7 @@
 # H2D 实现与资源契约（2026-10-25）
 
+> 历史设计记录：本文中的 wave 调度、分组配置及相关接口已在分层分支删除。当前执行方式和配置迁移见[分层实现说明](../../../../../../scripts/moe_layer/README.md)。缓存策略设计仍供参考。
+
 当前实现由公共 `ExpertWeightAccess` 直接组合 `HostTransferOps` /
 `DeviceTransferOps`，并复用有界 prefill pipeline。重构与验证状态见 [重构记录](REFACTOR_20261025.zh-CN.md)。
 

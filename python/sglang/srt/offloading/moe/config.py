@@ -129,27 +129,3 @@ class ExpertCatalog:
         if not 0 <= local_id < self._by_layer[layer_id].local_experts:
             raise ValueError("Invalid rank-local expert ID")
         return self._offsets[layer_id] + local_id
-
-
-@dataclass(frozen=True)
-class ExpertWave:
-    index: int
-    local_start: int
-    local_end: int
-    bank: int
-
-
-def fixed_waves(local_experts, bank_slots, bank_count=1):
-    """Static partition of all local experts, including empty execution waves.
-
-    Communication keeps original global expert IDs. Bank lanes are a local F
-    concern. Never renormalize top-k weights when masking routes for a wave.
-    Repeated DFC uses the same collective count/order on every EP rank; a
-    dispatch-once program uses the waves only for local F between its D and C.
-    """
-    if min(local_experts, bank_slots, bank_count) <= 0:
-        raise ValueError("Expert and bank capacities must be positive")
-    return tuple(
-        ExpertWave(i, start, min(start + bank_slots, local_experts), i % bank_count)
-        for i, start in enumerate(range(0, local_experts, bank_slots))
-    )
