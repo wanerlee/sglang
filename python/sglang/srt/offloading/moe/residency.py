@@ -15,6 +15,7 @@ from ..transfer import CopySourceKind, DeviceCopyPlan, HostCopyPlan, TransferTic
 from .config import ExpertWave, Phase
 from .execution import MaterializationPlan, require_prefill
 from .interfaces import ResidencyOps
+from .layer_execution import BoundExecutionLayer, LayerExecutionRequest
 from .resources import tensor_allocations
 
 
@@ -78,6 +79,7 @@ class TensorResidencyOps(ResidencyOps):
         error_status=None,
         prepare_prefill=None,
         cache_stats=None,
+        execution_layers=(),
     ):
         self.state, self.catalog = state, catalog
         self.update_bindings = update_bindings
@@ -123,6 +125,9 @@ class TensorResidencyOps(ResidencyOps):
         self._check_bindings(update_bindings)
         for bound in execution_waves:
             self._bind_wave(bound)
+        self._execution_layers = {}
+        for bound in execution_layers:
+            self._bind_layer(bound)
         banks = tuple(self._banks.values())
         for index, (start, size) in enumerate(banks):
             for other_start, other_size in banks[index + 1 :]:
@@ -210,7 +215,12 @@ class TensorResidencyOps(ResidencyOps):
             raise ValueError("Duplicate execution wave binding")
         self._check_bindings(bound.bindings)
         prefix = f"wave.{bound.layer_id}.{wave.index}.{wave.bank}"
-        buf = {"bound": bound, "layer": layer, "plan": self._plan(prefix, size)}
+        buf = {
+            "bound": bound,
+            "bank_id": wave.bank,
+            "layer": layer,
+            "plan": self._plan(prefix, size),
+        }
         for name in ("keys", "slots", "safe_slots", "slot_keys", "counts", "frequency"):
             buf[name] = self._tensor(prefix + "." + name, (size,))
         for name in ("needed", "hit", "flag", "flag2", "published_valid"):
@@ -239,6 +249,39 @@ class TensorResidencyOps(ResidencyOps):
             size,
         )
         self._waves[key] = buf
+
+    def _bind_layer(self, bound):
+        if not isinstance(bound, BoundExecutionLayer):
+            raise TypeError("execution_layers requires BoundExecutionLayer records")
+        layer = self._layers.get(bound.layer_id)
+        if layer is None or bound.bank_id < 0:
+            raise ValueError("Invalid bound execution layer")
+        size = layer.local_experts
+        if not 0 <= bound.execution_start <= self.execution_slots - size:
+            raise ValueError("Execution bank cannot hold the complete local layer")
+        if bound.layer_id in self._execution_layers or any(
+            key[0] == bound.layer_id for key in self._waves
+        ):
+            raise ValueError("Bind each layer to exactly one execution schedule")
+        old = self._banks.get(bound.bank_id)
+        if old is not None and old[0] != bound.execution_start:
+            raise ValueError("One execution bank must keep its physical offset")
+        self._banks[bound.bank_id] = (
+            bound.execution_start,
+            max(size, old[1] if old else 0),
+        )
+        self._check_bindings(bound.bindings)
+        buf = self._layer_sources[bound.layer_id]
+        buf.update(bound=bound, bank_id=bound.bank_id)
+        buf["published_valid"] = self._tensor(
+            f"layer.{bound.layer_id}.published_valid", (size,), torch.bool
+        )
+        torch.arange(
+            bound.execution_start,
+            bound.execution_start + size,
+            out=buf["plan"].destination_slot,
+        )
+        self._execution_layers[bound.layer_id] = buf
 
     def _allocate_layer_sources(self, layer):
         prefix = f"layer.{layer.layer_id}"
@@ -417,6 +460,8 @@ class TensorResidencyOps(ResidencyOps):
             )
         if request.phase is not Phase.DECODE:
             raise ValueError("Decode requires device planning")
+        if isinstance(request, LayerExecutionRequest):
+            return self._resolve_layer_execution(request, context)
         buf = self._waves.get((request.layer_id, request.wave))
         if buf is None:
             raise ValueError("Bind every decode wave before capture")
@@ -466,6 +511,32 @@ class TensorResidencyOps(ResidencyOps):
             (ready.completion,),
             (self, buf, ready, prepared),
             token,
+        )
+
+    def _resolve_layer_execution(self, request, context):
+        if (
+            self._active_layer_plan is not None
+            or self._active_execution
+            or self._pending_update
+        ):
+            raise RuntimeError("Retire prior readers/plans before executing a layer")
+        buf = self._execution_layers.get(request.layer_id)
+        if buf is None or buf["bank_id"] != request.bank_id:
+            raise ValueError("Bind the complete decode layer before capture")
+        self._validate_demand(request.local_demand, buf["layer"])
+        reader = self._readers.get(request.bank_id)
+        if reader is not None:
+            context.wait_for(reader, context.compute_stream)
+        self._prepare_sources(buf, request.local_demand, request.layer_id, 0)
+        bound, plan = buf["bound"], buf["plan"]
+        self.state.execution_valid[
+            bound.execution_start : bound.execution_start + plan.capacity
+        ].zero_()
+        ready = context.record_compute_completion()
+        token = _Reservation(self._token, context.invocation_id, buf)
+        self._active_execution[request.bank_id] = token
+        return MaterializationPlan(
+            plan, bound.bindings, (ready.completion,), (self, buf, ready), token
         )
 
     def _prepare_sources(self, buf, demand, layer_id, start):
@@ -572,8 +643,8 @@ class TensorResidencyOps(ResidencyOps):
             raise TypeError("Reader completion must be a TransferTicket")
         context.retain((reservation, read_done))
         if not token.prefill:
-            self._readers[token.buffers["bound"].wave.bank] = read_done
-            del self._active_execution[token.buffers["bound"].wave.bank]
+            self._readers[token.buffers["bank_id"]] = read_done
+            del self._active_execution[token.buffers["bank_id"]]
         token.retired = True
 
     def _inverse(self, keys, valid, buf):

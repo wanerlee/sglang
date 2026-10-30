@@ -198,6 +198,10 @@ class HostOps:
     def clear_cache(self):
         self.plans.clear()
 
+    def prepare(self, plan, device):
+        if not isinstance(plan, HostCopyPlan):
+            raise TypeError("Expected a host copy plan")
+
     def materialize_into(self, plan, bindings, stream):
         self.retain((plan, bindings))
         self.plans.append(plan)
@@ -261,6 +265,9 @@ class Assembly:
         self.policy = TensorLFUPolicy()
         backend = self.backend = NpuMoEBackend.__new__(NpuMoEBackend)
         backend.settings = SimpleNamespace(
+            prefill_mode="wave",
+            decode_mode="wave",
+            layer_profile=False,
             prefill_group_size=group,
             prefill_microbatch_size=1,
             prefill_max_inflight=2,
@@ -880,6 +887,20 @@ class TestAclHostTransfer(unittest.TestCase):
         self.assertIs(self.retained[-1], ticket)
         with self.assertRaisesRegex(ValueError, "source allocation"):
             HostCopyRegion(self.source, self.destination, 250, 0, 64)
+
+    def test_prepare_builds_descriptors_without_submission_or_completion(self):
+        self.ops.prepare(self.plan, self.device)
+        self.assertEqual(self.module.Batch.call_count, 2)
+        self.module.submit.assert_not_called()
+        self.completion.assert_not_called()
+        self.assertEqual(self.retained, [])
+        with mock.patch.object(
+            self.ops, "_lower", side_effect=AssertionError("rebuilt")
+        ):
+            ticket = self.ops.materialize_into(self.plan, None, self.stream)
+        self.assertIsInstance(ticket, TransferTicket)
+        self.assertEqual(self.module.submit.call_count, 2)
+        self.completion.assert_called_once()
 
     def test_partial_submission_retains_complete_plan_and_native_batches(self):
         self.module.submit.side_effect = [None, RuntimeError("submit failed")]

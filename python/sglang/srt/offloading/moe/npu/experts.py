@@ -116,6 +116,14 @@ class NPUWaveInput:
 
 
 @dataclass(frozen=True)
+class NPULayerInput:
+    hidden_states: torch.Tensor
+    hidden_states_scale: object
+    expert_tokens: torch.Tensor
+    row_count: torch.Tensor
+
+
+@dataclass(frozen=True)
 class _Combined:
     hidden_states: torch.Tensor
     original_hidden_width: int
@@ -376,6 +384,66 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             context.retain(result)
             return result
 
+    def select_layer(self, layout, context):
+        """Use the already expert-grouped prefix; no offset gather or partition."""
+        if layout.selected is not None:
+            raise RuntimeError("Write the previous layer before reusing its input")
+        raw = layout.dispatched.raw
+        rows = raw.hidden_states.shape[0]
+        count = layout.offsets[-1]
+        with _compute_scope(context, self.device):
+            if layout.prefill_offsets is not None:
+                used = layout.prefill_offsets[-1]
+                x = raw.hidden_states[:used]
+            else:
+                used = rows
+                x = self._copy_layer_bytes(
+                    raw.hidden_states, layout.row_ids >= count, "input_bytes"
+                )
+            scale = raw.hidden_states_scale
+            if scale is not None:
+                if rows == 0:
+                    if scale.numel():
+                        raise ValueError("Empty input cannot have nonempty scales")
+                else:
+                    if not scale.is_contiguous() or scale.numel() % rows:
+                        raise ValueError(
+                            "Layer scales require a fixed contiguous row shape"
+                        )
+                    scale = scale.view(rows, -1)[:used]
+                    if layout.prefill_offsets is None:
+                        scale = self._copy_layer_bytes(
+                            scale, layout.row_ids >= count, "scale_bytes"
+                        )
+            result = NPULayerInput(x, scale, layout.counts, count)
+            layout.selected = result
+            context.retain(result)
+            return result
+
+    def _copy_layer_bytes(self, source, padding, name):
+        # Reuse the already budgeted workspace, including float8/E8M0 bits.
+        # No per-layer clone or graph-dependent receive allocation is needed.
+        nbytes = source.numel() * source.element_size()
+        storage = self._owned[name]
+        if nbytes > storage.numel():
+            raise ValueError("Layer input exceeds its reserved byte workspace")
+        target = storage[:nbytes].view(source.dtype).view(source.shape)
+        target.view(torch.int8).copy_(source.view(torch.int8))
+        # CANN masked-fill does not support uint8 on the supported builds.
+        target.view(torch.int8).masked_fill_(padding.unsqueeze(1), 0)
+        return target
+
+    def write_layer(self, layout, output, context):
+        if not isinstance(layout.selected, NPULayerInput):
+            raise RuntimeError("Layer write requires its selected full-layer input")
+        rows = layout.selected.hidden_states.shape[0]
+        target = layout.output[:rows]
+        if output.shape != target.shape:
+            raise ValueError("Layer FFN must preserve the selected receive shape")
+        with _compute_scope(context, self.device):
+            target.copy_(output)
+            layout.selected = None
+
     def _gather_bytes(self, source, indices, count, name):
         rows = source.shape[0]
         if rows == 0:
@@ -592,6 +660,9 @@ def build_npu_layer_programs(
     max_dispatch_rows,
     device=None,
     shared_layout=None,
+    prefill_mode="wave",
+    decode_mode="wave",
+    profile=None,
 ):
     """Bind a real FusedMoE's native dispatcher and Ascend FFN to offload access.
 
@@ -636,21 +707,42 @@ def build_npu_layer_programs(
         layer_demand=lambda layout: layout.counts,
         compute_scope=lambda context: _compute_scope(context, device),
     )
-    prefill_local = PrefillLocalExpertProgram(pipeline, runner)
-    return NPULayerPrograms(
-        PrefillDispatchOnceProgram(
+    from ..layer_programs import LayerExpertProgram
+
+    if prefill_mode == "layer":
+        prefill = LayerExpertProgram(
+            dispatcher,
+            layout,
+            runner,
+            access,
+            compute_scope=lambda ctx: _compute_scope(ctx, device),
+            pipeline=pipeline,
+            profile=profile,
+        )
+    else:
+        prefill_local = PrefillLocalExpertProgram(pipeline, runner)
+        prefill = PrefillDispatchOnceProgram(
             dispatcher,
             prefill_local,
             layout,
             local_experts=experts.num_local_experts,
             pipeline=pipeline,
-        ),
-        DispatchOnceProgram(
+        )
+    if decode_mode == "layer":
+        decode = LayerExpertProgram(
+            dispatcher,
+            layout,
+            runner,
+            access,
+            compute_scope=lambda ctx: _compute_scope(ctx, device),
+            profile=profile,
+        )
+    else:
+        decode = DispatchOnceProgram(
             decode_waves,
             dispatcher,
             decode_local,
             layout,
             local_experts=experts.num_local_experts,
-        ),
-        layout,
-    )
+        )
+    return NPULayerPrograms(prefill, decode, layout)

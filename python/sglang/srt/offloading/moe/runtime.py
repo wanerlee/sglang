@@ -667,9 +667,11 @@ class BoundMoERuntime:
             if context.capturing:
                 raise RuntimeError("Prefill layer-start cannot run during capture")
             # Shared A/B storage cannot overwrite the previous layer's reader.
-            frontier = context.record_compute_completion()
-            frontier.completion.wait_on(context.copy_stream)
-            self.layer_programs[layer_id].prefill.layer_start(layer_id, context)
+            program = self.layer_programs[layer_id].prefill
+            if not getattr(program, "manages_layer_dependencies", False):
+                frontier = context.record_compute_completion()
+                frontier.completion.wait_on(context.copy_stream)
+            program.layer_start(layer_id, context)
 
     def run_layer(self, layer_id, hidden_states, routing, *, pre_quant_input=None):
         self._require_emission()
@@ -736,6 +738,7 @@ class BoundMoERuntime:
         stream = self.device_runtime.current_stream()
         token = owner.begin_forward(phase, stream)
         context = self._new_context(phase, stream=stream)
+        context.forward_sequence = token.sequence
         self._context = context
         logger.debug(
             "MoE offload forward.begin: rank=%s seq=%s phase=%s mode=%s "
@@ -769,6 +772,11 @@ class BoundMoERuntime:
             context.cache_graph_replayed = False
             context.retain(forward_batch)
             yield context
+            if phase is Phase.PREFILL:
+                for pipeline in self.pipelines:
+                    finish = getattr(pipeline, "finish_forward", None)
+                    if finish is not None:
+                        finish(context)
             if (
                 interval is not None
                 and active_decode
