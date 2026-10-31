@@ -54,6 +54,14 @@ prefill graph 仍关闭，decode 仍走原有 graph 后端。不能据此认定 
 - Prefill 预取整层全部本地专家，因此不需要提前预测下一层路由。
   Copy stream 仍是串行的；加载赶不上计算时，计算仍然需要等权重。
 
+NORMAL Prefill 的 FFN 适配直接使用 dispatch 返回的 host counts：在 CPU 校验并求和，
+只构造原生 GMM 所需的设备 counts，不再复制 counts 或计算设备前缀和。
+等待权重准备完成后，保留一次错误状态检查；整层 bank 不再重复查询动态槽位有效性。
+GMM 输入仅包含实际接收行，因此无需逐行掩码。接收布局紧凑时，原生 FFN 输出直接进入
+Combine；存在 padding 时，复用原有输出池，复制有效前缀并清零尾部。
+Combine 前仍按共享错误状态屏蔽失败输出。原生 GMM、激活、量化、预取依赖及 Decode
+路径保持不变。这些调整减少适配产生的设备操作，实际耗时收益需要 NPU profiling 验证。
+
 ## Decode：整层按需准备，保留缓存
 
 ```text
@@ -121,9 +129,10 @@ Prefill 沿用原有 Hot 借用机制：先快照，切回 decode 时恢复原�
 
 ```bash
 PYTHONPATH=python:test/registered/unit/offloading \
-python -m unittest test_layer_execution test_npu_backend test_native_periodic_cache
+python -m unittest test_layer_execution test_moe_layer_workspace test_npu_backend test_native_periodic_cache
 ```
 
 测试覆盖：完整权重 bundle、命中/缺失和代际故障、counts 变化后的设备计划重放、
 bank 覆盖依赖、连续 forward、单次 dispatch/FFN/combine、padding/NaN、
-prefill/decode 缓存恢复以及原有周期 LFU 规则。
+prefill/decode 缓存恢复以及原有周期 LFU 规则。紧凑 Prefill 另覆盖 BF16/FP16、
+输出直接传递、连续层共享池复用、dispatch 后出现错误时的抑制，以及多层输出生命周期。

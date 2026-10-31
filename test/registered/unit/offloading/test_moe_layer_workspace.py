@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from moe_test_utils import Context, TensorTrace
 
 from sglang.srt.offloading.moe.config import Phase
 from sglang.srt.offloading.moe.layer_execution import LayerExecutionRequest
@@ -31,6 +32,162 @@ class QuantInfo:
 
 
 class TestLayerWorkspace(unittest.TestCase):
+    def test_compact_prefill_counts_and_output_without_reductions_or_roundtrip(self):
+        for dtype in (torch.bfloat16, torch.float16):
+            with (
+                self.subTest(dtype=dtype),
+                patch.object(native, "_compute_scope", lambda *args: nullcontext()),
+            ):
+                error = torch.zeros((), dtype=torch.int32)
+                adapter = native.NPUDispatchLayout(4, 4, 8, "cpu", error)
+                adapter._owned["counts"].fill_(-99)
+                adapter._owned["offsets"].fill_(-99)
+                adapter._owned["output"].fill_(-99)
+                ctx = Context()
+                ctx.phase, ctx.capturing = Phase.PREFILL, False
+                x = torch.randn(8, 4).to(dtype)
+                scale = torch.arange(8, dtype=torch.float32)
+                raw = SimpleNamespace(
+                    format="deepep_normal",
+                    hidden_states=x,
+                    hidden_states_scale=scale,
+                    num_recv_tokens_per_expert=[2, 0, 5, 1],
+                )
+                with TensorTrace() as trace:
+                    layout = adapter.bind(native.NPUDispatch(raw, 4, object()), ctx)
+                    inputs = adapter.select_layer(layout, ctx)
+                reductions = {"aten.any.default", "aten.sum.default", "aten.cumsum.out"}
+                self.assertFalse(reductions & {str(call[0]) for call in trace.calls})
+                self.assertEqual(inputs.row_count, 8)
+                self.assertEqual(inputs.hidden_states.data_ptr(), x.data_ptr())
+                self.assertEqual(
+                    inputs.hidden_states_scale.data_ptr(), scale.data_ptr()
+                )
+                torch.testing.assert_close(
+                    inputs.expert_tokens, torch.tensor([2, 0, 5, 1])
+                )
+                self.assertTrue((adapter._owned["counts"] == -99).all())
+                self.assertTrue((adapter._owned["offsets"] == -99).all())
+
+                native_output = x * 2
+
+                def run(data, quant, state):
+                    self.assertIs(data.expert_tokens, inputs.expert_tokens)
+                    return SimpleNamespace(hidden_states=native_output)
+
+                runner = native.NPUExpertRunner(
+                    None, _core=SimpleNamespace(run=run), _input_type=SimpleNamespace
+                )
+                bank = native.NPUExpertBank(
+                    QuantInfo(torch.ones(4, 1, 1), torch.ones(4, 1, 1)),
+                    torch.ones(4, dtype=torch.bool),
+                    error,
+                )
+                with TensorTrace() as trace:
+                    result = runner(3, inputs, SimpleNamespace(expert_bank=bank), ctx)
+                    adapter.write_layer(layout, result.output, ctx)
+                    output = adapter.combine_input(layout, ctx).output
+                self.assertFalse(
+                    (
+                        reductions
+                        | {
+                            "aten.where.self",
+                            "aten.arange.default",
+                            "aten.copy_.default",
+                        }
+                    )
+                    & {str(call[0]) for call in trace.calls}
+                )
+                self.assertIs(output, native_output)
+                torch.testing.assert_close(output, x * 2)
+                # A compact result never clears or writes the shared output pool.
+                self.assertTrue((adapter._owned["output"] == -99).all())
+
+    def test_prefill_fault_latch_suppresses_unwritten_ffn_output(self):
+        for used, late_fault in (
+            (0, False),
+            (3, False),
+            (8, False),
+            (3, True),
+            (8, True),
+        ):
+            with (
+                self.subTest(used=used, late_fault=late_fault),
+                patch.object(native, "_compute_scope", lambda *args: nullcontext()),
+            ):
+                error = torch.tensor(0 if late_fault else 256, dtype=torch.int32)
+                adapter = native.NPUDispatchLayout(4, 4, 8, "cpu", error)
+                adapter._owned["output"].fill_(float("nan"))
+                ctx = Context()
+                ctx.phase, ctx.capturing = Phase.PREFILL, False
+                raw = SimpleNamespace(
+                    format="deepep_normal",
+                    hidden_states=torch.ones(8, 4, dtype=torch.bfloat16),
+                    hidden_states_scale=None,
+                    num_recv_tokens_per_expert=[0, used, 0, 0],
+                )
+                layout = adapter.bind(native.NPUDispatch(raw, 4, object()), ctx)
+                inputs = adapter.select_layer(layout, ctx)
+                if late_fault:
+                    # The runner must observe faults reported after dispatch,
+                    # when the program joins weight preparation before FFN.
+                    error.fill_(256)
+                calls = []
+
+                def run(data, quant, state):
+                    calls.append("ffn")
+                    self.assertEqual(data.expert_tokens.tolist(), [0] * 4)
+                    return SimpleNamespace(
+                        hidden_states=torch.full_like(data.hidden_states, float("nan"))
+                    )
+
+                runner = native.NPUExpertRunner(
+                    None, _core=SimpleNamespace(run=run), _input_type=SimpleNamespace
+                )
+                bank = native.NPUExpertBank(
+                    QuantInfo(torch.ones(4, 1, 1), torch.ones(4, 1, 1)),
+                    torch.ones(4, dtype=torch.bool),
+                    error,
+                )
+                result = runner(3, inputs, SimpleNamespace(expert_bank=bank), ctx)
+                adapter.write_layer(layout, result.output, ctx)
+                output = adapter.combine_input(layout, ctx).output
+                torch.testing.assert_close(
+                    output, torch.zeros(8, 4, dtype=output.dtype)
+                )
+                self.assertEqual(int(error), 256)
+                self.assertEqual(calls, ["ffn"] if used else [])
+
+    def test_prefill_reuses_output_pool_without_stale_padding(self):
+        with patch.object(native, "_compute_scope", lambda *args: nullcontext()):
+            adapter = native.NPUDispatchLayout(
+                4, 4, 8, "cpu", torch.zeros((), dtype=torch.int32)
+            )
+            ctx = Context()
+            ctx.phase, ctx.capturing = Phase.PREFILL, False
+            for used in (8, 3, 0, 6, 8):
+                with self.subTest(used=used):
+                    raw = SimpleNamespace(
+                        format="deepep_normal",
+                        hidden_states=torch.ones(8, 4, dtype=torch.bfloat16),
+                        hidden_states_scale=None,
+                        num_recv_tokens_per_expert=[used, 0, 0, 0],
+                    )
+                    layout = adapter.bind(native.NPUDispatch(raw, 4, object()), ctx)
+                    inputs = adapter.select_layer(layout, ctx)
+                    result = inputs.hidden_states * (used + 1)
+                    adapter.write_layer(layout, result, ctx)
+                    output = adapter.combine_input(layout, ctx).output
+                    expected = torch.zeros_like(output)
+                    expected[:used] = used + 1
+                    torch.testing.assert_close(output, expected)
+                    if used == 8:
+                        self.assertIs(output, result)
+                    else:
+                        self.assertEqual(
+                            output.data_ptr(), adapter._owned["output"].data_ptr()
+                        )
+
     def test_bank_rejects_mismatched_payload_before_native_execution(self):
         valid = torch.ones(2, dtype=torch.bool)
         error = torch.zeros((), dtype=torch.int32)
@@ -207,9 +364,13 @@ class TestLayerWorkspace(unittest.TestCase):
             patch.dict("os.environ", {"MOE_ENABLE_TOPK_NEG_ONE": "1"}),
             patch.object(native, "_compute_scope", lambda *args: nullcontext()),
         ):
-            for phase in Phase:
-                with self.subTest(phase=phase):
-                    fixture = self.fixture(phase=phase)
+            for phase, ids in (
+                (Phase.PREFILL, (0, 2)),
+                (Phase.PREFILL, (0, 1, 2, 3) * 2),
+                (Phase.DECODE, (0, 2)),
+            ):
+                with self.subTest(phase=phase, ids=ids):
+                    fixture = self.fixture(ids=ids, phase=phase)
                     pointers = {
                         k: v.data_ptr() for k, v in fixture.layout._owned.items()
                     }

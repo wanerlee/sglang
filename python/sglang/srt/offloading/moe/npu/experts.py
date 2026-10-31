@@ -2,16 +2,15 @@
 
 The NPU DeepEP receive buffer is a *flat*, expert-grouped allocation. Its device
 counts delimit the meaningful prefix; CUDA's [expert, capacity, hidden] layout
-is deliberately not accepted. Decode keeps fixed activation capacity; eager NORMAL prefill uses the
-dispatcher's host counts to slice the full layer's actual rows. Native GMM/activation temporaries still belong to the
-runtime's workspace budget.
+is deliberately not accepted. Decode keeps fixed activation capacity; eager
+NORMAL prefill uses the dispatcher's host counts to slice the full layer's actual
+rows. Native GMM/activation temporaries still belong to the workspace budget.
 """
 
 from __future__ import annotations
 
 from contextlib import ExitStack
 from dataclasses import dataclass, fields
-from itertools import accumulate
 
 import torch
 
@@ -89,11 +88,11 @@ class NPUDispatch:
 class _Layout:
     dispatched: NPUDispatch
     counts: torch.Tensor
-    offsets: torch.Tensor
+    offsets: torch.Tensor | None
     output: torch.Tensor
     row_ids: torch.Tensor
     selected: object = None
-    prefill_offsets: tuple[int, ...] | None = None
+    prefill_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +100,7 @@ class NPULayerInput:
     hidden_states: torch.Tensor
     hidden_states_scale: object
     expert_tokens: torch.Tensor
-    row_count: torch.Tensor
+    row_count: torch.Tensor | int
 
 
 @dataclass(frozen=True)
@@ -248,8 +247,8 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
     """Bounded decode packing and compact eager prefill over one receive buffer.
 
     Byte views preserve MXFP8 activation/scale bits without relying on float8
-    index_select support. The full receive output is initialized, and padding is
-    never counted as expert demand. NORMAL prefill slices contiguous expert rows
+    index_select support. Receive padding is zeroed and never counted as expert
+    demand. NORMAL prefill slices contiguous expert rows
     using existing host counts, without reading device counts back to the CPU.
     Buffers are reused only on the compute stream after the local program has
     joined every registered FFN reader.
@@ -309,7 +308,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         ):
             raise ValueError("Unsupported NPU compact dispatch shape or capacity")
         name = _format_name(raw)
-        prefill_offsets = None
+        prefill_rows = None
         if name == "deepep_normal":
             if context.capturing or context.phase is Phase.DECODE:
                 raise ValueError("Decode requires device-count DeepEP low latency")
@@ -322,8 +321,8 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 raise ValueError(
                     "Prefill dispatch requires nonnegative host counts for every expert"
                 )
-            prefill_offsets = tuple(accumulate(host_counts, initial=0))
-            if prefill_offsets[-1] > x.shape[0]:
+            prefill_rows = sum(host_counts)
+            if prefill_rows > x.shape[0]:
                 raise ValueError("Prefill dispatch counts exceed receive capacity")
             source = torch.as_tensor(host_counts, dtype=torch.int64, device=self.device)
         elif name == "deepep_ll":
@@ -338,25 +337,31 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raise ValueError("Dispatch counts must cover every local expert")
         context.retain((self, dispatched, source))
         with _compute_scope(context, self.device):
-            counts = self._owned["counts"]
-            counts.copy_(source)
-            invalid = (counts < 0).any() | (counts.sum() > x.shape[0])
-            self.error_status.bitwise_or_(invalid.to(torch.int32) * 64)
-            counts.masked_fill_(self.error_status != 0, 0)
-            offsets = self._owned["offsets"]
-            offsets[0].zero_()
-            torch.cumsum(counts, 0, out=offsets[1:])
+            if prefill_rows is not None:
+                # NORMAL already supplies checked host counts. Whole-layer FFN
+                # needs their sum, not per-expert offsets or a second copy.
+                counts, offsets = source, None
+            else:
+                counts = self._owned["counts"]
+                counts.copy_(source)
+                invalid = (counts < 0).any() | (counts.sum() > x.shape[0])
+                self.error_status.bitwise_or_(invalid.to(torch.int32) * 64)
+                counts.masked_fill_(self.error_status != 0, 0)
+                offsets = self._owned["offsets"]
+                offsets[0].zero_()
+                torch.cumsum(counts, 0, out=offsets[1:])
             output = self._owned["output"][: x.shape[0]]
             if x.dtype == torch.float16:
                 output = output.view(torch.float16)
-            output.zero_()
+            if prefill_rows is None:
+                output.zero_()
             result = _Layout(
                 dispatched,
                 counts,
                 offsets,
                 output,
                 self._owned["rows"][: x.shape[0]],
-                prefill_offsets=prefill_offsets,
+                prefill_rows=prefill_rows,
             )
             context.retain(result)
             return result
@@ -367,10 +372,14 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raise RuntimeError("Write the previous layer before reusing its input")
         raw = layout.dispatched.raw
         rows = raw.hidden_states.shape[0]
-        count = layout.offsets[-1]
+        count = (
+            layout.prefill_rows
+            if layout.prefill_rows is not None
+            else layout.offsets[-1]
+        )
         with _compute_scope(context, self.device):
-            if layout.prefill_offsets is not None:
-                used = layout.prefill_offsets[-1]
+            if layout.prefill_rows is not None:
+                used = layout.prefill_rows
                 x = raw.hidden_states[:used]
             else:
                 used = rows
@@ -388,7 +397,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                             "Layer scales require a fixed contiguous row shape"
                         )
                     scale = scale.view(rows, -1)[:used]
-                    if layout.prefill_offsets is None:
+                    if layout.prefill_rows is None:
                         scale = self._copy_layer_bytes(
                             scale, layout.row_ids >= count, "scale_bytes"
                         )
@@ -418,7 +427,15 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         if output.shape != target.shape:
             raise ValueError("Layer FFN must preserve the selected receive shape")
         with _compute_scope(context, self.device):
-            target.copy_(output)
+            if layout.prefill_rows is not None and rows == layout.output.shape[0]:
+                # Compact NORMAL output already has the native combine layout.
+                layout.output = output
+            else:
+                if layout.prefill_rows is not None:
+                    # Retain the receive capacity when it includes padding.
+                    # Only the unwritten tail needs initialization.
+                    layout.output[rows:].zero_()
+                target.copy_(output)
             layout.selected = None
 
     def combine_input(self, layout, context):
@@ -496,11 +513,20 @@ class NPUExpertRunner:
                 output = torch.empty_like(dispatched.hidden_states, dtype=dtype)
                 context.retain(output)
                 return LocalExecution(output, self._reader_ticket(context))
-            valid = bank.execution_valid
-            bad = ((dispatched.expert_tokens > 0) & ~valid).any()
-            bank.error_status.bitwise_or_(bad.to(torch.int32) * 128)
-            healthy = bank.error_status == 0
-            counts = torch.where(healthy, dispatched.expert_tokens, 0)
+            compact_prefill = context.phase is Phase.PREFILL and isinstance(
+                dispatched.row_count, int
+            )
+            if compact_prefill:
+                # The complete bank is ready after wait_ready; no dynamic slot
+                # validity to query. Check the shared fault latch after the wait.
+                counts = dispatched.expert_tokens
+                counts.masked_fill_(bank.error_status != 0, 0)
+            else:
+                valid = bank.execution_valid
+                bad = ((dispatched.expert_tokens > 0) & ~valid).any()
+                bank.error_status.bitwise_or_(bad.to(torch.int32) * 128)
+                healthy = bank.error_status == 0
+                counts = torch.where(healthy, dispatched.expert_tokens, 0)
             runner_input = self.input_type(
                 hidden_states=dispatched.hidden_states,
                 hidden_states_scale=dispatched.hidden_states_scale,
@@ -510,12 +536,13 @@ class NPUExpertRunner:
             context.retain(runner_input)
             output = self.core.run(runner_input, quant, {}).hidden_states
             context.retain(output)
-            # Unwritten GMM padding may contain NaN; multiply-by-zero is unsafe.
-            row_ids = torch.arange(output.shape[0], device=output.device)
-            good_rows = (row_ids < dispatched.row_count) & healthy
-            # Own the GMM result: clear padding in place rather than allocating
-            # and retaining a second [receive_capacity, hidden] output per layer.
-            output.masked_fill_(~good_rows.unsqueeze(1), 0)
+            if not compact_prefill:
+                # Unwritten GMM padding may contain NaN; multiply-by-zero is unsafe.
+                row_ids = torch.arange(output.shape[0], device=output.device)
+                good_rows = (row_ids < dispatched.row_count) & healthy
+                output.masked_fill_(~good_rows.unsqueeze(1), 0)
+            # Compact prefill has no padding. combine_input applies the shared
+            # fault latch once, including any unwritten output on a failed step.
             return LocalExecution(output, self._reader_ticket(context))
 
 
