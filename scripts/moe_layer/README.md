@@ -59,8 +59,8 @@ NORMAL Prefill 的 FFN 适配直接使用 dispatch 返回的 host counts：在 C
 等待权重准备完成后，保留一次错误状态检查；整层 bank 不再重复查询动态槽位有效性。
 GMM 输入仅包含实际接收行，因此无需逐行掩码。接收布局紧凑时，原生 FFN 输出直接进入
 Combine；存在 padding 时，复用原有输出池，复制有效前缀并清零尾部。
-Combine 前仍按共享错误状态屏蔽失败输出。原生 GMM、激活、量化、预取依赖及 Decode
-路径保持不变。这些调整减少适配产生的设备操作，实际耗时收益需要 NPU profiling 验证。
+Combine 前仍按共享错误状态屏蔽失败输出。原生 GMM、激活、量化和预取依赖保持不变。
+这些调整减少适配产生的设备操作，实际耗时收益需要 NPU profiling 验证。
 
 ## Decode：整层按需准备，保留缓存
 
@@ -79,6 +79,13 @@ dispatch / 设备 counts
 Decode 也没有 wave 循环，但不做下一层全专家盲预取：下一层路由尚未产生，
 为 decode 每次搬一整层会失去按需加载的意义。Execution 固定保留本层所有专家的槽位，
 只写实际使用的槽位，保留设备上的 valid mask 和 generation 校验。
+
+Decode 的接收容量保持固定，实际行数由设备 counts 求和得到，同时用于容量校验与
+padding 判断，不再构造未使用的专家前缀和。输入和 scale 共用预分配的 padding 掩码，
+保留接收数据的复制和尾部清零，避免 NaN padding 进入 FFN。原生 FFN 输出直接传给
+Combine，取消输出池的预清零及整块复制；Combine 前复用该掩码，一次清理 padding
+与失败输出。掩码每次执行重新生成，不读取设备标量到 CPU，不改变 graph 的输入形状。
+权重就绪检查、有效性校验、reader event、缓存统计和 LFU 均保持不变。
 
 Hot 命中统计、全 rank 内跨层 LFU 选择、替换门槛、衰减、维护周期以及 graph 更新门控均复用原逻辑。
 Prefill 沿用原有 Hot 借用机制：先快照，切回 decode 时恢复原权重、映射及策略状态。
@@ -136,3 +143,8 @@ python -m unittest test_layer_execution test_moe_layer_workspace test_npu_backen
 bank 覆盖依赖、连续 forward、单次 dispatch/FFN/combine、padding/NaN、
 prefill/decode 缓存恢复以及原有周期 LFU 规则。紧凑 Prefill 另覆盖 BF16/FP16、
 输出直接传递、连续层共享池复用、dispatch 后出现错误时的抑制，以及多层输出生命周期。
+Decode 另覆盖 BF16/FP16、int32/int64 counts、空/满/部分接收、NaN 输入和 scale、
+无效 counts、权重及 FFN 后故障、直接输出生命周期。CPU tensor 操作重放验证 counts
+和 valid mask 改变后仍使用新值，故障掩码不会残留到后续执行；不能替代真实 NPU graph
+验证。验证这次 Decode 精简时，和 `2ffe3c5d2c` 使用相同配置采集预热后的 32 个 decode
+step，比较输出、设备任务数量、step 耗时与 graph 显存峰值，计时阶段关闭 profiler。

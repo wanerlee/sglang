@@ -41,7 +41,8 @@ class TestLayerWorkspace(unittest.TestCase):
                 error = torch.zeros((), dtype=torch.int32)
                 adapter = native.NPUDispatchLayout(4, 4, 8, "cpu", error)
                 adapter._owned["counts"].fill_(-99)
-                adapter._owned["offsets"].fill_(-99)
+                adapter._owned["row_count"].fill_(-99)
+                adapter._owned["padding"].fill_(True)
                 adapter._owned["output"].fill_(-99)
                 ctx = Context()
                 ctx.phase, ctx.capturing = Phase.PREFILL, False
@@ -67,7 +68,8 @@ class TestLayerWorkspace(unittest.TestCase):
                     inputs.expert_tokens, torch.tensor([2, 0, 5, 1])
                 )
                 self.assertTrue((adapter._owned["counts"] == -99).all())
-                self.assertTrue((adapter._owned["offsets"] == -99).all())
+                self.assertEqual(int(adapter._owned["row_count"]), -99)
+                self.assertTrue(adapter._owned["padding"].all())
 
                 native_output = x * 2
 
@@ -187,6 +189,153 @@ class TestLayerWorkspace(unittest.TestCase):
                         self.assertEqual(
                             output.data_ptr(), adapter._owned["output"].data_ptr()
                         )
+
+    def test_decode_counts_and_padding_replay_without_output_roundtrip(self):
+        # Only native FFN math and stream APIs are simulated. Replay the actual
+        # layout/runner tensor operations with different counts and bank faults.
+        for dtype in (torch.bfloat16, torch.float16):
+            for count_dtype in (torch.int32, torch.int64):
+                with (
+                    self.subTest(dtype=dtype, count_dtype=count_dtype),
+                    patch.object(native, "_compute_scope", lambda *args: nullcontext()),
+                ):
+                    error = torch.zeros((), dtype=torch.int32)
+                    transfer_error = torch.zeros_like(error)
+                    adapter = native.NPUDispatchLayout(4, 4, 8, "cpu", error)
+                    adapter._owned["output"].fill_(-99)
+                    pointers = {k: v.data_ptr() for k, v in adapter._owned.items()}
+                    ctx = Context()
+                    x = torch.ones(8, 4, dtype=dtype)
+                    scale = torch.ones(8, 1, dtype=torch.float32)
+                    source = torch.tensor([0, 3, 0, 0], dtype=count_dtype)
+                    raw = SimpleNamespace(
+                        format="deepep_ll",
+                        hidden_states=x,
+                        hidden_states_scale=scale,
+                        masked_m=source,
+                    )
+                    bank = native.NPUExpertBank(
+                        QuantInfo(torch.ones(4, 1, 1), torch.ones(4, 1, 1)),
+                        torch.ones(4, dtype=torch.bool),
+                        error,
+                    )
+                    row_ids = torch.arange(8)
+                    native_counts = []
+
+                    def run(data, quant, state):
+                        native_counts.append(data.expert_tokens)
+                        output = data.hidden_states * 2
+                        # Model unwritten native output outside the used prefix.
+                        output.masked_fill_(
+                            (row_ids >= data.expert_tokens.sum()).unsqueeze(1),
+                            float("nan"),
+                        )
+                        return SimpleNamespace(hidden_states=output)
+
+                    runner = native.NPUExpertRunner(
+                        None,
+                        _core=SimpleNamespace(run=run),
+                        _input_type=SimpleNamespace,
+                    )
+                    with TensorTrace() as trace:
+                        layout = adapter.bind(native.NPUDispatch(raw, 4, object()), ctx)
+                        inputs = adapter.select_layer(layout, ctx)
+                        # Stand in for an error reported when joining H2D.
+                        error.bitwise_or_(transfer_error)
+                        result = runner(
+                            3, inputs, SimpleNamespace(expert_bank=bank), ctx
+                        )
+                        adapter.write_layer(layout, result.output, ctx)
+                        output = adapter.combine_input(layout, ctx).output
+                    self.assertIs(output, result.output)
+                    self.assertFalse(
+                        {
+                            "aten._local_scalar_dense.default",
+                            "aten.cumsum.out",
+                            "aten.arange.default",
+                        }
+                        & {str(call[0]) for call in trace.calls}
+                    )
+                    cases = (
+                        ([0, 0, 0, 0], None, 0, 0),
+                        ([2, 2, 2, 2], None, 0, 0),
+                        ([1, 0, 1, 0], 2, 0, 128),
+                        ([1, 0, 1, 0], None, 0, 0),
+                        ([0, 3, 0, 0], None, 256, 256),
+                        ([1, -1, 0, 0], None, 0, 64),
+                        ([0, 9, 0, 0], None, 0, 64),
+                        ([0, 2, 1, 0], None, 0, 0),
+                    )
+                    for counts, invalid_expert, fault, expected_error in cases:
+                        with self.subTest(
+                            counts=counts, fault=fault, invalid_expert=invalid_expert
+                        ):
+                            source.copy_(torch.tensor(counts, dtype=count_dtype))
+                            error.zero_()
+                            transfer_error.fill_(fault)
+                            bank.execution_valid.fill_(True)
+                            if invalid_expert is not None:
+                                bank.execution_valid[invalid_expert] = False
+                            used = 0 if expected_error == 64 else sum(counts)
+                            x.fill_(float("nan"))
+                            x[:used].fill_(3)
+                            scale.fill_(float("nan"))
+                            scale[:used].fill_(4)
+                            replay = trace.replay()
+                            out = replay[id(output)]
+                            expected = torch.zeros_like(out)
+                            if not expected_error:
+                                expected[:used] = 6
+                            torch.testing.assert_close(out, expected)
+                            self.assertEqual(out.dtype, dtype)
+                            self.assertEqual(int(error), expected_error)
+                            self.assertEqual(int(inputs.row_count), used)
+                            self.assertEqual(inputs.hidden_states.shape, x.shape)
+                            self.assertTrue(torch.isfinite(inputs.hidden_states).all())
+                            self.assertTrue(
+                                torch.isfinite(inputs.hidden_states_scale).all()
+                            )
+                            self.assertTrue((inputs.hidden_states[:used] == 3).all())
+                            self.assertTrue((inputs.hidden_states[used:] == 0).all())
+                            self.assertTrue(
+                                (inputs.hidden_states_scale[:used] == 4).all()
+                            )
+                            self.assertTrue(
+                                (inputs.hidden_states_scale[used:] == 0).all()
+                            )
+                            self.assertTrue(x[used:].isnan().all())
+                            self.assertTrue(scale[used:].isnan().all())
+                            self.assertEqual(source.tolist(), counts)
+                            self.assertEqual(
+                                replay[id(native_counts[0])].tolist(),
+                                [0] * 4 if expected_error else counts,
+                            )
+                            self.assertTrue((adapter._owned["output"] == -99).all())
+                            self.assertEqual(
+                                pointers,
+                                {k: v.data_ptr() for k, v in adapter._owned.items()},
+                            )
+
+    def test_decode_fault_after_ffn_is_applied_before_combine(self):
+        with patch.object(native, "_compute_scope", lambda *args: nullcontext()):
+            error = torch.zeros((), dtype=torch.int32)
+            adapter = native.NPUDispatchLayout(4, 4, 8, "cpu", error)
+            ctx = Context()
+            raw = SimpleNamespace(
+                format="deepep_ll",
+                hidden_states=torch.ones(8, 4, dtype=torch.bfloat16),
+                hidden_states_scale=None,
+                masked_m=torch.tensor([1, 0, 2, 0]),
+            )
+            layout = adapter.bind(native.NPUDispatch(raw, 4, object()), ctx)
+            adapter.select_layer(layout, ctx)
+            output = torch.full_like(raw.hidden_states, float("nan"))
+            output[:3] = 7
+            adapter.write_layer(layout, output, ctx)
+            error.fill_(256)
+            combined = adapter.combine_input(layout, ctx).output
+            self.assertIs(combined, output)
+            self.assertTrue((combined == 0).all())
 
     def test_bank_rejects_mismatched_payload_before_native_execution(self):
         valid = torch.ones(2, dtype=torch.bool)
@@ -368,6 +517,7 @@ class TestLayerWorkspace(unittest.TestCase):
                 (Phase.PREFILL, (0, 2)),
                 (Phase.PREFILL, (0, 1, 2, 3) * 2),
                 (Phase.DECODE, (0, 2)),
+                (Phase.DECODE, (0, 1, 2, 3) * 2),
             ):
                 with self.subTest(phase=phase, ids=ids):
                     fixture = self.fixture(ids=ids, phase=phase)
@@ -415,17 +565,20 @@ class TestLayerWorkspace(unittest.TestCase):
             for ids, experts in cases:
                 with self.subTest(ids=ids, experts=experts):
                     fixture = self.fixture(ids, experts)
-                    write = fixture.layout.write_layer
+                    combine_input = fixture.layout.combine_input
 
-                    def checked_write(layout, output, context):
-                        # Padding cleanup must reuse the native GMM allocation.
+                    def checked_combine(layout, context):
+                        # Cleanup moved to the combine boundary, using the native
+                        # allocation without a copy or a second output mask pass.
+                        combined = combine_input(layout, context)
+                        output = combined.output
                         self.assertIs(output, fixture.output_refs[-1]())
                         self.assertTrue(bool(torch.isfinite(output).all()))
-                        count = int(layout.selected.row_count)
+                        count = int(layout.row_count)
                         self.assertTrue(bool((output[count:] == 0).all()))
-                        write(layout, output, context)
+                        return combined
 
-                    fixture.layout.write_layer = checked_write
+                    fixture.layout.combine_input = checked_combine
                     result = fixture.runtime.run_layer(3, fixture.input, fixture.routes)
                     torch.testing.assert_close(
                         result,

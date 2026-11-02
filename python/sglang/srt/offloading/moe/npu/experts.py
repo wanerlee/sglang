@@ -88,11 +88,10 @@ class NPUDispatch:
 class _Layout:
     dispatched: NPUDispatch
     counts: torch.Tensor
-    offsets: torch.Tensor | None
+    row_count: torch.Tensor | int
     output: torch.Tensor
-    row_ids: torch.Tensor
+    padding: torch.Tensor | None
     selected: object = None
-    prefill_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -281,7 +280,8 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         )
         self._allocate("output", (max_dispatch_rows, hidden_size), torch.bfloat16)
         self._allocate("counts", (local_experts,), torch.int64)
-        self._allocate("offsets", (local_experts + 1,), torch.int64)
+        self._allocate("row_count", (), torch.int64)
+        self._allocate("padding", (max_dispatch_rows,), torch.bool)
         rows = self._allocate("rows", (max_dispatch_rows,), torch.int64)
         torch.arange(max_dispatch_rows, out=rows)
 
@@ -340,29 +340,25 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             if prefill_rows is not None:
                 # NORMAL already supplies checked host counts. Whole-layer FFN
                 # needs their sum, not per-expert offsets or a second copy.
-                counts, offsets = source, None
+                counts, row_count, padding = source, prefill_rows, None
             else:
                 counts = self._owned["counts"]
                 counts.copy_(source)
-                invalid = (counts < 0).any() | (counts.sum() > x.shape[0])
+                row_count = self._owned["row_count"]
+                torch.sum(counts, dim=0, out=row_count)
+                invalid = (counts < 0).any() | (row_count > x.shape[0])
                 self.error_status.bitwise_or_(invalid.to(torch.int32) * 64)
-                counts.masked_fill_(self.error_status != 0, 0)
-                offsets = self._owned["offsets"]
-                offsets[0].zero_()
-                torch.cumsum(counts, 0, out=offsets[1:])
+                failed = self.error_status != 0
+                counts.masked_fill_(failed, 0)
+                row_count.masked_fill_(failed, 0)
+                # Fixed-address device metadata is refreshed on every replay.
+                # Input, scales and combine share this single padding mask.
+                padding = self._owned["padding"][: x.shape[0]]
+                torch.ge(self._owned["rows"][: x.shape[0]], row_count, out=padding)
             output = self._owned["output"][: x.shape[0]]
             if x.dtype == torch.float16:
                 output = output.view(torch.float16)
-            if prefill_rows is None:
-                output.zero_()
-            result = _Layout(
-                dispatched,
-                counts,
-                offsets,
-                output,
-                self._owned["rows"][: x.shape[0]],
-                prefill_rows=prefill_rows,
-            )
+            result = _Layout(dispatched, counts, row_count, output, padding)
             context.retain(result)
             return result
 
@@ -372,19 +368,15 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             raise RuntimeError("Write the previous layer before reusing its input")
         raw = layout.dispatched.raw
         rows = raw.hidden_states.shape[0]
-        count = (
-            layout.prefill_rows
-            if layout.prefill_rows is not None
-            else layout.offsets[-1]
-        )
+        count = layout.row_count
         with _compute_scope(context, self.device):
-            if layout.prefill_rows is not None:
-                used = layout.prefill_rows
+            if layout.padding is None:
+                used = count
                 x = raw.hidden_states[:used]
             else:
                 used = rows
                 x = self._copy_layer_bytes(
-                    raw.hidden_states, layout.row_ids >= count, "input_bytes"
+                    raw.hidden_states, layout.padding, "input_bytes"
                 )
             scale = raw.hidden_states_scale
             if scale is not None:
@@ -397,9 +389,9 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                             "Layer scales require a fixed contiguous row shape"
                         )
                     scale = scale.view(rows, -1)[:used]
-                    if layout.prefill_rows is None:
+                    if layout.padding is not None:
                         scale = self._copy_layer_bytes(
-                            scale, layout.row_ids >= count, "scale_bytes"
+                            scale, layout.padding, "scale_bytes"
                         )
             result = NPULayerInput(x, scale, layout.counts, count)
             layout.selected = result
@@ -427,14 +419,12 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         if output.shape != target.shape:
             raise ValueError("Layer FFN must preserve the selected receive shape")
         with _compute_scope(context, self.device):
-            if layout.prefill_rows is not None and rows == layout.output.shape[0]:
-                # Compact NORMAL output already has the native combine layout.
+            if rows == layout.output.shape[0]:
+                # LL and compact NORMAL output already have the combine shape.
                 layout.output = output
             else:
-                if layout.prefill_rows is not None:
-                    # Retain the receive capacity when it includes padding.
-                    # Only the unwritten tail needs initialization.
-                    layout.output[rows:].zero_()
+                # Padded NORMAL retains receive capacity around its sliced FFN.
+                layout.output[rows:].zero_()
                 target.copy_(output)
             layout.selected = None
 
@@ -444,7 +434,13 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         # A latched failure suppresses the complete output too; never publish a partial
         # routed result when bank validation fails.
         with _compute_scope(context, self.device):
-            layout.output.masked_fill_(self.error_status != 0, 0)
+            invalid = self.error_status != 0
+            if layout.padding is not None:
+                # Inputs have been consumed on this stream. Include faults that
+                # arrived after bind, and clear unwritten GMM padding once.
+                layout.padding.logical_or_(invalid)
+                invalid = layout.padding.unsqueeze(1)
+            layout.output.masked_fill_(invalid, 0)
         return layout
 
 
@@ -536,13 +532,8 @@ class NPUExpertRunner:
             context.retain(runner_input)
             output = self.core.run(runner_input, quant, {}).hidden_states
             context.retain(output)
-            if not compact_prefill:
-                # Unwritten GMM padding may contain NaN; multiply-by-zero is unsafe.
-                row_ids = torch.arange(output.shape[0], device=output.device)
-                good_rows = (row_ids < dispatched.row_count) & healthy
-                output.masked_fill_(~good_rows.unsqueeze(1), 0)
-            # Compact prefill has no padding. combine_input applies the shared
-            # fault latch once, including any unwritten output on a failed step.
+            # combine_input clears padding and failed output in one pass after
+            # all readers are joined; the native FFN result needs no roundtrip.
             return LocalExecution(output, self._reader_ticket(context))
 
 
