@@ -720,20 +720,20 @@ class TestAddressCatalogMetadata(unittest.TestCase):
         for c, (name, _) in enumerate(self.sizes.items()):
             self.assertEqual(
                 first.tables[c][0].tolist(),
-                [0] + [source.device_address for source in self.hosts[name]],
+                [0]
+                + [source.device_address for source in self.hosts[name]]
+                + [region.address for region in self.hot[name]],
             )
             self.assertEqual(
-                first.tables[c][2].tolist(),
+                first.tables[c][1].tolist(),
                 [0] + [region.address for region in self.destinations[name]],
             )
         first_scratch = {a.storage_key for a in first.allocations()}
         second_scratch = {a.storage_key for a in second.allocations()}
         self.assertTrue(first_scratch.isdisjoint(second_scratch))
         catalog_allocations = self.catalog.allocations()
-        self.assertEqual(
-            sum(a.nbytes for a in catalog_allocations), 2 * (4 + 3 + 3) * 8
-        )
-        self.assertEqual(len({a.storage_key for a in catalog_allocations}), 6)
+        self.assertEqual(sum(a.nbytes for a in catalog_allocations), 2 * (6 + 3) * 8)
+        self.assertEqual(len({a.storage_key for a in catalog_allocations}), 4)
         self.assertTrue(
             first_scratch.isdisjoint(a.storage_key for a in catalog_allocations)
         )
@@ -746,7 +746,7 @@ class TestAddressCatalogMetadata(unittest.TestCase):
         before = self.bind()
         self.catalog.seal()
         after = self.bind()
-        self.assertEqual(before.tables[0][2].data_ptr(), after.tables[0][2].data_ptr())
+        self.assertEqual(before.tables[0][1].data_ptr(), after.tables[0][1].data_ptr())
         with self.assertRaisesRegex(RuntimeError, "sealed"):
             self.bind(self.regions(30000, 2))
 

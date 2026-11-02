@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from moe_test_utils import TensorTrace
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.offloading.moe.npu import transfer
@@ -298,6 +299,108 @@ class TestMemFabricCompaction(unittest.TestCase):
                 batches = (capacity + 255) // 256
                 self.assertEqual(result["scatter_add_calls"], 1 + batches)
                 self.assertEqual(result["copy_calls"], 6 * batches)
+
+    def test_source_selection_is_shared_across_components_and_batches(self):
+        for fixed in (False, True):
+            with (
+                self.subTest(fixed=fixed),
+                TransferHarness(8, max_batch_entries=3) as h,
+            ):
+                slots = tuple(range(8)) if fixed else None
+                h.binding = h.new_binding(fixed_destination_slots=slots)
+                plan = h.plan([True, False, True, True, False, True, False, True])
+                expected = h.expected(plan, destination_slots=slots)
+                with TensorTrace() as trace:
+                    h.run(plan)
+                self.assert_destinations(h, expected)
+                # One shared Host/Hot choice + one per packed destination batch,
+                # plus dynamic destination validation where applicable. This
+                # count is independent of the six weight/scale components.
+                self.assertEqual(
+                    sum("aten.where." in str(call[0]) for call in trace.calls),
+                    1 + 3 + (not fixed),
+                )
+
+    def test_shared_sources_with_empty_or_unequal_pools(self):
+        with TransferHarness(5) as h:
+            original = h.catalog
+            for host_count, hot_count in ((0, 0), (5, 0), (0, 5), (2, 5), (5, 2)):
+                with self.subTest(hosts=host_count, hot=hot_count):
+                    h.catalog = transfer.MemFabricAddressCatalog(
+                        dict(
+                            zip(
+                                h.component_sizes,
+                                (s[:host_count] for s in original.host_sources),
+                            )
+                        ),
+                        dict(
+                            zip(
+                                h.component_sizes,
+                                (s[:hot_count] for s in original.hot_sources),
+                            )
+                        ),
+                        h.component_sizes,
+                        device=h.device,
+                    )
+                    h.generations = torch.arange(hot_count, dtype=torch.int64) + 19
+                    h.binding = h.new_binding()
+                    # Build without indexing an empty generation pool.
+                    plan = DeviceCopyPlan(
+                        source_kind=torch.zeros(5, dtype=torch.int64),
+                        source_index=torch.zeros(5, dtype=torch.int64),
+                        destination_slot=torch.arange(5, dtype=torch.int64),
+                        valid=torch.zeros(5, dtype=torch.bool),
+                        expected_generation=torch.zeros(5, dtype=torch.int64),
+                        count=torch.zeros((), dtype=torch.int32),
+                        capacity=5,
+                    )
+                    for i in range(5):
+                        use_host = bool(host_count) and (not hot_count or i % 2 == 0)
+                        count = host_count if use_host else hot_count
+                        plan.source_kind[i] = int(
+                            CopySourceKind.HOST if use_host else CopySourceKind.HOT_SLOT
+                        )
+                        plan.source_index[i] = i % count if count else 999
+                        plan.valid[i] = count > 0
+                        if not use_host and hot_count:
+                            plan.expected_generation[i] = h.generations[i % hot_count]
+                    plan.count.copy_(plan.valid.sum(dtype=torch.int32))
+                    expected = h.expected(plan)
+                    h.run(plan)
+                    self.assert_destinations(h, expected)
+                    self.assertEqual(int(h.error), 0)
+
+    def test_recorded_source_selection_reads_changed_host_hot_and_validity(self):
+        with TransferHarness(5, max_batch_entries=3) as h:
+            plan = h.plan()
+            # Record only tensor descriptor lowering. Invoke the native-copy
+            # stand-in after replay so its CPU reads cannot bake in old choices.
+            h.ops.group_pack_copy = lambda *args: 0
+            with TensorTrace() as trace:
+                h.ops.materialize_into(plan, h.binding, h.stream)
+            for kind, valid, bad_source in (
+                (CopySourceKind.HOST, [True] * 5, False),
+                (CopySourceKind.HOT_SLOT, [False, True, False, True, True], False),
+                (CopySourceKind.HOST, [False] * 5, False),
+                (CopySourceKind.HOT_SLOT, [True] * 5, True),
+                (CopySourceKind.HOST, [True] * 5, False),
+            ):
+                with self.subTest(kind=kind, valid=valid, bad_source=bad_source):
+                    h.error.zero_()
+                    plan.source_kind.fill_(int(kind))
+                    plan.source_index.copy_(torch.arange(5).flip(0))
+                    plan.expected_generation.copy_(h.generations[plan.source_index])
+                    plan.valid.copy_(torch.tensor(valid))
+                    plan.count.copy_(plan.valid.sum(dtype=torch.int32))
+                    if bad_source:
+                        plan.source_index[0] = torch.iinfo(torch.int64).max
+                    expected = h.expected(plan, suppressed=bad_source)
+                    trace.replay()
+                    for batches in h.binding.batches:
+                        for _, _, *descriptors in batches:
+                            h.native_copy(*descriptors, h.device)
+                    self.assert_destinations(h, expected)
+                    self.assertEqual(bool(h.error), bad_source)
 
     def test_sparse_full_empty_replays_preserve_unselected_destinations(self):
         with TransferHarness(7) as h:

@@ -81,11 +81,21 @@ Decode 也没有 wave 循环，但不做下一层全专家盲预取：下一层�
 只写实际使用的槽位，保留设备上的 valid mask 和 generation 校验。
 
 Decode 的接收容量保持固定，实际行数由设备 counts 求和得到，同时用于容量校验与
-padding 判断，不再构造未使用的专家前缀和。输入和 scale 共用预分配的 padding 掩码，
-保留接收数据的复制和尾部清零，避免 NaN padding 进入 FFN。原生 FFN 输出直接传给
+padding 判断，不再构造未使用的专家前缀和。输入和 scale 共用预分配的逐行 INT8 掩码：
+有效行为 `-1`，padding 为 `0`。通过字节视图做一次 bitwise-and，同时完成复制和尾部
+清零，保留有效 FP8/量化数据的原始位，避免 NaN padding 进入 FFN。原生 FFN 输出直接传给
 Combine，取消输出池的预清零及整块复制；Combine 前复用该掩码，一次清理 padding
 与失败输出。掩码每次执行重新生成，不读取设备标量到 CPU，不改变 graph 的输入形状。
+counts 和 row_count 是整数，故障清零使用整数乘法；浮点数据不使用乘零清理，
+因为 NaN 乘零仍然是 NaN。逐行 INT8 掩码增加 `max_dispatch_rows` 字节的固定 workspace。
 权重就绪检查、有效性校验、reader event、缓存统计和 LFU 均保持不变。
+
+MemFabric 的每个权重组件使用 `[0, Host 地址..., Hot 地址...]` 合并地址表。
+整份搬运计划只选择一次 Host/Hot 索引，未激活项索引为零；各组件按该索引直接 gather
+到原有 src 描述符。省去原来每个组件、每个 native batch 的两次 `Where`、一次 gather
+和一次 src 复制，动态源范围/代际校验、目标压紧及搬运完成依赖保持不变。
+例如六组件、一个 native batch、固定 Decode 目标的搬运，CPU tensor 调用路径中
+`Where` 从 13 次降到 2 次（一次源选择、一次目标压紧）；这不是整层算子总数或性能比例。
 
 Hot 命中统计、全 rank 内跨层 LFU 选择、替换门槛、衰减、维护周期以及 graph 更新门控均复用原逻辑。
 Prefill 沿用原有 Hot 借用机制：先快照，切回 decode 时恢复原权重、映射及策略状态。
@@ -136,7 +146,7 @@ Prefill 沿用原有 Hot 借用机制：先快照，切回 decode 时恢复原�
 
 ```bash
 PYTHONPATH=python:test/registered/unit/offloading \
-python -m unittest test_layer_execution test_moe_layer_workspace test_npu_backend test_native_periodic_cache
+python -m unittest test_layer_execution test_moe_layer_workspace test_npu_backend test_native_periodic_cache test_memfabric_compaction test_fixed_decode_transfer
 ```
 
 测试覆盖：完整权重 bundle、命中/缺失和代际故障、counts 变化后的设备计划重放、
@@ -146,5 +156,13 @@ prefill/decode 缓存恢复以及原有周期 LFU 规则。紧凑 Prefill 另覆
 Decode 另覆盖 BF16/FP16、int32/int64 counts、空/满/部分接收、NaN 输入和 scale、
 无效 counts、权重及 FFN 后故障、直接输出生命周期。CPU tensor 操作重放验证 counts
 和 valid mask 改变后仍使用新值，故障掩码不会残留到后续执行；不能替代真实 NPU graph
-验证。验证这次 Decode 精简时，和 `2ffe3c5d2c` 使用相同配置采集预热后的 32 个 decode
-step，比较输出、设备任务数量、step 耗时与 graph 显存峰值，计时阶段关闭 profiler。
+验证。验证本轮字节掩码和地址选择精简时，以 `2a42dda145` 为对照，保持模型、量化、
+TP/EP/attention DP、实际 BS、输入/输出长度和缓存配置相同。先检查短请求输出和
+连续 Prefill→Decode，再采集预热后的 32 个纯 Decode step：
+
+- 比较接收 padding 处理对应的 `MaskedFill` 与新 bitwise-and 任务耗时；关注 FP8/scale
+  数据、空接收 rank、错误后的输出清零和 graph replay 是否正常。
+- 比较搬运计划对应的 `Where` 次数及总耗时。其他模块仍可能调用 `Where`/`MaskedFill`，
+  不能要求全模型计数为零；原生 DynamicQuant、GMM、激活与 Dispatch 量化方式没有改变。
+- 比较 step 墙钟时间、TPOT 和 graph 显存峰值。计时阶段关闭 profiler；CPU UT 和
+  tensor 调用数减少不能证明 NPU 加速，尤其要验证目标 CANN 版本的 INT8 广播 bitwise-and。

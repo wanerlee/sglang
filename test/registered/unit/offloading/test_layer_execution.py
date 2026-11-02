@@ -270,17 +270,10 @@ class TestLayerPrefetch(unittest.TestCase):
 
 
 class TestLayerLayout(unittest.TestCase):
-    def test_layer_byte_copy_preserves_quantized_payloads_without_uint8_mask(self):
+    def test_layer_byte_copy_preserves_quantized_payloads_in_one_pass(self):
         layout = experts.NPUDispatchLayout(
             4, 256, 8, "cpu", torch.zeros((), dtype=torch.int32)
         )
-        fill = torch.Tensor.masked_fill_
-
-        def npu_fill(tensor, mask, value):
-            if tensor.dtype == torch.uint8:
-                raise RuntimeError("CANN masked-fill does not support uint8")
-            return fill(tensor, mask, value)
-
         dtypes = [
             torch.int8,
             torch.bfloat16,
@@ -296,15 +289,19 @@ class TestLayerLayout(unittest.TestCase):
             for dtype in dtypes:
                 source = payload.view(dtype)
                 for count in (0, 3, 8):
-                    with patch.object(torch.Tensor, "masked_fill_", npu_fill):
-                        result = layout._copy_layer_bytes(
-                            source, torch.arange(8) >= count, name
-                        )
+                    row_mask = (torch.arange(8) >= count).to(torch.int8) - 1
+                    with TensorTrace() as trace:
+                        result = layout._copy_layer_bytes(source, row_mask, name)
                     expected = payload.clone()
                     expected[count:] = 0
                     self.assertTrue(torch.equal(result.view(torch.uint8), expected))
                     self.assertTrue(torch.equal(source.view(torch.uint8), payload))
                     self.assertEqual(result.data_ptr(), layout._owned[name].data_ptr())
+                    ops = [str(call[0]) for call in trace.calls]
+                    self.assertEqual(ops.count("aten.bitwise_and.Tensor_out"), 1)
+                    self.assertFalse(
+                        any("copy_" in op or "masked_fill" in op for op in ops)
+                    )
 
     def test_whole_layer_prefix_empty_and_nan_padding(self):
         for phase in (Phase.PREFILL, Phase.DECODE):

@@ -248,6 +248,11 @@ class TestLayerWorkspace(unittest.TestCase):
                         adapter.write_layer(layout, result.output, ctx)
                         output = adapter.combine_input(layout, ctx).output
                     self.assertIs(output, result.output)
+                    # The simulated FFN injects NaN with one masked_fill_.
+                    # Decode layout itself must not add any, even for counts.
+                    self.assertEqual(
+                        sum("masked_fill" in str(call[0]) for call in trace.calls), 1
+                    )
                     self.assertFalse(
                         {
                             "aten._local_scalar_dense.default",

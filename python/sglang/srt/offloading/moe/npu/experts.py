@@ -90,7 +90,7 @@ class _Layout:
     counts: torch.Tensor
     row_count: torch.Tensor | int
     output: torch.Tensor
-    padding: torch.Tensor | None
+    row_mask: torch.Tensor | None
     selected: object = None
 
 
@@ -282,6 +282,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         self._allocate("counts", (local_experts,), torch.int64)
         self._allocate("row_count", (), torch.int64)
         self._allocate("padding", (max_dispatch_rows,), torch.bool)
+        self._allocate("row_mask", (max_dispatch_rows,), torch.int8)
         rows = self._allocate("rows", (max_dispatch_rows,), torch.int64)
         torch.arange(max_dispatch_rows, out=rows)
 
@@ -340,7 +341,7 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
             if prefill_rows is not None:
                 # NORMAL already supplies checked host counts. Whole-layer FFN
                 # needs their sum, not per-expert offsets or a second copy.
-                counts, row_count, padding = source, prefill_rows, None
+                counts, row_count, row_mask = source, prefill_rows, None
             else:
                 counts = self._owned["counts"]
                 counts.copy_(source)
@@ -348,17 +349,20 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                 torch.sum(counts, dim=0, out=row_count)
                 invalid = (counts < 0).any() | (row_count > x.shape[0])
                 self.error_status.bitwise_or_(invalid.to(torch.int32) * 64)
-                failed = self.error_status != 0
-                counts.masked_fill_(failed, 0)
-                row_count.masked_fill_(failed, 0)
+                healthy = (self.error_status == 0).to(torch.int64)
+                counts.mul_(healthy)
+                row_count.mul_(healthy)
                 # Fixed-address device metadata is refreshed on every replay.
                 # Input, scales and combine share this single padding mask.
                 padding = self._owned["padding"][: x.shape[0]]
                 torch.ge(self._owned["rows"][: x.shape[0]], row_count, out=padding)
+                # -1 keeps every payload bit; 0 clears padding, including NaNs.
+                row_mask = self._owned["row_mask"][: x.shape[0]]
+                row_mask.copy_(padding).sub_(1)
             output = self._owned["output"][: x.shape[0]]
             if x.dtype == torch.float16:
                 output = output.view(torch.float16)
-            result = _Layout(dispatched, counts, row_count, output, padding)
+            result = _Layout(dispatched, counts, row_count, output, row_mask)
             context.retain(result)
             return result
 
@@ -370,13 +374,13 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         rows = raw.hidden_states.shape[0]
         count = layout.row_count
         with _compute_scope(context, self.device):
-            if layout.padding is None:
+            if layout.row_mask is None:
                 used = count
                 x = raw.hidden_states[:used]
             else:
                 used = rows
                 x = self._copy_layer_bytes(
-                    raw.hidden_states, layout.padding, "input_bytes"
+                    raw.hidden_states, layout.row_mask, "input_bytes"
                 )
             scale = raw.hidden_states_scale
             if scale is not None:
@@ -389,16 +393,16 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
                             "Layer scales require a fixed contiguous row shape"
                         )
                     scale = scale.view(rows, -1)[:used]
-                    if layout.padding is not None:
+                    if layout.row_mask is not None:
                         scale = self._copy_layer_bytes(
-                            scale, layout.padding, "scale_bytes"
+                            scale, layout.row_mask, "scale_bytes"
                         )
             result = NPULayerInput(x, scale, layout.counts, count)
             layout.selected = result
             context.retain(result)
             return result
 
-    def _copy_layer_bytes(self, source, padding, name):
+    def _copy_layer_bytes(self, source, row_mask, name):
         # Reuse the already budgeted workspace, including float8/E8M0 bits.
         # No per-layer clone or graph-dependent receive allocation is needed.
         nbytes = source.numel() * source.element_size()
@@ -406,9 +410,13 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         if nbytes > storage.numel():
             raise ValueError("Layer input exceeds its reserved byte workspace")
         target = storage[:nbytes].view(source.dtype).view(source.shape)
-        target.view(torch.int8).copy_(source.view(torch.int8))
-        # CANN masked-fill does not support uint8 on the supported builds.
-        target.view(torch.int8).masked_fill_(padding.unsqueeze(1), 0)
+        # Copy and sanitize in one pass. Integer masking preserves valid FP8
+        # and scale bits, and clears NaN/Inf padding unlike floating multiply.
+        torch.bitwise_and(
+            source.view(torch.int8),
+            row_mask.unsqueeze(1),
+            out=target.view(torch.int8),
+        )
         return target
 
     def write_layer(self, layout, output, context):
@@ -434,13 +442,15 @@ class NPUDispatchLayout(DispatchLayoutAdapter):
         # A latched failure suppresses the complete output too; never publish a partial
         # routed result when bank validation fails.
         with _compute_scope(context, self.device):
-            invalid = self.error_status != 0
-            if layout.padding is not None:
+            if layout.row_mask is not None:
                 # Inputs have been consumed on this stream. Include faults that
                 # arrived after bind, and clear unwritten GMM padding once.
-                layout.padding.logical_or_(invalid)
-                invalid = layout.padding.unsqueeze(1)
-            layout.output.masked_fill_(invalid, 0)
+                layout.row_mask.mul_((self.error_status == 0).to(torch.int8))
+                layout.output.view(torch.int8).bitwise_and_(
+                    layout.row_mask.unsqueeze(1)
+                )
+            else:
+                layout.output.masked_fill_(self.error_status != 0, 0)
         return layout
 
 

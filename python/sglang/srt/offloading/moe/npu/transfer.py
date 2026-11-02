@@ -190,9 +190,9 @@ class MemFabricAddressCatalog:
             self._validate_device_regions(hot, nbytes)
             self._host_ranges.extend(_range(p, nbytes) for p in pointers)
             self._hot_ranges.extend(_range(r.address, nbytes) for r in hot)
-            tables.append(
-                (self._table(pointers), self._table([r.address for r in hot]))
-            )
+            # One source index selects Host or Hot for every bundle component.
+            # Layout: [zero sentinel, host pointers..., hot pointers...].
+            tables.append(self._table(pointers + [r.address for r in hot]))
         self.source_tables = tuple(tables)
 
     def _validate_device_regions(self, regions, nbytes):
@@ -247,7 +247,7 @@ class MemFabricAddressCatalog:
         destination_tables, aliases_hot, _ = cached
         return (
             tuple(
-                (*sources, target)
+                (sources, target)
                 for sources, target in zip(self.source_tables, destination_tables)
             ),
             aliases_hot,
@@ -519,14 +519,19 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                 # them once on the copy stream, while keeping native mutable
                 # groups/packed buffers private to each component and batch.
                 source_index = plan.source_index + 1
-                host_indices = source_index.clamp(0, bindings.host_count)
-                hot_indices = source_index.clamp(0, bindings.hot_count)
+                source_indices = torch.where(
+                    plan.source_kind == int(CopySourceKind.HOST),
+                    source_index.clamp(0, bindings.host_count),
+                    source_index.clamp(0, bindings.hot_count) + bindings.host_count,
+                )
+                # Invalid entries gather the zero sentinel. _mask has already
+                # checked source bounds/generation and latched any fault.
+                source_indices.mul_(bindings.mask)
                 destination_indices = bindings._fixed_destination_indices
                 if destination_indices is None:
                     destination_indices = (plan.destination_slot + 1).clamp(
                         0, bindings.destination_count
                     )
-                from_host = plan.source_kind == int(CopySourceKind.HOST)
                 for batch, packed_slots in zip(
                     bindings.batches[0], bindings.packed_destination_slots
                 ):
@@ -543,24 +548,14 @@ class MemFabricDeviceTransferOps(DeviceTransferOps):
                         torch.where(selected, destination_indices[begin:end], 0),
                     )
                 for tables, batches in zip(bindings.tables, bindings.batches):
-                    host_table, hot_table, destination_table = tables
+                    source_table, destination_table = tables
                     for batch, packed_slots in zip(
                         batches, bindings.packed_destination_slots
                     ):
                         begin, end, src, dst, lengths, scan, groups, packed = batch
-                        host_ptr = host_table.gather(0, host_indices[begin:end])
-                        hot_ptr = hot_table.gather(0, hot_indices[begin:end])
                         selected = bindings.mask[begin:end]
-                        src.copy_(
-                            torch.where(
-                                selected,
-                                torch.where(
-                                    from_host[begin:end],
-                                    host_ptr,
-                                    hot_ptr,
-                                ),
-                                0,
-                            )
+                        torch.gather(
+                            source_table, 0, source_indices[begin:end], out=src
                         )
                         groups.copy_(selected)
                         # Native output j corresponds to the j-th selected i.
