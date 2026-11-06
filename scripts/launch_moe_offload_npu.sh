@@ -340,7 +340,7 @@ SERVER_CMD=(
     --attn-dp-size "$ATTN_DP_SIZE" --moe-dp-size 1
     --device npu --attention-backend dsv4 --page-size 128 --trust-remote-code
     --load-format safetensors --quantization "$MODEL_QUANTIZATION" --kv-cache-dtype bfloat16
-    --moe-a2a-backend ascend_ops --deepep-mode auto --moe-runner-backend ascend
+    --moe-a2a-backend ascend_ops --deepep-mode auto
     --moe-ascend-ops-config '{"prefill":"alltoallv","decode":"low_latency"}'
     --disable-overlap-schedule --disable-shared-experts-fusion
     --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled
