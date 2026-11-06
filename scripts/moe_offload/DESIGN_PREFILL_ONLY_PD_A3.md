@@ -56,7 +56,7 @@ P 和 D 使用同一模型版本、tokenizer、主模型量化描述、KV dtype 
 | `offloading/moe/npu/model_adapter.py:35` | GLM 首个 routed MoE 层固定常驻 | P-only 目录把所有 routed MoE 层标记为可卸载；dense/shared 不变 |
 | `offloading/moe/npu/prefill.py:45` | Bank B 优先借 Hot；不足时使用 Execution 后半段 | P-only 明确使用两份 Execution bank，容量 `2 * local_experts` |
 | `offloading/moe/npu/ascend_ops.py:319` | 无条件初始化 Residency、LFU、缓存替换与地址发布 | P-only 跳过这些对象与初始化 |
-| 同文件 `_init_decode_mask` / `decode_row_mask` | 原 Decode row mask 要求 Attention DP=EP | 当前混部已在 MC2 dispatch 时按本地有效行数生成 mask，支持 Attention TP>1；P-only 仍不初始化 Decode mask |
+| 同文件 `:367` | Decode row mask 要求 Attention DP=EP | 仅混部路径保留；P-only 不初始化 Decode mask，允许 DP4 / EP16 |
 | 同文件 `:627`，`npu/cache_update.py:27` | 地址发布 / 缓存维护读取 Hot | 不能只放宽 ratio 校验，否则空 Hot 会进入无效索引路径 |
 | 同文件 `:670`、`:722` | 捕获维护图，每轮清统计并重放缓存维护 | P-only 不捕获维护图、不更新 LFU、不恢复 Hot |
 | `offloading/moe/npu/prefill.py:245` | 专家计数转换与 usage 统计绑在一起 | 拆出无统计的计数校验/规范化路径，仍保留错误报告 |
