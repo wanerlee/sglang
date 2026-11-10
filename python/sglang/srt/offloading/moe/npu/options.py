@@ -21,6 +21,7 @@ _COMMON_OPTIONS = frozenset(
     {
         "mode",
         "cache_ratio",
+        "prefill_resident_ratio",
         "host_pool_gib",
         "execution_slots",
         "native_extension_directory",
@@ -41,6 +42,34 @@ def _finite_number(name, value):
     return value
 
 
+MAX_PHYSICAL_WEIGHT_GROUPS = 1024
+
+
+def parse_prefill_resident_ratio(value):
+    ratio = _finite_number("prefill_resident_ratio", value)
+    if not 0 <= ratio < 1:
+        raise ValueError("prefill_resident_ratio must be in [0, 1)")
+    return float(ratio)
+
+
+def prefill_weight_slots(local_experts, routed_layers, ratio, slot_budget):
+    """Return experts resident per layer and HBM slots to allocate on this rank."""
+    resident = int(local_experts * ratio)
+    required = routed_layers * resident + 2 * (local_experts - resident)
+    if resident and required > MAX_PHYSICAL_WEIGHT_GROUPS:
+        raise ValueError(
+            f"Prefill residency needs {required} physical weight groups, "
+            f"but GMM supports at most {MAX_PHYSICAL_WEIGHT_GROUPS}"
+        )
+    if slot_budget is not None and slot_budget < required:
+        raise ValueError(
+            f"execution_slots (EXECUTION_SLOTS) must be at least {required} "
+            f"for {routed_layers} layers with {resident} resident experts per layer "
+            "and two cold banks"
+        )
+    return resident, required if resident or slot_budget is None else slot_budget
+
+
 @dataclass(frozen=True)
 class AscendOffloadOptions:
     """Validate once before choosing the mixed or prefill-only lifecycle.
@@ -52,6 +81,7 @@ class AscendOffloadOptions:
     values: dict
     mode: str
     cache_ratio: float
+    prefill_resident_ratio: float = 0.0
 
     @property
     def prefill_only(self):
@@ -93,6 +123,12 @@ class AscendOffloadOptions:
         elif not 0 < ratio <= 1:
             raise ValueError("cache_ratio must be in (0, 1] for mixed mode")
 
+        if mode != "prefill_only" and "prefill_resident_ratio" in values:
+            raise ValueError("prefill_resident_ratio requires mode=prefill_only")
+        prefill_resident_ratio = parse_prefill_resident_ratio(
+            values.get("prefill_resident_ratio", 0)
+        )
+
         for name in (
             "host_pool_gib",
             "execution_slots",
@@ -124,4 +160,9 @@ class AscendOffloadOptions:
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{name} must be a nonempty string")
 
-        return cls(values=values, mode=mode, cache_ratio=float(ratio))
+        return cls(
+            values=values,
+            mode=mode,
+            cache_ratio=float(ratio),
+            prefill_resident_ratio=prefill_resident_ratio,
+        )

@@ -59,6 +59,23 @@ def prepare_packed_copies(
 
 
 @triton.jit
+def _store_slot_count_pairs(
+    Groups, physical, count, needed, EXPERTS: tl.constexpr, BLOCK: tl.constexpr
+):
+    position = tl.cumsum(needed.to(tl.int32), 0) - 1
+    pair = tl.arange(0, 2 * BLOCK)
+    match = (pair[:, None] // 2 == position[None, :]) & needed[None, :]
+    values = tl.where(
+        pair[:, None] % 2 == 0,
+        physical[None, :].to(tl.float32),
+        count[None, :].to(tl.float32),
+    )
+    packed = tl.sum(tl.where(match, values, 0), 1).to(tl.int64)
+    # Clear stale entries in the mutable prefix. The rest stays zero.
+    tl.store(Groups + pair, packed, pair < 2 * EXPERTS)
+
+
+@triton.jit
 def prepare_prefill_counts(
     Counts,
     Error,
@@ -69,8 +86,12 @@ def prepare_prefill_counts(
     CUMULATIVE: tl.constexpr,
     BLOCK: tl.constexpr,
     TRACK_USAGE: tl.constexpr = True,
+    Groups=None,
+    ResidentBase=0,
+    ColdBase=0,
+    RESIDENT_EXPERTS: tl.constexpr = 0,
 ):
-    """Keep full-layer expert order; normalize counts and observe usage once."""
+    """Normalize logical counts and optionally select physical weight slots."""
     e = tl.arange(0, BLOCK)
     inside = e < EXPERTS
     count = tl.load(Counts + e, inside, 0)
@@ -78,10 +99,20 @@ def prepare_prefill_counts(
         previous = tl.load(Counts + e - 1, (e > 0) & inside, 0)
         count = count - previous
     bad = tl.sum(((count < 0) & inside).to(tl.int32), 0) > 0
+    if RESIDENT_EXPERTS:
+        # Slot/count pairs use the float32 reduction shared with decode.
+        bad = bad | (tl.sum((count > 16777216).to(tl.int32), 0) > 0)
     error = tl.load(Error) | bad.to(tl.int32)
     tl.store(Error, error)
     count = tl.where(error == 0, count, 0)
     tl.store(OutCounts + e, count, inside)
+    if RESIDENT_EXPERTS:
+        physical = tl.where(
+            e < RESIDENT_EXPERTS, ResidentBase + e, ColdBase + e - RESIDENT_EXPERTS
+        )
+        _store_slot_count_pairs(
+            Groups, physical, count, inside & (count > 0), EXPERTS, BLOCK
+        )
     if TRACK_USAGE:
         accesses = tl.load(Access + e, inside, 0)
         enabled = tl.load(Enabled) != 0
@@ -145,18 +176,7 @@ def prepare_fixed_copies(
     if DIRECT_HOT:
         hit = hot_slot >= 0
         physical = tl.where(hit, EXPERTS + hot_slot, e)
-        position = tl.cumsum(needed.to(tl.int32), 0) - 1
-        pair = tl.arange(0, 2 * BLOCK)
-        match = (pair[:, None] // 2 == position[None, :]) & needed[None, :]
-        values = tl.where(
-            pair[:, None] % 2 == 0,
-            physical[None, :].to(tl.float32),
-            count[None, :].to(tl.float32),
-        )
-        packed = tl.sum(tl.where(match, values, 0), 1).to(tl.int64)
-        # The remaining descriptors stay zero from initialization. Clear the
-        # entire mutable prefix on every replay, including the empty case.
-        tl.store(Groups + pair, packed, pair < 2 * EXPERTS)
+        _store_slot_count_pairs(Groups, physical, count, needed, EXPERTS, BLOCK)
         previous = tl.load(ExecutionKeys + e, e < EXPERTS, -1)
         copy_needed = needed & ~hit & (previous != KEY_START + e)
         # Hot reads must leave the Cold slot's identity untouched. Both weight

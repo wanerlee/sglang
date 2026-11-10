@@ -1,4 +1,4 @@
-"""Whole-layer eager prefill over two views of the native expert pools.
+"""Eager prefill over two native weight banks, with optional static residency.
 
 Adapted from codex/moe-prefill-opt-20261102 (2dc7903d0b). Each bank is reused
 only after its layer's combine. Dispatch never waits for future weights;
@@ -18,7 +18,7 @@ class PrefillLayerTransfer:
     w2: TransferTicket
 
 
-def _projection_copy_plans(storage, bank, layouts):
+def _projection_copy_plans(storage, bank, layouts, source_slice=slice(None)):
     groups = tuple(
         tuple(name for name in layouts if name.startswith(prefix))
         for prefix in ("w13_", "w2_")
@@ -31,7 +31,7 @@ def _projection_copy_plans(storage, bank, layouts):
                 HostCopyRegion(source, destination, 0, 0, layouts[name].nbytes)
                 for name in group
                 for source, destination in zip(
-                    storage.component_capabilities[name],
+                    storage.component_capabilities[name][source_slice],
                     bank.component_regions[name],
                     strict=True,
                 )
@@ -141,7 +141,8 @@ class LayerPrefetchPipeline:
 
 
 class AscendPrefillWeights:
-    def __init__(self, owner):
+
+    def __init__(self, owner, *, resident_experts=0):
         import torch
 
         from .native_acl import AclHostTransferOps
@@ -151,33 +152,75 @@ class AscendPrefillWeights:
         self.counts = torch.empty(
             owner.local_experts, dtype=torch.int64, device=owner.device
         )
-        layout = whole_layer_bank_layout(
-            owner.local_experts, owner.hot_slots, owner.execution.capacity
-        )
-        pools = {"execution": owner.execution, "hot": owner.hot}
-        self.banks = tuple(
-            pools[pool].view(offset, count) for pool, offset, count in layout
-        )
-        self.quant_info = tuple(bank.quant_info() for bank in self.banks)
-        self.borrows_hot = layout[1][0] == "hot"
+        specs = owner.catalog.offloaded_layers
+        self.resident_experts = resident_experts
+        self.resident_slots = len(specs) * resident_experts
+        if resident_experts:
+            cold_experts = owner.local_experts - resident_experts
+            self.banks = tuple(
+                owner.execution.view(
+                    self.resident_slots + bank * cold_experts, cold_experts
+                )
+                for bank in range(2)
+            )
+            quant_info = owner.execution.quant_info()
+            self.quant_info = (quant_info, quant_info)
+            self.groups = torch.zeros(
+                (owner.execution.capacity, 2), dtype=torch.int64, device=owner.device
+            )
+            self.borrows_hot = False
+        else:
+            layout = whole_layer_bank_layout(
+                owner.local_experts, owner.hot_slots, owner.execution.capacity
+            )
+            pools = {"execution": owner.execution, "hot": owner.hot}
+            self.banks = tuple(
+                pools[pool].view(offset, count) for pool, offset, count in layout
+            )
+            self.quant_info = tuple(bank.quant_info() for bank in self.banks)
+            self.borrows_hot = layout[1][0] == "hot"
         self.hot_dirty = False
         self.host_ops = AclHostTransferOps(
             owner.format.adapter.native_acl, owner._retain
         )
+        if resident_experts:
+            self._populate_resident(specs)
         self.plans = {}
-        for index, spec in enumerate(owner.catalog.offloaded_layers):
+        for index, spec in enumerate(specs):
             storage, bank = owner.storages[spec.layer_id], self.banks[index % 2]
-            plans = _projection_copy_plans(storage, bank, owner.format.layouts)
+            plans = _projection_copy_plans(
+                storage, bank, owner.format.layouts, slice(resident_experts, None)
+            )
             self.plans[spec.layer_id] = plans
             for plan in plans:
                 self.host_ops.prepare(plan, owner.device)
         self.pipeline = LayerPrefetchPipeline(
-            (spec.layer_id for spec in owner.catalog.offloaded_layers),
+            (spec.layer_id for spec in specs),
             load=self._load,
             copy_stream=owner.weight_copy_stream,
         )
         if self.borrows_hot:
             self._init_hot_restore()
+
+    def _populate_resident(self, specs):
+        owner, count = self.owner, self.resident_experts
+        stream = owner.weight_copy_stream
+        try:
+            for index, spec in enumerate(specs):
+                bank = owner.execution.view(index * count, count)
+                plans = _projection_copy_plans(
+                    owner.storages[spec.layer_id],
+                    bank,
+                    owner.format.layouts,
+                    slice(count),
+                )
+                for plan in plans:
+                    self.host_ops.materialize_into(plan, bank, stream)
+        finally:
+            # Retain descriptors and both allocations through partial submission.
+            stream.synchronize()
+            self.host_ops.clear_cache()
+            owner.context.resources.clear()
 
     def _init_hot_restore(self):
         import torch
@@ -242,10 +285,21 @@ class AscendPrefillWeights:
             raise ValueError("Prefill requires one int64 count per local expert")
         if runner_input.group_list_type not in (0, 1):
             raise ValueError("Unsupported prefill group list type")
-        # A dedicated prefill worker has no residency/usage state. Keep the
-        # same count validation kernel, compiling out the optional observation.
+        # A dedicated prefill worker has no decode-cache usage state.
         state = owner.state
         start = owner.catalog.key(layer, 0)
+        group_tokens, group_type, slot_args = self.counts, 1, {}
+        if self.resident_experts:
+            # The same layer ordinal selects its immutable prefix and the
+            # alternating cold bank. Groups stay in dispatch's logical order.
+            index = self.pipeline.current
+            group_tokens, group_type = self.groups, 2
+            slot_args = {
+                "Groups": self.groups,
+                "ResidentBase": index * self.resident_experts,
+                "ColdBase": self.resident_slots + (index % 2) * self.banks[0].capacity,
+                "RESIDENT_EXPERTS": self.resident_experts,
+            }
         prepare_prefill_counts[(1,)](
             counts,
             owner.error,
@@ -260,8 +314,12 @@ class AscendPrefillWeights:
             CUMULATIVE=runner_input.group_list_type == 0,
             BLOCK=triton.next_power_of_2(owner.local_experts),
             TRACK_USAGE=state is not None,
+            **slot_args,
         )
-        runner_input.expert_tokens, runner_input.group_list_type = self.counts, 1
+        runner_input.expert_tokens, runner_input.group_list_type = (
+            group_tokens,
+            group_type,
+        )
         # Keep the dispatch-owned input alive through asynchronous consumption.
         owner.context.retain(counts)
         bank = self.pipeline.acquire(layer, owner.context)

@@ -262,13 +262,25 @@ class AscendRunnerCore(MoeRunnerCore):
         group_list_type = runner_input.group_list_type
         # Activation uses logical expert counts; GMM may address physical slots.
         activation_tokens = expert_tokens
+        offloaded_prefill = owner is not None and get_is_extend_in_batch()
         if owner is not None and group_list_type == 2:
-            activation_tokens = owner.fused_counts
+            if offloaded_prefill:
+                activation_tokens = owner.prefill.counts
+                activation_group_type = 1
+            else:
+                activation_tokens = owner.fused_counts
         else:
             activation_group_type = group_list_type
 
-        if owner is not None and get_is_extend_in_batch() and x.shape[0] == 0:
-            return AscendRunnerOutput(hidden_states=x.to(original_dtype))
+        if offloaded_prefill:
+            if running_state.get("deepep_empty_receive"):
+                # DeepEP normal can allocate a dummy row for an empty receive.
+                # Preserve its shape for combine without reading the dummy data.
+                return AscendRunnerOutput(
+                    hidden_states=torch.zeros_like(x, dtype=original_dtype)
+                )
+            if x.shape[0] == 0:
+                return AscendRunnerOutput(hidden_states=x.to(original_dtype))
 
         w13_kernel = self.config.layer.w13_kernel
 
@@ -577,6 +589,35 @@ def pre_permute_deepep_normal_to_ascend(
         topk_weights,
         num_recv_tokens_per_expert,
     ) = dispatch_output
+    if getattr(runner_config.layer, "_ascend_ops_offloader", None) is not None:
+        counts = num_recv_tokens_per_expert
+        if (
+            not isinstance(counts, (list, tuple))
+            or len(counts) != runner_config.num_local_experts
+            or any(type(count) is not int or count < 0 for count in counts)
+        ):
+            raise ValueError(
+                "DeepEP offload requires one nonnegative count per local expert"
+            )
+        received = sum(counts)
+        rows = hidden_states.shape[0]
+        if received == 0 and rows == 1:
+            running_state["deepep_empty_receive"] = True
+        elif received != rows:
+            raise ValueError(
+                f"DeepEP offload received {rows} rows for {received} expert tokens"
+            )
+        if received:
+            if hidden_states.dtype == torch.int8:
+                if hidden_states_scale is None or hidden_states_scale.numel() != rows:
+                    raise ValueError("DeepEP INT8 dispatch requires one scale per row")
+            elif (
+                hidden_states.dtype not in (torch.bfloat16, torch.float16)
+                or hidden_states_scale is not None
+            ):
+                raise ValueError(
+                    "DeepEP W8A8 offload expects INT8 or unquantized BF16/FP16 dispatch"
+                )
     group_list = torch.tensor(
         num_recv_tokens_per_expert,
         dtype=torch.int64,

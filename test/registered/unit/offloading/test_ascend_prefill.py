@@ -411,6 +411,7 @@ class TestAscendPrefillWeights(CustomTestCase):
     def test_cumulative_counts_keep_zero_groups_and_cache_usage_in_layer_order(self):
         weights = object.__new__(AscendPrefillWeights)
         weights.counts = torch.empty(4, dtype=torch.int64)
+        weights.resident_experts = 0
         context = _Context()
         usage = torch.zeros(8, dtype=torch.int64)
         weights.owner = SimpleNamespace(
@@ -442,6 +443,7 @@ class TestAscendPrefillWeights(CustomTestCase):
     def test_prefill_only_counts_need_no_lfu_state(self):
         weights = object.__new__(AscendPrefillWeights)
         weights.counts = torch.empty(4, dtype=torch.int64)
+        weights.resident_experts = 0
         context = _Context()
         weights.owner = SimpleNamespace(
             local_experts=4,
@@ -463,6 +465,48 @@ class TestAscendPrefillWeights(CustomTestCase):
         weights.owner.error.fill_(1)
         weights.weights(0, inputs)
         self.assertEqual(inputs.expert_tokens.tolist(), [0, 0, 0, 0])
+
+    def test_physical_groups_keep_logical_counts_and_clear_previous_layer(self):
+        from sglang.srt.offloading.moe.npu import small_batch_kernels
+
+        weights = object.__new__(AscendPrefillWeights)
+        weights.resident_experts, weights.resident_slots = 1, 3
+        weights.counts = torch.empty(3, dtype=torch.int64)
+        weights.groups = torch.zeros((7, 2), dtype=torch.int64)
+        weights.banks = (SimpleNamespace(capacity=2),) * 2
+        weights.quant_info = (object(),) * 2
+        weights.pipeline = SimpleNamespace(current=1, acquire=lambda layer, ctx: 1)
+        weights.owner = SimpleNamespace(
+            local_experts=3,
+            error=torch.zeros((), dtype=torch.int32),
+            state=None,
+            catalog=SimpleNamespace(key=lambda layer, expert: expert),
+            context=_Context(),
+        )
+
+        with (
+            patch.object(
+                small_batch_kernels,
+                "_store_slot_count_pairs",
+                InterpretedFunction(small_batch_kernels._store_slot_count_pairs.fn),
+            ),
+            patch.object(tl, "cumsum", InterpretedFunction(tl.cumsum.fn)),
+        ):
+            for counts, expected, pairs in (
+                ([2, 2, 5], [2, 0, 3], [[1, 2], [6, 3]]),
+                ([0, 4, 4], [0, 4, 0], [[5, 4]]),
+                ([0, 0, 0], [0, 0, 0], []),
+            ):
+                inputs = SimpleNamespace(
+                    expert_tokens=torch.tensor(counts, dtype=torch.int64),
+                    group_list_type=0,
+                )
+                self.assertIs(weights.weights(4, inputs), weights.quant_info[1])
+                self.assertEqual(inputs.group_list_type, 2)
+                self.assertEqual(weights.counts.tolist(), expected)
+                self.assertEqual(
+                    inputs.expert_tokens.tolist(), pairs + [[0, 0]] * (7 - len(pairs))
+                )
 
     def test_prefill_count_kernel_without_usage_checks_invalid_and_padded_groups(self):
         from sglang.srt.offloading.moe.npu.small_batch_kernels import (
@@ -1588,18 +1632,22 @@ class TestAscendPrefillIntegration(CustomTestCase):
                 multipliers = torch.repeat_interleave(torch.tensor([2.0, 5.0]), counts)
                 return values * multipliers[:, None], None
 
-        for prefill in (True, False):
+        for prefill, physical_slots in ((True, False), (True, True), (False, True)):
             for original_type in (0, 1):
-                with self.subTest(prefill=prefill, original_type=original_type):
+                with self.subTest(
+                    prefill=prefill,
+                    physical_slots=physical_slots,
+                    original_type=original_type,
+                ):
                     logical_counts = torch.tensor(
                         [1, 3] if original_type == 0 else [1, 2], dtype=torch.int64
                     )
                     prepared_counts = (
-                        torch.tensor([1, 2], dtype=torch.int64)
-                        if prefill
-                        else torch.tensor([[1, 1], [5, 2], [0, 0]], dtype=torch.int64)
+                        torch.tensor([[1, 1], [5, 2], [0, 0]], dtype=torch.int64)
+                        if physical_slots
+                        else torch.tensor([1, 2], dtype=torch.int64)
                     )
-                    prepared_type = 1 if prefill else 2
+                    prepared_type = 2 if physical_slots else 1
 
                     def prepare(layer, inputs):
                         inputs.expert_tokens = prepared_counts
@@ -1607,7 +1655,8 @@ class TestAscendPrefillIntegration(CustomTestCase):
                         return None
 
                     owner = SimpleNamespace(
-                        direct_hot=True,
+                        direct_hot=not (prefill and physical_slots),
+                        prefill=SimpleNamespace(counts=torch.tensor([1, 2])),
                         # A previous decode's logical counts are unrelated to
                         # the next prefill, even though direct_hot stays enabled.
                         fused_counts=(

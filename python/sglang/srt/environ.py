@@ -754,6 +754,8 @@ class Envs:
     # Radix and sparse KV caches
     # ===================================================================
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
+    # Benchmark-only: permit fake PD prefill requests to publish local KV.
+    SGLANG_TEST_FAKE_PREFILL_RADIX_CACHE = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch

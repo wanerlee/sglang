@@ -68,6 +68,7 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_actual_token: Optional[List[int]] = None
     max_rank_len: Optional[List[int]] = None
     per_rank_logical_token: Optional[List[int]] = None
+    moe_local_token_count: Optional[torch.Tensor] = None
 
     # Per-sequence FlashAttention tensors (shape [bs] or [bs + 1]).
     kv_len_prev_tensor: Optional[Any] = None
@@ -105,6 +106,23 @@ ContextParallelMetadata = ZigzagContextParallelMetadata
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Bound routed rows by this rank's logical CP shard, not the batch.
+
+        Zigzag concatenates its early/late blocks before appending physical
+        padding, so real rows are a local prefix. Cache the device scalar in
+        per-forward metadata; every MoE layer consumes the same count.
+        """
+        metadata = forward_batch.attn_cp_metadata
+        if metadata.moe_local_token_count is None:
+            lengths = metadata.per_rank_logical_token or metadata.per_rank_actual_token
+            metadata.moe_local_token_count = torch.tensor(
+                lengths[self.cp_rank],
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+        return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:

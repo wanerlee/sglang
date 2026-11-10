@@ -1481,9 +1481,18 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        # Fake requests normally do not publish KV: they include server warmup
+        # requests. A dedicated prefill benchmark may opt in to cross-request
+        # prefix caching; fake decode and other modes retain the default.
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
-            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            (
+                bootstrap_host == FAKE_BOOTSTRAP_HOST
+                and not (
+                    disagg_mode == DisaggregationMode.PREFILL
+                    and envs.SGLANG_TEST_FAKE_PREFILL_RADIX_CACHE.get()
+                )
+            )
             or positional_embed_overrides is not None
         )
         # Set when the request's in-flight forward ran on KV that never landed:

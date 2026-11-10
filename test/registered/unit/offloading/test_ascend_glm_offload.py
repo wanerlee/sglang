@@ -88,6 +88,94 @@ class TestAscendModelCatalog(CustomTestCase):
                 self.assertEqual(catalog.offloaded_layers[0].layer_id, first_offloaded)
                 self.assertEqual(catalog.num_experts, (8 - first_offloaded) * 4)
 
+    def test_stage_catalogs_cover_only_local_layers_and_stage_local_experts(self):
+        config = self._glm(num_hidden_layers=78, moe_layer_freq=1, n_routed_experts=256)
+        spans = ((0, 18), (18, 38), (38, 62), (62, 78))
+        stage_layers = []
+        for span, expected_layers in zip(spans, (15, 20, 24, 16)):
+            owned_experts = set()
+            for rank in range(4):
+                with self.subTest(span=span, rank=rank):
+                    catalog = build_expert_catalog(
+                        config, 4, rank, offload_all_routed=True, layer_range=span
+                    )
+                    ids = tuple(layer.layer_id for layer in catalog.layers)
+                    self.assertEqual(ids, tuple(range(max(span[0], 3), span[1])))
+                    self.assertEqual(len(catalog.offloaded_layers), expected_layers)
+                    self.assertEqual(catalog.num_experts, expected_layers * 64)
+                    self.assertEqual(catalog.key(ids[0], 0), 0)
+                    self.assertEqual(catalog.key(ids[-1], 63), catalog.num_experts - 1)
+                    for layer in catalog.layers:
+                        self.assertFalse(layer.resident)
+                        self.assertEqual(layer.local_experts, 64)
+                        self.assertEqual(layer.global_start, rank * 64)
+                    first = catalog.layers[0]
+                    owned_experts.update(
+                        range(
+                            first.global_start, first.global_start + first.local_experts
+                        )
+                    )
+                    if rank == 0:
+                        stage_layers.extend(ids)
+            self.assertEqual(owned_experts, set(range(256)))
+        self.assertEqual(stage_layers, list(range(3, 78)))
+
+    def test_stage_filter_preserves_sparse_ids_and_global_resident_prefix(self):
+        # The first routed layer is globally 4. A later stage must not make its
+        # first local routed layer resident or renumber its global layer ID.
+        for all_routed in (False, True):
+            with self.subTest(all_routed=all_routed):
+                catalog = build_expert_catalog(
+                    self._glm(),
+                    4,
+                    2,
+                    offload_all_routed=all_routed,
+                    layer_range=(5, 10),
+                )
+                self.assertEqual(
+                    tuple(layer.layer_id for layer in catalog.layers), (6, 8)
+                )
+                self.assertEqual(catalog.offloaded_layers, catalog.layers)
+                self.assertEqual(catalog.key(6, 0), 0)
+                self.assertEqual(catalog.key(8, 3), 7)
+                for outside in (4, 10):
+                    with self.assertRaisesRegex(
+                        ValueError, "Unregistered expert layer"
+                    ):
+                        catalog.layer(outside)
+        prefix = build_expert_catalog(self._glm(), 4, 0, layer_range=(0, 8))
+        self.assertTrue(prefix.layer(4).resident)
+        self.assertEqual(
+            tuple(layer.layer_id for layer in prefix.offloaded_layers), (6,)
+        )
+
+    def test_invalid_stage_range_and_stages_without_offloaded_layers_are_rejected(self):
+        invalid_ranges = (
+            (),
+            (0,),
+            (0, 1, 2),
+            (0, 13),
+            (-1, 3),
+            (3, 3),
+            (4, 3),
+            (0, True),
+            (0, 3.0),
+            "0,3",
+        )
+        for span in invalid_ranges:
+            with self.subTest(span=span), self.assertRaisesRegex(
+                ValueError, "layer_range"
+            ):
+                build_expert_catalog(self._glm(), 4, 0, layer_range=span)
+        # Dense-only and resident-only stages have no execution-bank owner in V1.
+        for span, all_routed in (((0, 4), True), ((4, 5), False), ((5, 6), True)):
+            with self.subTest(span=span), self.assertRaisesRegex(
+                ValueError, r"nonresident MoE layer in layer range"
+            ):
+                build_expert_catalog(
+                    self._glm(), 4, 0, offload_all_routed=all_routed, layer_range=span
+                )
+
     def test_invalid_sparse_catalog_is_rejected_before_bank_allocation(self):
         cases = (
             dict(model_type="glm4_moe"),

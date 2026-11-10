@@ -104,6 +104,7 @@ class MemFabricHostPool:
                     config.local_world_size = 1
                 config.rank_id = 0
                 config.flags = 0
+                # config.flags = offload.OFFLOAD_FLAG_GIANT_PAGE
                 config.scene = offload.Scene.LOCAL
                 status = offload.initialize(config)
                 if status not in (None, 0):

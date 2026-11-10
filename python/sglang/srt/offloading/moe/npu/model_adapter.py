@@ -19,16 +19,34 @@ def get_model_id(hf_config):
     )
 
 
-def build_expert_catalog(hf_config, ep_size, ep_rank, *, offload_all_routed=False):
+def build_expert_catalog(
+    hf_config, ep_size, ep_rank, *, offload_all_routed=False, layer_range=None
+):
     """Keep model layer identities while selecting routed-weight residency.
 
     Mixed serving retains its resident prefix; a dedicated prefill worker can
-    stream every routed layer through the same execution banks.
+    stream every routed layer through the same execution banks. A PP stage may
+    limit its catalog to a half-open range while retaining global layer IDs and
+    the model's original resident prefix.
     """
     model_id = get_model_id(hf_config)
     layer_count = hf_config.num_hidden_layers
     if type(layer_count) is not int or layer_count <= 0:
         raise ValueError("num_hidden_layers must be a positive integer")
+    if layer_range is not None:
+        if (
+            not isinstance(layer_range, (tuple, list))
+            or len(layer_range) != 2
+            or any(type(bound) is not int for bound in layer_range)
+            or not 0 <= layer_range[0] < layer_range[1] <= layer_count
+        ):
+            raise ValueError(
+                "layer_range must be (start, end) with "
+                "0 <= start < end <= num_hidden_layers"
+            )
+        start, end = layer_range
+    else:
+        start, end = 0, layer_count
     if model_id == "GLM-5.2":
         first = hf_config.first_k_dense_replace
         frequency = hf_config.moe_layer_freq
@@ -50,10 +68,14 @@ def build_expert_catalog(hf_config, ep_size, ep_rank, *, offload_all_routed=Fals
                 i, hf_config.n_routed_experts, ep_size, ep_rank, i in resident_ids
             )
             for i in layer_ids
+            if start <= i < end
         )
     )
     if not catalog.offloaded_layers:
-        raise ValueError("Expert offload requires at least one nonresident MoE layer")
+        scope = f" in layer range [{start}, {end})" if layer_range is not None else ""
+        raise ValueError(
+            "Expert offload requires at least one nonresident MoE layer" + scope
+        )
     return catalog
 
 
