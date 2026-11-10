@@ -95,6 +95,15 @@ class TestLayerPrefetchPipeline(CustomTestCase):
         self.assertEqual(
             whole_layer_bank_layout(4, 2, 8), (("execution", 0, 4), ("execution", 4, 4))
         )
+        self.assertEqual(
+            whole_layer_bank_layout(4, 6, 8), (("execution", 0, 4), ("hot", 0, 4))
+        )
+        self.assertEqual(
+            whole_layer_bank_layout(4, 6, 8, use_execution_banks=True),
+            (("execution", 0, 4), ("execution", 4, 4)),
+        )
+        with self.assertRaisesRegex(ValueError, "requires execution_slots >= 8"):
+            whole_layer_bank_layout(4, 6, 4, use_execution_banks=True)
         for capacity in ((4, 2, 4), (4, 6, 3), (0, 6, 4)):
             with self.subTest(capacity=capacity), self.assertRaises(ValueError):
                 whole_layer_bank_layout(*capacity)
@@ -1281,13 +1290,15 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     self.assertEqual(observed, [[3, 99]])
                     self.assertFalse(owner.weight_copy_stream.tail.done)
 
-    def test_refill_waits_for_combine_submission_and_device_completion(self):
-        """Refilling a consumed bank must neither delay nor race its return collective."""
+    def test_refill_waits_for_combine_submission_and_the_weight_reader(self):
         for mode in ("allgather", "alltoallv"):
-            for rows in (0, 2):
-                with self.subTest(mode=mode, received_rows=rows):
+            for rows, early_reuse in ((0, False), (2, False), (0, True), (2, True)):
+                with self.subTest(
+                    mode=mode, received_rows=rows, early_reuse=early_reuse
+                ):
                     owner, context, banks, submitted = self._forward_owner()
                     owner.context = context
+                    owner.prefill.pipeline.early_bank_reuse = early_reuse
                     communication, trace = _Stream(), []
                     load = owner.prefill.host_ops.materialize_into
 
@@ -1303,10 +1314,15 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     owner.start_prefill_layer(3)
                     bank = owner.prefill.pipeline.acquire(3, context)
                     values = torch.zeros((rows, 2))
-                    context.compute_stream.enqueue(
-                        lambda: values.fill_(banks[bank].item())
-                    )
-                    trace.clear()
+                    if rows:
+                        owner.prefill.pipeline.wait_for_w2(3, context)
+
+                        def gmm2():
+                            values.fill_(banks[bank].item())
+                            trace.append("gmm2-done")
+
+                        context.compute_stream.enqueue(gmm2)
+                        owner.prefill.pipeline.record_last_reader(3, context)
                     dispatcher, inputs = self._combine_call(owner, 3, mode, values)
                     with self._combine_device(context, communication, trace):
                         result = dispatcher.combine(inputs)
@@ -1317,18 +1333,24 @@ class TestAscendPrefillIntegration(CustomTestCase):
                     )
                     self.assertFalse(communication.tail.done)
                     self.assertEqual(owner.prefill.pipeline.current, 1)
-                    # Adversarial scheduling: run the copy stream first. Its new
-                    # H2D must still execute the queued return communication
-                    # before overwriting bank A, including on an empty rank.
+                    # Drain the copy stream first to expose the exact dependency.
                     owner.weight_copy_stream.drain()
-                    self.assertTrue(communication.tail.done)
-                    self.assertLess(
-                        trace.index("combine-done"), trace.index("copy-5-w13")
-                    )
-                    if mode == "alltoallv":
+                    if early_reuse and rows:
+                        self.assertFalse(communication.tail.done)
                         self.assertLess(
-                            trace.index("finalize-done"), trace.index("copy-5-w13")
+                            trace.index("gmm2-done"), trace.index("copy-5-w13")
                         )
+                    else:
+                        self.assertTrue(communication.tail.done)
+                        self.assertLess(
+                            trace.index("combine-done"), trace.index("copy-5-w13")
+                        )
+                        if mode == "alltoallv":
+                            self.assertLess(
+                                trace.index("finalize-done"), trace.index("copy-5-w13")
+                            )
+                    context.compute_stream.drain()
+                    self.assertIsNone(owner.prefill.pipeline.last_reader)
                     self.assertTrue(torch.equal(result, torch.full_like(values, 3)))
                     self.assertEqual(banks[0].item(), 5)
 
@@ -1336,9 +1358,12 @@ class TestAscendPrefillIntegration(CustomTestCase):
         """A failed return collective must not advance or overwrite its layer bank."""
         owner, context, _, submitted = self._forward_owner()
         owner.context = context
+        owner.prefill.pipeline.early_bank_reuse = True
         owner.prefill.pipeline.begin_forward(context)
         owner.start_prefill_layer(3)
         owner.prefill.pipeline.acquire(3, context)
+        owner.prefill.pipeline.wait_for_w2(3, context)
+        owner.prefill.pipeline.record_last_reader(3, context)
         copy_tail = owner.weight_copy_stream.tail
         dispatcher, inputs = self._combine_call(
             owner, 3, "alltoallv", torch.ones((2, 2))
@@ -1561,8 +1586,12 @@ class TestAscendPrefillIntegration(CustomTestCase):
         owner = SimpleNamespace(
             prepare_weights=lambda *args: object(),
             wait_for_w2=lambda layer: sequence.append("w2-ready"),
+            context=object(),
             prefill=SimpleNamespace(
-                finish_layer=lambda layer: sequence.append("retired")
+                finish_layer=lambda layer: sequence.append("retired"),
+                pipeline=SimpleNamespace(
+                    record_last_reader=lambda layer, ctx: sequence.append("bank-reader")
+                ),
             ),
         )
         core = object.__new__(AscendRunnerCore)
@@ -1599,7 +1628,7 @@ class TestAscendPrefillIntegration(CustomTestCase):
         self.assertTrue(
             torch.equal(result.hidden_states, inputs.hidden_states.relu() * 6)
         )
-        self.assertEqual(sequence, ["w13", "w2-ready", "w2"])
+        self.assertEqual(sequence, ["w13", "w2-ready", "w2", "bank-reader"])
 
         # The same runner must not retire/overwrite banks during Decode.
         sequence.clear()
@@ -1656,7 +1685,11 @@ class TestAscendPrefillIntegration(CustomTestCase):
 
                     owner = SimpleNamespace(
                         direct_hot=not (prefill and physical_slots),
-                        prefill=SimpleNamespace(counts=torch.tensor([1, 2])),
+                        prefill=SimpleNamespace(
+                            counts=torch.tensor([1, 2]),
+                            pipeline=SimpleNamespace(record_last_reader=Mock()),
+                        ),
+                        context=object(),
                         # A previous decode's logical counts are unrelated to
                         # the next prefill, even though direct_hot stays enabled.
                         fused_counts=(

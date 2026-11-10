@@ -145,7 +145,10 @@ class AscendOpsOffloader(BaseOffloader):
 
         if not (self.options.prefill_only and self.execution_mode.resident_experts):
             whole_layer_bank_layout(
-                self.local_experts, self.hot_slots, self.execution_slots
+                self.local_experts,
+                self.hot_slots,
+                self.execution_slots,
+                use_execution_banks=self.cfg.get("prefill_use_execution_banks", False),
             )
         self.device = torch.device("npu", get_device().gpu_id)
         self.storages = {}
@@ -392,12 +395,17 @@ class AscendOpsOffloader(BaseOffloader):
         self._init_decode_mask()
         from .prefill import AscendPrefillWeights
 
-        self.prefill = AscendPrefillWeights(self)
+        self.prefill = AscendPrefillWeights(
+            self,
+            early_bank_reuse=self.cfg.get("prefill_early_bank_reuse", False),
+            use_execution_banks=self.cfg.get("prefill_use_execution_banks", False),
+        )
         self._capture_cache_tails()
         self.ready = True
         logger.info(
             "Ascend expert offload: local=%d hot=%d/%d execution=%.3f GiB host=%.3f GiB; "
-            "W2 overlap=%s, fused metadata=%s, Hot direct/execution reuse=%s",
+            "W2 overlap=%s, fused metadata=%s, Hot direct/execution reuse=%s; "
+            "Prefill borrows Hot=%s, early bank reuse=%s",
             self.local_experts,
             self.hot_slots,
             self.catalog.num_experts,
@@ -406,6 +414,8 @@ class AscendOpsOffloader(BaseOffloader):
             True,
             True,
             self.direct_hot,
+            self.prefill.borrows_hot,
+            self.prefill.pipeline.early_bank_reuse,
         )
 
     def _retain(self, value):

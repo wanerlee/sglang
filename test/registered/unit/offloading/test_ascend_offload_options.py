@@ -83,6 +83,15 @@ class TestAscendOffloadOptions(unittest.TestCase):
         self.assertEqual(options.cache_ratio, 0.0)
         self.assertEqual(options.values, {"mode": "prefill_only"})
 
+    def test_prefill_tuning_flags_are_booleans_for_mixed_execution(self):
+        for name in ("prefill_early_bank_reuse", "prefill_use_execution_banks"):
+            with self.subTest(name=name):
+                self.assertTrue(self._read({name: True}).values[name])
+                with self.assertRaisesRegex(ValueError, "must be a boolean"):
+                    self._read({name: 1})
+                with self.assertRaisesRegex(ValueError, "requires mode=mixed"):
+                    self._read({"mode": "prefill_only", name: True}, role="prefill")
+
     def test_prefill_only_accepts_explicit_host_and_bank_budgets(self):
         options = self._read(
             {

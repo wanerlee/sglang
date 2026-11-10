@@ -22,6 +22,8 @@ _COMMON_OPTIONS = frozenset(
         "mode",
         "cache_ratio",
         "prefill_resident_ratio",
+        "prefill_early_bank_reuse",
+        "prefill_use_execution_banks",
         "host_pool_gib",
         "execution_slots",
         "native_extension_directory",
@@ -128,6 +130,13 @@ class AscendOffloadOptions:
         prefill_resident_ratio = parse_prefill_resident_ratio(
             values.get("prefill_resident_ratio", 0)
         )
+
+        for name in ("prefill_early_bank_reuse", "prefill_use_execution_banks"):
+            enabled = values.get(name, False)
+            if type(enabled) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+            if enabled and mode != "mixed":
+                raise ValueError(f"{name} requires mode=mixed")
 
         for name in (
             "host_pool_gib",

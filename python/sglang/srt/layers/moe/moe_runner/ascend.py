@@ -342,6 +342,10 @@ class AscendRunnerCore(MoeRunnerCore):
             weight_prefix="w2",
             group_list_type=group_list_type,
         )
+        if offloaded_prefill:
+            owner.prefill.pipeline.record_last_reader(
+                self.config.layer.layer_id, owner.context
+            )
         return AscendRunnerOutput(hidden_states=hidden_states)
 
 

@@ -1,7 +1,7 @@
 """Eager prefill over two native weight banks, with optional static residency.
 
 Adapted from codex/moe-prefill-opt-20261102 (2dc7903d0b). Each bank is reused
-only after its layer's combine. Dispatch never waits for future weights;
+after its layer's combine is submitted. Dispatch never waits for future weights;
 each projection joins its own copy immediately before consuming that bank.
 Borrowed Hot bytes are restored before decode or cache maintenance can consume
 the published cache addresses.
@@ -42,13 +42,20 @@ def _projection_copy_plans(storage, bank, layouts, source_slice=slice(None)):
     )
 
 
-def whole_layer_bank_layout(local_experts, hot_slots, execution_slots):
+def whole_layer_bank_layout(
+    local_experts, hot_slots, execution_slots, *, use_execution_banks=False
+):
     if local_experts <= 0 or execution_slots < local_experts:
         raise ValueError(
             "Whole-layer prefill requires execution_slots >= local_experts"
         )
     first = ("execution", 0, local_experts)
-    if hot_slots >= local_experts:
+    if use_execution_banks and execution_slots < 2 * local_experts:
+        raise ValueError(
+            "prefill_use_execution_banks requires execution_slots >= "
+            f"{2 * local_experts} for this EP rank"
+        )
+    if not use_execution_banks and hot_slots >= local_experts:
         return first, ("hot", 0, local_experts)
     if execution_slots >= 2 * local_experts:
         return first, ("execution", local_experts, local_experts)
@@ -61,11 +68,12 @@ def whole_layer_bank_layout(local_experts, hot_slots, execution_slots):
 class LayerPrefetchPipeline:
     """Ordered host submission with per-bank device completion dependencies."""
 
-    def __init__(self, layer_ids, *, load, copy_stream):
+    def __init__(self, layer_ids, *, load, copy_stream, early_bank_reuse=False):
         self.layer_ids = tuple(layer_ids)
         if not self.layer_ids or len(set(self.layer_ids)) != len(self.layer_ids):
             raise ValueError("Prefill requires unique ordered offloaded layers")
         self.load, self.copy_stream = load, copy_stream
+        self.early_bank_reuse = early_bank_reuse
         self.reset()
 
     def reset(self):
@@ -73,6 +81,7 @@ class LayerPrefetchPipeline:
         self.current = 0
         self.started = False
         self.ready = {}
+        self.last_reader = None
 
     def _require_current(self, layer, context):
         if (
@@ -121,6 +130,11 @@ class LayerPrefetchPipeline:
             raise RuntimeError("Start the prefill layer before acquiring weights")
         self.ready[self.current].w2.completion.wait_on(context.compute_stream)
 
+    def record_last_reader(self, layer, context):
+        if self.early_bank_reuse and self.current + 2 < len(self.layer_ids):
+            self._require_current(layer, context)
+            self.last_reader = context.record_compute_completion()
+
     def retire(self, layer, reader, context):
         self._require_current(layer, context)
         if not self.started:
@@ -129,6 +143,7 @@ class LayerPrefetchPipeline:
         if following < len(self.layer_ids):
             self._submit(following, context, reader)
         del self.ready[self.current]
+        self.last_reader = None
         self.current += 1
         self.started = False
 
@@ -141,8 +156,14 @@ class LayerPrefetchPipeline:
 
 
 class AscendPrefillWeights:
-
-    def __init__(self, owner, *, resident_experts=0):
+    def __init__(
+        self,
+        owner,
+        *,
+        resident_experts=0,
+        early_bank_reuse=False,
+        use_execution_banks=False,
+    ):
         import torch
 
         from .native_acl import AclHostTransferOps
@@ -171,7 +192,10 @@ class AscendPrefillWeights:
             self.borrows_hot = False
         else:
             layout = whole_layer_bank_layout(
-                owner.local_experts, owner.hot_slots, owner.execution.capacity
+                owner.local_experts,
+                owner.hot_slots,
+                owner.execution.capacity,
+                use_execution_banks=use_execution_banks,
             )
             pools = {"execution": owner.execution, "hot": owner.hot}
             self.banks = tuple(
@@ -198,6 +222,7 @@ class AscendPrefillWeights:
             (spec.layer_id for spec in specs),
             load=self._load,
             copy_stream=owner.weight_copy_stream,
+            early_bank_reuse=early_bank_reuse,
         )
         if self.borrows_hot:
             self._init_hot_restore()
@@ -327,12 +352,11 @@ class AscendPrefillWeights:
 
     def finish_layer(self, layer):
         """Called after the dispatcher has enqueued the complete prefill combine."""
-        owner = self.owner
-        # The compute stream already waits for the return collective and carries
-        # finalization. Gate bank reuse on that frontier, not just the last GMM.
-        self.pipeline.retire(
-            layer, owner.context.record_compute_completion(), owner.context
-        )
+        context = self.owner.context
+        # Combine consumes GMM2's output. Its enqueue still precedes the refill.
+        # Empty receives have no GMM2 event and use the post-combine frontier.
+        reader = self.pipeline.last_reader or context.record_compute_completion()
+        self.pipeline.retire(layer, reader, context)
         if self.pipeline.current == len(self.pipeline.layer_ids):
             self.restore_hot()
 
