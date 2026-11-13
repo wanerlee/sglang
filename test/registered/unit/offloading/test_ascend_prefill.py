@@ -480,6 +480,7 @@ class TestAscendPrefillWeights(CustomTestCase):
 
         weights = object.__new__(AscendPrefillWeights)
         weights.resident_experts, weights.resident_slots = 1, 3
+        weights.cold_offsets = (3, 5)
         weights.counts = torch.empty(3, dtype=torch.int64)
         weights.groups = torch.zeros((7, 2), dtype=torch.int64)
         weights.banks = (SimpleNamespace(capacity=2),) * 2

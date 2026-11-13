@@ -106,11 +106,15 @@ class TestAscendOffloadOptions(unittest.TestCase):
         self.assertEqual(options.values["execution_slots"], 32)
         self.assertEqual(options.values["host_pool_gib"], 48)
 
-    def test_prefill_resident_ratio_is_fractional_and_exclusive_to_prefill(self):
+    def test_prefill_resident_ratio_supports_dsv4_mixed(self):
         option = "prefill_resident_ratio"
         options = self._read({"mode": "prefill_only", option: 0.25}, role="prefill")
         self.assertEqual(options.prefill_resident_ratio, 0.25)
-        with self.assertRaisesRegex(ValueError, "requires mode=prefill_only"):
+        mixed = self._read({option: 0.25}, model_id="DeepSeek-V4-Flash")
+        self.assertEqual(mixed.prefill_resident_ratio, 0.25)
+        self.assertEqual(mixed.cache_ratio, 0.28125)
+        self.assertEqual(self._read({option: 0}).prefill_resident_ratio, 0)
+        with self.assertRaisesRegex(ValueError, "requires DeepSeek-V4-Flash"):
             self._read({option: 0.25})
         for value in (-0.01, 1, float("nan"), True, "0.25"):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, option):
