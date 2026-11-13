@@ -36,10 +36,7 @@ class CachedExecution:
             raise ValueError("Mixed expert offload requires PP=1 and attention CP=1")
 
     def validate_quantization(self, owner, quant_spec):
-        if owner.cfg.get("prefill_resident_ratio", 0) and (
-            quant_spec.kind != "w8a8" or get_spec().speculative_algorithm
-        ):
-            raise ValueError("Mixed prefill residency requires W8A8 without MTP")
+        pass
 
     def configure(self, owner, path):
         owner.hot_slots = int(owner.catalog.num_experts * owner.options.cache_ratio)

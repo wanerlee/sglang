@@ -125,15 +125,11 @@ class AscendOffloadOptions:
         elif not 0 < ratio <= 1:
             raise ValueError("cache_ratio must be in (0, 1] for mixed mode")
 
+        if mode != "prefill_only" and "prefill_resident_ratio" in values:
+            raise ValueError("prefill_resident_ratio requires mode=prefill_only")
         prefill_resident_ratio = parse_prefill_resident_ratio(
             values.get("prefill_resident_ratio", 0)
         )
-        if (
-            mode == "mixed"
-            and prefill_resident_ratio
-            and model_id != "DeepSeek-V4-Flash"
-        ):
-            raise ValueError("Mixed prefill residency requires DeepSeek-V4-Flash")
 
         for name in ("prefill_early_bank_reuse", "prefill_use_execution_banks"):
             enabled = values.get(name, False)

@@ -18,27 +18,6 @@ class PrefillLayerTransfer:
     w2: TransferTicket
 
 
-def mixed_resident_bank_layout(
-    local_experts, routed_layers, resident_experts, execution_slots, direct_hot_slots=0
-):
-    """Prefix immutable weights; reuse Decode execution, never its Hot bytes."""
-    from .options import MAX_PHYSICAL_WEIGHT_GROUPS
-
-    resident_slots = routed_layers * resident_experts
-    cold = local_experts - resident_experts
-    decode_slots = execution_slots + direct_hot_slots
-    # A direct-Hot union must remain contiguous with exactly its old layout.
-    second = resident_slots + (decode_slots if direct_hot_slots else cold)
-    capacity = max(resident_slots + decode_slots, second + cold)
-    if capacity > MAX_PHYSICAL_WEIGHT_GROUPS:
-        raise ValueError(
-            f"Mixed prefill residency needs {capacity} physical weight groups; "
-            f"GMM supports at most {MAX_PHYSICAL_WEIGHT_GROUPS}. "
-            "Reduce prefill_resident_ratio."
-        )
-    return capacity, (resident_slots, second)
-
-
 def _projection_copy_plans(storage, bank, layouts, source_slice=slice(None)):
     groups = tuple(
         tuple(name for name in layouts if name.startswith(prefix))
@@ -184,8 +163,6 @@ class AscendPrefillWeights:
         resident_experts=0,
         early_bank_reuse=False,
         use_execution_banks=False,
-        resident_pool=None,
-        cold_offsets=None,
     ):
         import torch
 
@@ -201,24 +178,16 @@ class AscendPrefillWeights:
         self.resident_slots = len(specs) * resident_experts
         if resident_experts:
             cold_experts = owner.local_experts - resident_experts
-            self.resident_pool = (
-                resident_pool if resident_pool is not None else owner.execution
-            )
-            self.cold_offsets = (
-                cold_offsets
-                if cold_offsets is not None
-                else tuple(
-                    self.resident_slots + bank * cold_experts for bank in range(2)
-                )
-            )
             self.banks = tuple(
-                self.resident_pool.view(offset, cold_experts)
-                for offset in self.cold_offsets
+                owner.execution.view(
+                    self.resident_slots + bank * cold_experts, cold_experts
+                )
+                for bank in range(2)
             )
-            quant_info = self.resident_pool.quant_info()
+            quant_info = owner.execution.quant_info()
             self.quant_info = (quant_info, quant_info)
             self.groups = torch.zeros(
-                (self.resident_pool.capacity, 2), dtype=torch.int64, device=owner.device
+                (owner.execution.capacity, 2), dtype=torch.int64, device=owner.device
             )
             self.borrows_hot = False
         else:
@@ -263,7 +232,7 @@ class AscendPrefillWeights:
         stream = owner.weight_copy_stream
         try:
             for index, spec in enumerate(specs):
-                bank = self.resident_pool.view(index * count, count)
+                bank = owner.execution.view(index * count, count)
                 plans = _projection_copy_plans(
                     owner.storages[spec.layer_id],
                     bank,
@@ -353,7 +322,7 @@ class AscendPrefillWeights:
             slot_args = {
                 "Groups": self.groups,
                 "ResidentBase": index * self.resident_experts,
-                "ColdBase": self.cold_offsets[index % 2],
+                "ColdBase": self.resident_slots + (index % 2) * self.banks[0].capacity,
                 "RESIDENT_EXPERTS": self.resident_experts,
             }
         prepare_prefill_counts[(1,)](

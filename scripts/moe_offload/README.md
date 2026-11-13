@@ -32,23 +32,6 @@ python3 scripts/moe_offload/test_requests.py --bench
 
 这不是 `sglang.bench_serving`：使用 8 条短自然语言提示，固定输出 128 token，并发 1/4/8 各两轮，轮换固定 DP rank；不额外预热、不自动重置缓存，首次与后续轮都记录。BS 指请求并发；TPOT 按首末内容流块间隔除以输出 token 数减一计算，含客户端/流式传输影响，不是设备逐 token 时间。历史错题和原始错误已标在脚本中，文本格式不匹配需人工检查。
 
-## DSV4 单机混布：部分专家用于 Prefill 常驻
-
-在现有 offload JSON 中增加 `"prefill_resident_ratio": 0.25`，即可启用本地实验功能；不配置或设为 `0` 保持原路径。范围为 DSV4 Flash ModelSlim W8A8、单机混布、PP=CP=1、无 MTP，通信后端仍为 `ascend_ops`。本功能尚待 NPU 数值和性能验收，不能用 CPU UT 代替设备验证。
-
-每个卸载层、每个 EP rank 固定保留前 `floor(local_experts * ratio)` 个本地专家，其余专家继续双 bank 流水预取。沿用已有物理槽 GMM 和逻辑专家计数，不增加 GMM 次数，也不改通信、算子或 MemFabric。原有常驻 hash 层不参与这项比例计算。
-
-Decode 的 Hot 容量、LFU、packed/Hot 直算选择和执行槽容量不变。新增 Prefill 常驻区不能被 Decode 覆写；Prefill 冷 bank 复用 Decode 执行区，并在不够时扩展底层分配，不借用 Hot，所以此模式无需回填 Hot。常驻专家仍可能同时存在于 Decode Hot 中：这是保留 Decode 行为的代价，不能把这项比例当成 Decode 命中率或 Hot 容量比例。
-
-例如 256 专家、EP8、40 个卸载层、`execution_slots=32`、比例 0.25：每层本 rank 有 8 个常驻、24 个冷专家，Prefill 每层 H2D 权重字节数降低 25%。新增 HBM 为 `(40*8 + 2*24 - 32) * expert_nbytes = 336 * expert_nbytes`，另有少量 group metadata；`expert_nbytes` 含运行时权重及量化辅助张量。若每专家约 24 MiB，额外权重空间约 7.875 GiB/rank，实际以日志为准。EP4 Hot 直算布局还要保持 Hot 与 Decode 执行区相邻，额外空间另按布局计算。物理槽总数超过 1024 时明确拒绝，不切换 Decode 路径来规避限制。
-
-**NPU 对照步骤：**
-
-1. 沿用当前可运行启动命令，仅分别设置 `prefill_resident_ratio=0` 和 `0.25`，其余参数、权重、输入和实际 Prefill `toks` 保持相同。保留原 JSON 中的 `offline_stats_path` 等配置。启动脚本无需改动。
-2. 对每组执行相同的“短请求 → 长请求（跨多个 Prefill chunk）→ 短请求”，固定采样参数，核对输出及错误日志；再测原并发。检查切回 Decode 后仍使用原 graph/cache 路径。
-3. 启动日志的 `Mixed Prefill residency` 应列出常驻专家数、新增 HBM 和每层 Prefill H2D 字节数。Profiling 对比同一卸载层，确认只搬冷专家且每层 GMM 次数未增加。
-4. 比较 TTFT、TPOT、端到端吞吐和可容纳的实际并发。常驻权重挤占 KV cache，不能只凭 H2D 减少判定混布收益。若内存不足，降低该比例；不要同时调其他变量后直接归因。
-
 ## 当前边界
 
 以下“已验证”指合入前的 Ascend Ops 基线或上游测试；整层 prefill 与 Hot 直算的本次兼容合入尚待 NPU 验收。

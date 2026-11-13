@@ -143,11 +143,7 @@ class AscendOpsOffloader(BaseOffloader):
         self.execution_mode.configure(self, path)
         from .prefill import whole_layer_bank_layout
 
-        if self.execution_slots < self.local_experts:
-            raise ValueError(
-                "Whole-layer prefill requires execution_slots >= local_experts"
-            )
-        if not int(self.local_experts * self.options.prefill_resident_ratio):
+        if not (self.options.prefill_only and self.execution_mode.resident_experts):
             whole_layer_bank_layout(
                 self.local_experts,
                 self.hot_slots,
@@ -276,8 +272,6 @@ class AscendOpsOffloader(BaseOffloader):
         return _Context()
 
     def _init_cached_runtime(self):
-        from .prefill import AscendPrefillWeights, mixed_resident_bank_layout
-
         # The physical-slot GMM API accepts at most 1024 weight groups.
         # Extra execution slots retain the packed path: direct Hot addressing
         # expects the Hot bank to start immediately after the local experts.
@@ -288,37 +282,13 @@ class AscendOpsOffloader(BaseOffloader):
             and self.execution_slots == self.copy_capacity
             and self.copy_capacity + self.hot_slots <= MAX_PHYSICAL_WEIGHT_GROUPS
         )
-        resident_experts = int(
-            self.local_experts * self.cfg.get("prefill_resident_ratio", 0)
-        )
-        resident_slots = len(self.catalog.offloaded_layers) * resident_experts
-        decode_slots = (
-            self.copy_capacity + self.hot_slots
-            if self.direct_hot
-            else self.execution_slots
-        )
-        allocation_slots, cold_offsets = decode_slots, None
-        if resident_experts:
-            allocation_slots, cold_offsets = mixed_resident_bank_layout(
-                self.local_experts,
-                len(self.catalog.offloaded_layers),
-                resident_experts,
-                self.execution_slots,
-                self.hot_slots if self.direct_hot else 0,
-            )
-        # Decode still sees its original capacity and relative slot numbering.
-        # Its writes cannot reach the immutable Prefill prefix.
-        pool = self.format.allocate_bank(
-            allocation_slots,
-            ResourceKind.EXECUTION_WEIGHTS,
-            "ascend.union" if self.direct_hot else "ascend.execution",
-        )
-        decode_bank = (
-            pool.view(resident_slots, decode_slots) if resident_experts else pool
-        )
         self.execution_keys = None
         if self.direct_hot:
-            self.union = decode_bank
+            self.union = self.format.allocate_bank(
+                self.copy_capacity + self.hot_slots,
+                ResourceKind.EXECUTION_WEIGHTS,
+                "ascend.union",
+            )
             self.execution = self.union.view(0, self.copy_capacity)
             self.hot = self.union.view(self.copy_capacity, self.hot_slots)
             self.direct_groups = torch.zeros(
@@ -331,7 +301,9 @@ class AscendOpsOffloader(BaseOffloader):
             )
             self.quant_info = self.union.quant_info()
         else:
-            self.execution = decode_bank
+            self.execution = self.format.allocate_bank(
+                self.execution_slots, ResourceKind.EXECUTION_WEIGHTS, "ascend.execution"
+            )
             self.hot = self.format.allocate_bank(
                 self.hot_slots, ResourceKind.HOT_WEIGHTS, "ascend.hot"
             )
@@ -421,31 +393,13 @@ class AscendOpsOffloader(BaseOffloader):
         self.context.resources.clear()
         self.state.update_enabled.fill_(False)  # warmup/capture never trains LFU
         self._init_decode_mask()
-        residency_args = (
-            dict(
-                resident_experts=resident_experts,
-                resident_pool=pool,
-                cold_offsets=cold_offsets,
-            )
-            if resident_experts
-            else {}
-        )
+        from .prefill import AscendPrefillWeights
+
         self.prefill = AscendPrefillWeights(
             self,
             early_bank_reuse=self.cfg.get("prefill_early_bank_reuse", False),
             use_execution_banks=self.cfg.get("prefill_use_execution_banks", False),
-            **residency_args,
         )
-        if resident_experts:
-            logger.info(
-                "Mixed Prefill residency: %d/%d experts per layer, %d layers; "
-                "extra HBM=%.3f GiB, Prefill H2D bytes/layer=%d; Decode cache unchanged",
-                resident_experts,
-                self.local_experts,
-                len(self.catalog.offloaded_layers),
-                (allocation_slots - decode_slots) * self.format.expert_nbytes / 1024**3,
-                (self.local_experts - resident_experts) * self.format.expert_nbytes,
-            )
         self._capture_cache_tails()
         self.ready = True
         logger.info(
